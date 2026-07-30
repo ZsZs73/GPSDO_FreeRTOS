@@ -7,8 +7,26 @@ storage for learned state.
 
 Project by **J. M. Niewiński** — based on **GPSDO v0.06c** by André Balsa
 ([STM32-GPSDO](https://github.com/AndrewBCN/STM32-GPSDO)), with the FreeRTOS
-port and algorithms 3–10 by the author, Claude AI as programming assistant, and
-PCB design by Scrachi (EEVBlog forum).
+port and algorithms 3–11 by the author, Claude AI as programming assistant, and
+PCB design by Scrachi (EEVBlog forum). Algorithm 11 (continuous-PI loop) is
+based on the original GPSDO controller design by the late **Lars Walenius**,
+extended here with CT auto-calibration, a frequency-led acquisition branch and a
+picDIV phase-capture bridge.
+
+Measurement and field testing of algorithms 10 and 11 by **Dan Wiering**, whose
+rubidium-referenced ADEV runs shaped both loops.
+
+---
+
+
+## Documentation
+
+| | English | Polski | Español |
+|---|---|---|---|
+| Firmware manual | [README_EN](doc/README_EN.md) | [README_PL](doc/README_PL.md) | [README_ES](doc/README_ES.md) |
+| Changelog | [CHANGELOG_EN](doc/CHANGELOG_EN.md) | [CHANGELOG_PL](doc/CHANGELOG_PL.md) | [CHANGELOG_ES](doc/CHANGELOG_ES.md) |
+| Tuner (PC console) | [README_TUNER_EN](doc/README_TUNER_EN.md) | [README_TUNER_PL](doc/README_TUNER_PL.md) | [README_TUNER_ES](doc/README_TUNER_ES.md) |
+| Flash-ring bring-up | [BRINGUP_EN](doc/FLASH_RING_BRINGUP_EN.md) | [BRINGUP_PL](doc/FLASH_RING_BRINGUP_PL.md) | [BRINGUP_ES](doc/FLASH_RING_BRINGUP_ES.md) |
 
 ---
 
@@ -22,8 +40,6 @@ three languages:
 | **Manual** — hardware, wiring, algorithms, CLI, display | [README_EN](doc/README_EN.md) | [README_PL](doc/README_PL.md) | [README_ES](doc/README_ES.md) |
 | **Changelog** — what changed and why | [CHANGELOG_EN](doc/CHANGELOG_EN.md) | [CHANGELOG_PL](doc/CHANGELOG_PL.md) | [CHANGELOG_ES](doc/CHANGELOG_ES.md) |
 | **Flash ring bring-up** — first-time setup of the flash ring buffer | [BRINGUP_EN](doc/FLASH_RING_BRINGUP_EN.md) | [BRINGUP_PL](doc/FLASH_RING_BRINGUP_PL.md) | [BRINGUP_ES](doc/FLASH_RING_BRINGUP_ES.md) |
-| **Timezone generator** — regenerating `tz_table.h` from tzdata | [TZGEN_EN](doc/gen_tz_table_EN.md) | [TZGEN_PL](doc/gen_tz_table_PL.md) | [TZGEN_ES](doc/gen_tz_table_ES.md) |
-| **Tuner GUI** — live loop tuning & phase visualisation | [TUNER_EN](doc/gpsdo_tuner_EN.md) | [TUNER_PL](doc/gpsdo_tuner_PL.md) | [TUNER_ES](doc/gpsdo_tuner_ES.md) |
 
 New here? Start with the manual in your language — it covers the build, the
 wiring and the first calibration run.
@@ -87,8 +103,8 @@ gpsdo_state.cpp         shared state, EEPROM save/recall
 flash_ring.cpp          wear-levelled flash storage for live data
 live_store.cpp          what goes in the ring and when
 TM1637Display.cpp       vendored driver, patched for FreeRTOS
-tz_table.h              generated from tzdata (see tools/ and doc/gen_tz_table_*)
-tools/gen_tz_table.py   regenerates tz_table.h; cross-platform (Linux/macOS/Windows)
+tz_table.h              generated: 407 zones, 88 rules (see tools/)
+tools/gen_tz_table.py   regenerates tz_table.h from system tzdata
 doc/                    manual, changelog and bring-up guide (EN/PL/ES)
 ```
 

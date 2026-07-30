@@ -1,6 +1,6 @@
 /* ======================================================================
  * flash_ring_core.c  —  hardware-independent ring-buffer logic
- * Part of GPSDO FreeRTOS v0.90
+ * Part of GPSDO FreeRTOS v1.01
  * See flash_ring_core.h for the design and rationale.
  * ====================================================================== */
 #include "flash_ring_core.h"
@@ -54,13 +54,14 @@ static int fr_slot_blank(const uint8_t *s)
 static int fr_slot_valid(const uint8_t *s)
 {
     if (fr_slot_blank(s)) return 0;
-    uint16_t crc = fr_crc16(s, 30);
-    return (s[30] == (uint8_t)(crc & 0xFFu) &&
-            s[31] == (uint8_t)(crc >> 8));
+    uint16_t crc = fr_crc16(s, FR_SLOT_SIZE - 2);
+    return (s[FR_SLOT_SIZE - 2] == (uint8_t)(crc & 0xFFu) &&
+            s[FR_SLOT_SIZE - 1] == (uint8_t)(crc >> 8));
 }
 
-static uint16_t fr_slot_seq(const uint8_t *s) { return (uint16_t)(s[0] | (s[1] << 8)); }
-static uint8_t  fr_slot_len(const uint8_t *s) { return s[2]; }
+static uint16_t fr_slot_seq (const uint8_t *s) { return (uint16_t)(s[0] | (s[1] << 8)); }
+static uint8_t  fr_slot_type(const uint8_t *s) { return s[2]; }
+static uint16_t fr_slot_len (const uint8_t *s) { return (uint16_t)(s[4] | (s[5] << 8)); }
 
 /* newer-than test using modular sequence distance (handles wrap) */
 static int fr_seq_newer(uint16_t a, uint16_t b)
@@ -82,7 +83,7 @@ static int fr_fresh(fr_state_t *st, uint16_t erase_count)
     fr_build_header(hdr, erase_count);
     if (st->ops->program(0, hdr, FR_HDR_SIZE) != 0) return -1;
     st->used = 0; st->next_idx = 0; st->cur_seq = 0;
-    st->have_data = 0; st->cur_idx = 0;
+    st->have_data = 0;
     st->erase_count = erase_count;
     return 0;
 }
@@ -92,7 +93,7 @@ int fr_begin(fr_state_t *st, const fr_ops_t *ops)
     st->ops = ops;
     st->slot_count = (uint16_t)((ops->sector_len - FR_HDR_SIZE) / FR_SLOT_SIZE);
     st->used = 0; st->next_idx = 0; st->cur_seq = 0;
-    st->have_data = 0; st->cur_idx = 0; st->erase_count = 0;
+    st->have_data = 0; st->erase_count = 0;
 
     uint8_t hdr[FR_HDR_SIZE];
     ops->read(0, hdr, FR_HDR_SIZE);
@@ -113,7 +114,9 @@ int fr_begin(fr_state_t *st, const fr_ops_t *ops)
 
     st->erase_count = (uint16_t)(hdr[12] | (hdr[13] << 8));
 
-    /* scan every slot: find newest valid, first blank, count used */
+    /* scan every slot: find highest seq across ALL types (for next write's
+     * seq), find first blank, count used. Per-type newest is resolved on
+     * demand by fr_read_newest(). */
     uint8_t slot[FR_SLOT_SIZE];
     int first_blank = -1;
     for (uint16_t i = 0; i < st->slot_count; i++) {
@@ -126,7 +129,7 @@ int fr_begin(fr_state_t *st, const fr_ops_t *ops)
         st->used++;
         uint16_t seq = fr_slot_seq(slot);
         if (!st->have_data || fr_seq_newer(seq, st->cur_seq)) {
-            st->have_data = 1; st->cur_seq = seq; st->cur_idx = i;
+            st->have_data = 1; st->cur_seq = seq;
         }
     }
     /* next free slot: the first blank, or wrap to full if none */
@@ -142,20 +145,38 @@ int fr_begin_fresh_count(fr_state_t *st, uint16_t prev_ec)
     return 0;   /* no data yet */
 }
 
-uint16_t fr_read(fr_state_t *st, uint8_t *out, uint16_t maxlen)
+uint16_t fr_read_newest(fr_state_t *st, uint8_t type,
+                        uint8_t *out, uint16_t maxlen)
 {
     if (!st->have_data) return 0;
+
+    /* Scan for the newest valid slot of the requested type. Each scan is
+     * O(slot_count) — 256 reads worst case. Acceptable because reads are
+     * called rarely (boot + a few CLI commands), never from a hot loop. */
     uint8_t slot[FR_SLOT_SIZE];
-    st->ops->read(fr_slot_off(st, st->cur_idx), slot, FR_SLOT_SIZE);
-    if (!fr_slot_valid(slot)) return 0;
+    uint16_t best_seq = 0, best_idx = 0xFFFFu;
+    for (uint16_t i = 0; i < st->slot_count; i++) {
+        st->ops->read(fr_slot_off(st, i), slot, FR_SLOT_SIZE);
+        if (fr_slot_blank(slot)) continue;       /* first blank ends live area */
+        if (!fr_slot_valid(slot)) continue;
+        if (fr_slot_type(slot) != type) continue;
+        uint16_t seq = fr_slot_seq(slot);
+        if (best_idx == 0xFFFFu || fr_seq_newer(seq, best_seq)) {
+            best_seq = seq; best_idx = i;
+        }
+    }
+    if (best_idx == 0xFFFFu) return 0;
+
+    st->ops->read(fr_slot_off(st, best_idx), slot, FR_SLOT_SIZE);
     uint16_t len = fr_slot_len(slot);
     if (len > FR_PAYLOAD) len = FR_PAYLOAD;
     if (len > maxlen)     len = maxlen;
-    memcpy(out, slot + 3, len);
+    memcpy(out, slot + FR_SLOT_HDR, len);   /* payload follows the 6-byte header */
     return len;
 }
 
-int fr_write(fr_state_t *st, const uint8_t *data, uint16_t len)
+int fr_write(fr_state_t *st, uint8_t type,
+             const uint8_t *data, uint16_t len)
 {
     if (len > FR_PAYLOAD) len = FR_PAYLOAD;
 
@@ -170,11 +191,14 @@ int fr_write(fr_state_t *st, const uint8_t *data, uint16_t len)
     memset(slot, 0, FR_SLOT_SIZE);
     slot[0] = (uint8_t)(seq & 0xFFu);
     slot[1] = (uint8_t)(seq >> 8);
-    slot[2] = (uint8_t)len;
-    memcpy(slot + 3, data, len);
-    uint16_t crc = fr_crc16(slot, 30);
-    slot[30] = (uint8_t)(crc & 0xFFu);
-    slot[31] = (uint8_t)(crc >> 8);
+    slot[2] = type;
+    slot[3] = 0u;                       /* reserved; keeps the payload aligned */
+    slot[4] = (uint8_t)(len & 0xFFu);   /* length is 16-bit: a settings block is */
+    slot[5] = (uint8_t)(len >> 8);      /* ~324 B and would truncate in 8 bits   */
+    memcpy(slot + FR_SLOT_HDR, data, len);
+    uint16_t crc = fr_crc16(slot, FR_SLOT_SIZE - 2);
+    slot[FR_SLOT_SIZE - 2] = (uint8_t)(crc & 0xFFu);
+    slot[FR_SLOT_SIZE - 1] = (uint8_t)(crc >> 8);
 
     uint32_t off = fr_slot_off(st, st->next_idx);
     if (st->ops->program(off, slot, FR_SLOT_SIZE) != 0) return -1;
@@ -184,7 +208,7 @@ int fr_write(fr_state_t *st, const uint8_t *data, uint16_t len)
     st->ops->read(off, chk, FR_SLOT_SIZE);
     if (memcmp(chk, slot, FR_SLOT_SIZE) != 0) return -1;
 
-    st->have_data = 1; st->cur_seq = seq; st->cur_idx = st->next_idx;
+    st->have_data = 1; st->cur_seq = seq;
     st->next_idx++; st->used++;
     return 0;
 }

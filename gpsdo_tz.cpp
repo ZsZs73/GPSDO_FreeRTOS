@@ -1,7 +1,7 @@
 /**
  * gpsdo_tz.cpp — Timezone resolution: POSIX TZ rules, named zones, EU auto
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  *
@@ -170,7 +170,14 @@ int16_t tz_offset_now(const TzSpec *tz, uint8_t day, uint8_t mon,
      * nominally local, but comparing them against UTC only shifts each
      * boundary by an hour or so — for a clock display that is immaterial,
      * and it avoids a chicken-and-egg (you'd need the offset to know the
-     * local time to decide the offset). */
+     * local time to decide the offset).
+     *
+     * DISPLAY-ONLY ASSUMPTION (audit v0.95): the ~1 h skew this introduces
+     * at the exact DST transition moment is acceptable for a wall-clock
+     * readout, which is the sole consumer today. Do NOT repurpose this
+     * function for time-critical logic (e.g. timestamping flash-ring
+     * entries) without first resolving the local-time boundary properly —
+     * iterate: guess offset → convert → re-check → settle. */
     long now = (long)mon           * 1000000L + (long)day * 10000L + min_utc;
     long st  = (long)tz->start.mon * 1000000L + (long)sd  * 10000L + tz->start.at_min;
     long en  = (long)tz->end.mon   * 1000000L + (long)ed  * 10000L + tz->end.at_min;
@@ -234,7 +241,15 @@ const char *tz_lookup(const char *name)
  * ====================================================================== */
 
 /* Legacy heuristic, unchanged in behaviour — see gpsdo_control.cpp for the
- * zone rules it encodes. Returns whole hours; tz_resolve scales to minutes. */
+ * zone rules it encodes. Returns whole hours; tz_resolve scales to minutes.
+ *
+ * int8 range note (audit v0.95): the return type is int8_t (-128..127),
+ * which overflows for UTC+14 (Kiribati). This is safe in practice because
+ * the EU heuristic only ever classifies longitude bands inside UTC-12..+14
+ * and every real offset it returns lies in [-12, +14] hours — but the type
+ * would silently wrap if the heuristic were ever extended eastward. Kept
+ * as int8_t for binary compatibility with gpsdo_control.cpp; the ×60 scale
+ * in tz_resolve cannot overflow because int16_t covers ±840 min. */
 extern int8_t tz_auto_offset_eu(float lat, float lon, uint8_t day,
                                 uint8_t mon, uint16_t year, uint8_t hour_utc);
 

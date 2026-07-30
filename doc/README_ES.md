@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v0.95
+# GPSDO FreeRTOS v1.01
 
 [English](README_EN.md) | [Polski](README_PL.md) | **Español**
 
@@ -13,9 +13,12 @@ Firmware en tiempo real (FreeRTOS) para un oscilador disciplinado por GPS
 
 | Rol | Persona / fuente |
 |-----|------------------|
-| Autor del port a FreeRTOS, algoritmos 3–10 | **J. M. Niewiński** — [repositorio](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
+| Autor del port a FreeRTOS, algoritmos 3–11 | **J. M. Niewiński** — [repositorio](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
 | Asistente de programación (Anthropic) | **Claude AI** |
+| Medición y pruebas de campo, algoritmos 10 y 11 | **Dan Wiering** — series ADEV contra referencia de rubidio que hallaron el ciclo límite del algoritmo 10, resolvieron la cuestión de la amortiguación `FA`, informaron del bloqueo en ACQ y establecieron la comparación del algoritmo 11 |
+| Soporte de ILI9486 / ILI9488 — el empujón para implementarlo | **lucido** (foro EEVBlog) |
 | Autor de v0.06c — inspiración del port RTOS | **André Balsa** — [repositorio](https://github.com/AndrewBCN/STM32-GPSDO) |
+| Lazo PI continuo (algoritmo 11) — diseño original | **Lars Walenius** (in memoriam) — controlador GPSDO compartido con la comunidad [time-nuts](http://www.leapsecond.com/time-nuts.htm) y EEVBlog. Ampliado aquí con autocalibración por CT, una rama de adquisición guiada por frecuencia y un puente de captura de fase picDIV. |
 | Diseño de PCB (prototipo) | **Scrachi** (foro EEVBlog) — [mensaje con archivos](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/825/) · [perfil](https://www.eevblog.com/forum/profile/?u=762266) |
 | Hilo del proyecto | [Yet another DIY GPSDO](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/) — Foro EEVBlog |
 
@@ -24,6 +27,12 @@ André Balsa a la arquitectura FreeRTOS, con un rediseño completo de tareas,
 sincronización y manejo de pantallas. El diseño de hardware se basa en el
 esquemático v0.06c, usando las PCB compartidas por el usuario Scrachi en el
 foro EEVBlog.
+
+---
+
+
+> **Consola de ajuste en PC:** véase [README_TUNER_ES](README_TUNER_ES.md) —
+> gráficas en vivo, pestañas de parámetros y el generador de `tz_table.h`.
 
 ---
 
@@ -41,7 +50,7 @@ estabilidad a corto plazo del OCXO.
                                             10 MHz
                ┌─────────────┐       ┌──────────────┐
    Antena GPS  ┤  u-blox     │       │    OCXO      ├── TIM2 ETR (PA15) ──┐
-               │  NEO-6M/7M  │       │  10 MHz      │                     │
+               │ NEO-6M/8M   │       │  10 MHz      │                     │
                └──┬──────┬───┘       └──────▲───────┘                     │
                   │      │                  │                             │
         NMEA      │  1PPS (PB10)      PWM (PB9)                           │
@@ -86,24 +95,19 @@ estabilidad a corto plazo del OCXO.
 
 **Pantallas** (opcionales):
 
-- **OLED 128×64** I2C (SH1106 / SSD1306 / SSD1309) — páginas rotativas; una
-  tercera página muestra el estado del lazo algo-10, la fase y el aviso LPOL?
-  cuando LTIC está activado
-- **LCD 20×4** I2C (HD44780 + PCF8574T) — la línea alternante añade un modo con
-  estado algo-10 / fase / LPOL? cuando LTIC está activado
+- **OLED 128×64** I2C (SH1106 / SSD1306 / SSD1309)
+- **LCD 20×4** I2C (HD44780 + PCF8574T)
 - **TM1637** (reloj de 4 o 6 dígitos)
 - **TFT 320×240** SPI (ILI9341 / ST7789, biblioteca TFT_eSPI)
-- **TFT 480×320** SPI (ILI9488, biblioteca TFT_eSPI) — el panel principal en
-  uso actual, con disciplinado a LOCK confirmado en el hardware de varios
-  constructores. El diseño se dibuja de forma nativa a 480×320 (no solo
-  escalado): una rejilla de seis campos de sensores con unidades alineadas a la
-  derecha, la lectura de fase de algo-10 (Vph / dph con guardián de banda `ovf`
-  / qErr) y una barra de estado con SURVEY y el aviso de polaridad LPOL?
+- **TFT 480×320** SPI (ILI9488, biblioteca TFT_eSPI) — probado en campo contra
+  una referencia de rubidio; el diseño 320×240 se escala automáticamente
 - **HT16K33** reloj de 7 segmentos de 4 dígitos con dos puntos, dirección
   I2C 0x70 (HH:MM)
 
 OLED y LCD pueden funcionar simultáneamente (direcciones I2C distintas).
 LCD y TM1637 **no pueden** funcionar simultáneamente (conflicto de bus).
+
+---
 
 ---
 
@@ -133,6 +137,8 @@ estrictamente definidos:
 
 ---
 
+---
+
 ## Algoritmos de control
 
 Once algoritmos seleccionables mediante el comando `LA n` (0–10):
@@ -150,6 +156,7 @@ Once algoritmos seleccionables mediante el comando `LA n` (0–10):
 | 8 | Híbrido | FLL+PLL | 100 s | Mezcla sigmoide automática FLL↔PLL |
 | 9 | Red neuronal | e/∫e/de + temp | 10 s | MLP de 5 entradas; aprende el tempco del oscilador, holdover compensado térmicamente |
 | 10 | LTIC | fase TIC + frec. | por etapas | Tres etapas ACQ→DPLL→LOCK; detector de fase por hardware, autocalibrante |
+| 11 | LTIC-Lars | fase TIC | continuo | Un único lazo PI continuo, sin máquina de estados; ganancia derivada de `CT`. Según Lars Walenius |
 
 Los algoritmos PLL (4, 5, 7 y la rama PLL del 8) usan un diseño de **dos
 escalas temporales** ajustado para "captura rápida, mantenimiento de fase
@@ -170,8 +177,10 @@ propia estabilidad a corto plazo.
 
 Los algoritmos 3–9 tienen parámetros PID ajustables en tiempo de ejecución
 (`Kp`, `Ki`, `Kd`, `I_LIMIT`) configurables mediante comandos CLI (`KP`,
-`KI`, `KD`, `IL`) — sin recompilar. Los parámetros se guardan en EEPROM con
+`KI`, `KD`, `IL`) — sin recompilar. Los parámetros se guardan en el flash-ring con
 `ES`.
+
+---
 
 ---
 
@@ -205,6 +214,8 @@ perdida).
 
 ---
 
+---
+
 ## Diseño de la pantalla LCD 20×4
 
 Pantalla de versión durante 2 segundos, luego:
@@ -231,6 +242,8 @@ Holdover en la línea 3: `[H]` (manual) o `[A]` (automático) — parpadeo 500 m
 
 ---
 
+---
+
 ## Diseño de la pantalla TFT (ILI9341 / ST7789 320×240, ILI9488 480×320, TFT_eSPI)
 
 Se admiten módulos TFT SPI económicos en orientación horizontal, controlados
@@ -240,6 +253,42 @@ panel solo requiere cambiar la definición del driver y el ancho/alto. Las
 líneas `TFT_RGB_ORDER` / `TFT_INVERSION_OFF` son necesarias para colores
 correctos en módulos ST7789 e inofensivas en los demás. Independiente de las
 pantallas I2C — OLED, LCD y TFT pueden funcionar a la vez.
+
+### Los dos tamaños de panel
+
+La pantalla de trabajo se compone una sola vez, a 320×240, y se escala a 480×320
+en tiempo de compilación mediante `TFT_SX` / `TFT_SY` / `TFT_F`. La disposición
+de los campos es por tanto **idéntica en ambos paneles** — nada se desplaza
+respecto a lo demás. Lo que cambia es cómo se dibuja el texto, y esa diferencia
+es lo bastante grande como para importar.
+
+```
+ ┌──────────────────────────────────────────┐
+ │  GPSDO v1.00-rtos            LOCK        │  barra de estado + tendencia
+ │                                          │
+ │        1 0 0 0 0 0 0 0   H z             │  frecuencia, monoespaciada grande
+ │                                          │
+ │  PWM  40849      Vctl  1.799 V           │  salida de control y tensión
+ │  dph   -5.3 ns   Vphase 2.083 V          │  error de fase y detector
+ │  Sat 11  HDOP 0.77   Up 000d 01:42:12    │  estado GPS y tiempo activo
+ │  BMP 51.1C  1006.7hPa   INA 4.92V 182mA  │  sensores
+ │  14:32:45  Lun 28/07/2026                │  reloj
+ └──────────────────────────────────────────┘
+```
+
+**320×240 (ILI9341, ST7789)** usa las fuentes numéricas GLCD clásicas para la
+pantalla de trabajo. Ya tienen el tamaño adecuado a escala 1:1, se dibujan rápido
+y no requieren `LOAD_GFXFF` en `User_Setup.h`. El razonamiento está en *Por qué
+el panel pequeño conserva las fuentes clásicas*, más abajo.
+
+**480×320 (ILI9488, ILI9486)** usa las fuentes libres de Adafruit GFX mediante
+una capa de abstracción por rol (`GF_DATA`, `GF_HEAD`, `GF_STATUS`, etc. en
+`gpsdo_config.h`). Escalar las fuentes de mapa de bits clásicas por 1,5 habría
+dado dígitos visiblemente dentados; las fuentes libres se mantienen limpias en el
+tamaño mayor. Esta compilación **sí** necesita `LOAD_GFXFF`.
+
+El panel grande mueve además 2,4 veces más píxeles por redibujado, así que
+`SPI_FREQUENCY` no debería bajar de 40 MHz en él — véanse las notas de conexión.
 
 > **El soporte de ILI9488 / ILI9486 480×320 está verificado en panel (v0.93).**
 > La pantalla de operación 320×240 y el splash se escalan automáticamente a
@@ -279,7 +328,7 @@ pantallas I2C — OLED, LCD y TFT pueden funcionar a la vez.
 
 ```
 ┌────────────────────────────────────────────┐
-│ v0.95-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
+│ v1.01-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
 ├────────────────────────────────────────────┤
 │                                            │
 │        10000000.0000 Hz                    │ ← frequency (large, colour-coded)
@@ -443,6 +492,58 @@ TFT: data sprite (1-bit) created
 
 ---
 
+### Soporte de TFT a color (TFT_eSPI)
+
+Cualquier pantalla TFT_eSPI de **320×240** o **480×320** debería funcionar
+(`TFT_SX()/TFT_SY()`). Probadas: ILI9341, ST7789, ILI9488. Activa el
+`GPSDO_TFT_*` adecuado en `gpsdo_config.h` y configura el controlador y los
+pines en `User_Setup.h` (SPI1: SCK=PA5, MOSI=PA7); cualquier panel de
+320×240 o 480×320 encaja sin cambios de código.
+
+---
+
+---
+
+## Pantallas de reloj (HT16K33 y TM1637)
+
+Se admiten dos módulos pequeños de 7 segmentos. Ambos muestran la hora, respetan
+el ajuste `LT` (UTC o local) y parpadean los dos puntos, de modo que una pantalla
+detenida salta a la vista. Ninguno muestra el estado del GPSDO — existen para que
+la unidad sirva de reloj mientras disciplina.
+
+### HT16K33 — 4 dígitos, I2C
+
+```
+ ┌────────────────┐
+ │  1 4 : 3 2     │   HH:MM, los dos puntos parpadean cada segundo
+ └────────────────┘
+```
+
+Dirección I2C 0x70, comparte el bus con los sensores y la OLED. Se activa con
+`GPSDO_HT16K33`. Se informa al arrancar como
+`HW: HT16K33 clock display OK (I2C 0x70)`, así que un módulo ausente o mal
+direccionado se detecta de inmediato.
+
+### TM1637 — 4 o 6 dígitos, dos hilos
+
+```
+ ┌────────────────┐
+ │  1 4 : 3 2     │   versión de 4 dígitos: HH:MM
+ └────────────────┘
+ ┌────────────────────┐
+ │  1 4 : 3 2 : 4 5   │   versión de 6 dígitos: HH:MM:SS
+ └────────────────────┘
+```
+
+Usa sus propios pines CLK/DIO, no I2C. `GPSDO_TM1637` selecciona la variante de
+4 dígitos y `GPSDO_TM1637_6` la de 6. Los dos puntos parpadean en los segundos
+pares.
+
+> **TM1637 y la LCD 20×4 no pueden usarse a la vez** — compiten por los mismos
+> pines. Elige uno al compilar.
+
+---
+
 ## Señalización por LED
 
 | LED | Pin | Función |
@@ -458,6 +559,8 @@ TFT: data sprite (1-bit) created
 | Señal OK, modo disciplinado | Operación normal | ENCENDIDO fijo |
 | Holdover manual (`MH`) | Usuario activó holdover | Pulso lento 1000 ms |
 | Holdover automático | Señal perdida durante operación | Pulso rápido 200 ms |
+
+---
 
 ---
 
@@ -500,6 +603,8 @@ de fase de inmediato.
 
 ---
 
+---
+
 ## Holdover automático
 
 Cuando el GPS pierde la señal durante la operación normal (p. ej. antena
@@ -513,6 +618,8 @@ desconectada):
 
 El comando manual `MH` activa el holdover de forma independiente (indicado
 como `H`). `MD` desactiva el holdover (tanto manual como automático).
+
+---
 
 ---
 
@@ -531,7 +638,7 @@ funciona cualquier combinación de mayúsculas/minúsculas.
 | `V` | Versión, autores y enlaces de GitHub |
 | `F` | Vaciar búferes de frecuencia (reiniciar el promediado) |
 | `C` | Iniciar autocalibración (solo centrado del PWM) |
-| `CT` | Calibrar + autoajustar: medir K, derivar PID para todos los algos 3-9 |
+| `CT` | Calibrar + autoajustar: medir K, derivar PID para todos los algos 3-9 (+ LTIC 10 & 11; auto-save) |
 | `T [baud]` | Túnel GPS por USB para u-center — NMEA/UBX bidireccional limpio (la telemetría pasa a Bluetooth si existe, si no se silencia); baud opcional de la UART GPS, conservado al salir; sale tras 300 s |
 | `SP <n>` | Fijar el DAC PWM directamente (1–65535), omite el algoritmo |
 | `RH` | Modo de informe: legible por humanos (por defecto) |
@@ -626,7 +733,7 @@ en nanosegundos respecto a `zero_offset`; sin calibrar, recurre a un error en
 voltios en torno al medio de escala con un aviso único. Es clave que la banda de
 trabajo del detector puede quedar lejos del medio del ADC (p. ej. 0–0,45 V), así
 que el lazo nunca asume que 1,65 V es el centro — usa el `zero_offset` calibrado.
-El estado persiste en EEPROM, así que un reinicio en caliente (`RB`) reanuda
+El estado persiste en el flash-ring, así que un reinicio en caliente (`RB`) reanuda
 donde se quedó en vez de arrancar en frío desde ACQ.
 
 Selecciónalo con `LA 10`; el picDIV se arma automáticamente al entrar en ACQ.
@@ -652,9 +759,70 @@ Los demás comandos de abajo fijan/muestran parámetros, que `ES` guarda.
 | `LKP/LKI/LKD/LKL [v]` | PID de etapa LOCK: Kp / Ki / Kd / I_LIMIT |
 | `LAT [v]` | Umbral ACQ→DPLL (fase en rango, ns) |
 | `LDT [v]` | Umbral DPLL→LOCK (error de frecuencia) |
-| `LIV [v]` | Intervalo de actualización LOCK (segundos, por defecto 300) |
+| `LIV [v]` | Intervalo de actualización LOCK (segundos, por defecto 300, 1..600 s) |
 | `LPOL [-1/0/1]` | Polaridad del detector de fase (0 = auto) |
 | `LCV` | Muestra el voltaje TIC actual (ayuda en la calibración) |
+
+### Orden de calibración: primero `CT`, después `LC`
+
+**Ejecuta `CT` antes que `LC`.** No son independientes: `LC` barre el PWM para
+alcanzar una tasa de fase objetivo, y para saber cuánto desviarlo necesita K — la
+pendiente en Hz por LSB de tu OCXO, que es justo lo que mide `CT`. Sin ella, `LC`
+recurre a un valor genérico de 3000 LSB/Hz y la calibración sale escalada por lo
+que tu oscilador se aparte de esa suposición.
+
+La trampa es que **la respuesta equivocada no parece equivocada**. En una placa,
+`LC` antes de `CT` dio ns_per_volt = 1592,8 y un resultado WEAK; tras `CT` la
+misma placa dio 921,2 y PASSED — un factor de 1,7, sin nada en la primera
+ejecución que hiciera sospechar.
+
+El orden para una placa nueva:
+
+1. `CT` — mide K, deriva los juegos de PID y los guarda automáticamente
+2. `LC` — calibra el detector de fase, se guarda solo si pasa
+3. `LPOL -1` o `LPOL 1` si el lazo indica que la polaridad no está fijada, luego `ES LTIC`
+4. `LA 10` o `LA 11`, luego `ES ALGO`
+
+`LC` avisa si no se ha ejecutado `CT`, pero continúa igualmente — repetirlo cuesta
+tres minutos y hay motivos legítimos para barrer primero.
+
+### Algoritmo 11 — LTIC-Lars (lazo PI continuo)
+
+Un único lazo PI continuo sin máquina de estados ACQ/DPLL/LOCK, según el
+controlador GPSDO original del difunto Lars Walenius. Comparte la calibración
+del detector con el algoritmo 10 (`LC`), así que una sola calibración sirve a
+ambos lazos. Las etiquetas de tendencia usan el mismo vocabulario que el
+algoritmo 10: **ACQ** (guiado por frecuencia, detector de fase saturado),
+**PLL** (guiado por fase) y **LOCK**.
+
+| Comando | Descripción |
+|---------|-------------|
+| `LG [v]` | Ganancia. **0 = auto**, derivada de la calibración `CT`; un valor no nulo fija una escala manual |
+| `LD [v]` | Amortiguación |
+| `LTC [s]` | Constante de tiempo del lazo, 1..600 s |
+| `LFD [n]` | Divisor del filtro — la constante del prefiltro es `LTC / n` |
+| `LTO [adc]` | Offset del TIC: objetivo de fase en cuentas de ADC |
+| `LPL [ns]` | Límite de fase de enganche — anchura de la ventana |
+| `LPF [n]` | Factor de enganche: la ventana debe mantenerse `LPF × LTC` segundos |
+| `LTK [v]` | Feed-forward del coeficiente de temperatura (0 = desactivado) |
+| `LTR [adc]` | Referencia de temperatura, cuentas de ADC |
+
+Ninguno se guarda automáticamente; `ES LTIC` los almacena junto con los
+parámetros del algoritmo 10.
+
+### Ventana de promediado del término de amortiguación — `FA` / `FAD` / `FAL`
+
+| Comando | Descripción |
+|---------|-------------|
+| `FA [n]` | Fija la ventana de promediado del término de amortiguación en **ambas** etapas LTIC (10/100/1000 s) |
+| `FAD [n]` | Solo la etapa DPLL |
+| `FAL [n]` | Solo la etapa LOCK |
+
+100 es el valor histórico y no cambia nada. Una ventana más corta es la
+candidata para corregir un ciclo límite cuyo periodo sea un par de veces la
+longitud de promediado — el retardo de grupo de una media larga puede quedar
+cerca de la cuadratura con la respuesta del propio lazo.
+
 
 #### Corrección de diente de sierra (qErr) — `SAW 0|1`
 
@@ -682,36 +850,7 @@ pico de la rampa justo tras el flanco PPS (véanse las notas de hardware TIC má
 abajo), cada lectura de fase se empareja con el qErr reportado para el pulso de
 ese mismo segundo.
 
-#### Ventana de promediado del término de amortiguación — `FA` / `FAD` / `FAL`
-
-El lazo del algoritmo 10 alimenta su término de frecuencia (amortiguación) desde
-un promedio de frecuencia móvil. Medidas contra referencia de rubidio (Dan
-Wiering, tinyPFA contra un S250) mostraron un ciclo límite de ~220 s en algo 10
-cuyo mecanismo es el retardo de grupo del promedio largo de 100 s cayendo cerca
-de la cuadratura — mientras que el algoritmo 7 en la misma referencia era limpio,
-lo que apunta a la estructura de segundo orden del DPLL y no al promedio en sí.
-
-`FA` selecciona qué ventana lee ese término, y los estados DPLL (adquisición) y
-LOCK (estacionario) pueden ajustarse de forma independiente:
-
-| Comando | Efecto |
-|---------|--------|
-| `FAD [n]` | Ventana solo para el estado **DPLL** |
-| `FAL [n]` | Ventana solo para el estado **LOCK** |
-| `FA [n]` | Ambos a la vez |
-| `FA` | Muestra ambas ventanas actuales |
-
-`n` es 10, 100 o 1000 segundos; **100 es el valor por defecto en cada uno y
-reproduce el comportamiento anterior bit a bit**. Solo se afecta el término de
-frecuencia — la detección de fuga, el autoaprendizaje, la máquina de estados y el
-phase PI se mantienen en el promedio suave de 100 s. Ambas ventanas se guardan
-con `ES` (grupo LTIC).
-
-La separación es tanto diagnóstico como solución: si `FAD` cambia el ciclo, vive
-en la adquisición; si solo `FAL`, en el estado estacionario; si ninguno lo toca,
-el ciclo está en la rama de fase, no en el término de frecuencia. Es
-deliberadamente un conmutador, no un nuevo valor por defecto — la ventana corta
-es una candidata, a validar contra una referencia antes de cambiar nada.
+---
 
 ---
 
@@ -789,46 +928,99 @@ irrelevante para el ancho de banda del lazo: LOCK actualiza cada pocos segundos
 (muy por debajo de 0,2 Hz), así que la constante de tiempo del detector está
 órdenes de magnitud por encima del lazo.
 
-## EEPROM
+### Entrada de fase LTIC (Lars' TIC)
 
-| Comando | Descripción |
-|---------|-------------|
-| `ES [grupo]` | Guardar en EEPROM — todo, o un solo grupo (ver abajo) |
-| `ER` | Recuperar parámetros desde EEPROM |
-| `EE` | Borrar EEPROM (restaurar valores por defecto) |
+Con `GPSDO_LTIC` activado, el firmware lee un contador de intervalo de tiempo
+por hardware (el TIC de Lars Walenius): un condensador de 1 nF se carga con una
+corriente constante durante el intervalo GPS-1PPS → OCXO-1PPS, y la tensión
+retenida en PA1 se muestrea en el pico de la rampa ~50 µs tras el flanco PPS;
+no hace falta descarga activa: el diodo bloquea y la fuga de ~25 ms limpia el
+condensador antes del siguiente pulso de 1 Hz. La tensión
+es una medida directa y de alta resolución de la diferencia de fase entre ambos
+pulsos — mucho más fina que el contador de ciclos TIM2 que usan los algoritmos
+de frecuencia (3–9).
 
-`ES` por sí solo guarda toda la página de parámetros, como antes. `ES <grupo>`
-guarda solo un bloque y deja el resto de ajustes en su valor almacenado — así,
-confirmar un cambio de zona horaria no puede fijar de paso un PID con el que aún
-estabas experimentando. Los grupos son `CORE` (PWM, algoritmo activo), `PID`
-(ganancias algo 3-9, mezcla, paso NN), `TZ` (zona horaria), `LTIC` (ajuste del
-lazo algo-10, umbrales y las ventanas FA), `LCAL` (calibración de rampa algo-10),
-`CAL` (offsets de presión/altitud) y `MISC` (survey, warmup, splash, ring, saw,
-learn). `ES` con un nombre desconocido los lista en vez de adivinar. Cada guardado
-rellena el búfer de emulación desde flash, escribe la sección pedida y hace flush;
-los bytes intactos conservan sus valores en flash.
+El lazo de control **disciplina el OCXO directamente desde esta fase** mediante
+el algoritmo 10 (`LA 10`) — el lazo de tres etapas ACQ → DPLL → LOCK descrito
+abajo. La fase aparece en el informe serie (`Vphase:` y `dph:` en ns), como una
+fila `Vph:`/`dph:` en el TFT y como una línea `LTIC phase (PA1)` en la lista de
+verificación de arranque. Una vez que `LC` ha calibrado la rampa, la fase se
+reporta en nanosegundos relativa al `zero_offset` calibrado, usando el
+`ns_per_volt` medido; antes de calibrar solo se muestran voltios. (La constante
+de compilación `LTIC_NS_PER_VOLT` en `gpsdo_config.h` es un fallback heredado y
+normalmente queda en 0 — `LC` mide la pendiente real por placa y la guarda en
+los parámetros vivos.)
 
 ---
 
-## EEPROM
+---
 
-La EEPROM (emulada en la Flash del STM32) almacena 144 bytes:
+## Almacenamiento de ajustes (flash-ring)
 
-| Dirección | Tamaño | Contenido |
-|-----------|--------|-----------|
-| 0–5 | 6 B | Firma `"GPSD2"` |
-| 6–7 | 2 B | Valor del DAC PWM (big-endian) |
-| 8 | 1 B | Número de algoritmo (0–9) |
-| 9 | 1 B | Desfase heredado en horas enteras (sustituido por 234) |
-| 10–121 | 112 B | PID: g_pid[3..9] × {Kp, Ki, Kd, I_LIMIT} |
-| 122–133 | 12 B | g_blend_crossover, g_blend_scale, g_nn_max_step |
-| 134–137 | 4 B | g_pressure_offset (comando PO) |
-| 138–141 | 4 B | g_altitude_offset (comando AO) |
-| 142 | 1 B | Flag tz_auto heredado (sustituido por 234) |
-| 234 | 1 B | Modo de zona (0 = manual, 1 = auto-EU, 2 = regla POSIX) |
-| 235 | 2 B | Desfase manual, minutos (int16) |
-| 237 | 48 B | Regla POSIX TZ, como texto |
-| 143 | 1 B | habilitación de survey-in (0 = off, 1 = on, comando `SV`) |
+Los ajustes viven en un anillo con nivelado de desgaste en el **sector 7** del
+flash (0x08060000, 128 KB) — el último, para que el firmware conserve el máximo
+espacio contiguo por debajo. No hay EEPROM, ni emulada ni de ningún otro tipo.
+
+Los registros llevan tipo, así que el bloque de ajustes y los datos aprendidos
+comparten un mismo anillo sin colisionar. Cada slot lleva un CRC16, los slots van
+numerados por secuencia y gana el más reciente válido, y cada escritura se relee y
+verifica. Un corte de corriente a mitad de escritura deja por tanto intactos los
+ajustes anteriores, en vez de un medio registro corrupto.
+
+El bloque de ajustes guarda el PWM y el algoritmo, los juegos PID de los
+algoritmos 3-9, la calibración LTIC y las ganancias por etapa, los parámetros
+LTIC-Lars, las ventanas de amortiguación, los offsets de sensores, los
+indicadores de arranque y la zona horaria. Está versionado: un bloque escrito por
+un firmware anterior con distinto formato se rechaza en lugar de malinterpretarse,
+y la placa arranca con los valores por defecto.
+
+| Comando | Efecto |
+|---------|--------|
+| `ES [grupo]` | Guardar todo, o un grupo: `TZ` / `PID` / `LTIC` / `FLAGS` / `ALGO` / `PO` |
+| `ER` | Recuperar los ajustes del anillo |
+| `EE` | Borrar los ajustes — volver a los valores por defecto |
+| `EW` | Desgaste del flash: ciclos de borrado y slots usados |
+| `CR YES` | Reinicio en frío: borrar el anillo por completo |
+
+Las preferencias se guardan solas; el ajuste del lazo requiere un `ES` explícito.
+En ambos casos la respuesta indica qué se aplicó — véanse las notas de
+persistencia en la sección del CLI.
+
+### Nivelación de desgaste de Flash (datos vivos)
+
+Los datos “vivos” — deriva/amortiguación aprendida (`LRN`), calibración LC y
+el último PWM — cambian mucho más a menudo que los ajustes, por lo que se
+almacenan junto al bloque de ajustes, en un **buffer circular con
+nivelación de desgaste** que ocupa el sector 6 de Flash (0x08040000, 128 KB).
+Actívalo con `FR 0|1` (guardado con `ES`, activo por defecto); consulta el
+desgaste con `EW`.
+
+Cada guardado escribe el siguiente slot de 32 bytes; el sector se borra solo
+cuando el anillo da la vuelta (una vez cada 4095 guardados). A 100
+guardados/día son ~9 borrados/año, así que la resistencia del Flash (~10 000
+ciclos) dura del orden de mil años. Un guardado ocurre solo cuando un valor se
+ha asentado en un nuevo nivel — la deriva cambió > 8 LSB o la amortiguación
+> 0.03, y ≥ 20 min desde el último guardado — mientras que una calibración
+`LC` exitosa guarda de inmediato. Cada slot lleva un CRC y un número de
+secuencia, así que un corte de energía a mitad de escritura se detecta y se usa
+el slot bueno anterior.
+
+Con el anillo **activo**, `ES` nunca sobrescribe la calibración ni los valores
+aprendidos — solo guarda ajustes genuinos (ganancias PID, umbrales, flags).
+Los datos vivos van al anillo junto con los ajustes; `ES` los guarda como
+respaldo.
+
+### Conservar datos vivos al re-flashear el firmware
+
+- **Bootloader / DFU / Arduino IDE** toca solo los sectores de firmware (0–5);
+  el anillo del sector 7 sobrevive.
+- **Borrado total del chip con J-Link/ST-Link** borra todo. Para conservar
+  calibración y aprendizaje, borra solo los sectores 0–5:
+  `erase 0x08000000 0x0803FFFF`, luego `loadbin firmware.bin 0x08000000`.
+- Si el anillo se borra, el firmware reaprende/recalibra desde los valores por
+  defecto — nada se rompe, solo se pierde el ajuste acumulado.
+
+---
 
 ---
 
@@ -904,40 +1096,6 @@ estacionario existente sin cambios.
 
 ---
 
-## Nivelación de desgaste de Flash (datos vivos)
-
-Los datos “vivos” — deriva/amortiguación aprendida (`LRN`), calibración LC y
-el último PWM — cambian mucho más a menudo que los ajustes, por lo que se
-almacenan aparte de la EEPROM de ajustes, en un **buffer circular con
-nivelación de desgaste** que ocupa el sector 6 de Flash (0x08040000, 128 KB).
-Actívalo con `FR 0|1` (guardado con `ES`, activo por defecto); consulta el
-desgaste con `EW`.
-
-Cada guardado escribe el siguiente slot de 32 bytes; el sector se borra solo
-cuando el anillo da la vuelta (una vez cada 4095 guardados). A 100
-guardados/día son ~9 borrados/año, así que la resistencia del Flash (~10 000
-ciclos) dura del orden de mil años. Un guardado ocurre solo cuando un valor se
-ha asentado en un nuevo nivel — la deriva cambió > 8 LSB o la amortiguación
-> 0.03, y ≥ 20 min desde el último guardado — mientras que una calibración
-`LC` exitosa guarda de inmediato. Cada slot lleva un CRC y un número de
-secuencia, así que un corte de energía a mitad de escritura se detecta y se usa
-el slot bueno anterior.
-
-Con el anillo **activo**, `ES` nunca sobrescribe la calibración ni los valores
-aprendidos — solo guarda ajustes genuinos (ganancias PID, umbrales, flags).
-Con el anillo **inactivo**, `ES` sí guarda esos valores vivos en EEPROM como
-respaldo.
-
-### Conservar datos vivos al re-flashear el firmware
-
-- **Bootloader / DFU / Arduino IDE** toca solo los sectores de firmware (0–5);
-  el anillo (6) y la EEPROM de ajustes (7) sobreviven.
-- **Borrado total del chip con J-Link/ST-Link** borra todo. Para conservar
-  calibración y aprendizaje, borra solo los sectores 0–5:
-  `erase 0x08000000 0x0803FFFF`, luego `loadbin firmware.bin 0x08000000`.
-- Si el anillo se borra, el firmware reaprende/recalibra desde los valores por
-  defecto — nada se rompe, solo se pierde el ajuste acumulado.
-
 ---
 
 ## Autoajuste (comando `CT`)
@@ -959,11 +1117,13 @@ Procedimiento (~3 minutos, determinista):
 
 El resultado se verifica (K debe estar entre 0.1–2 mHz/LSB y el GPS debe
 mantener señal); si falla, los parámetros quedan sin cambios. Ejecute `ES`
-después para guardar los valores ajustados en EEPROM. A diferencia del
+después para guardar los valores ajustados en el flash-ring. A diferencia del
 autoajuste por realimentación de relé, `CT` nunca desestabiliza el lazo — la
 constante de tiempo del lazo aquí es de cientos de segundos, así que la
 oscilación forzada tardaría horas y se corrompería por la deriva térmica;
 derivar las ganancias directamente de una K medida es más rápido y más seguro.
+
+---
 
 ---
 
@@ -986,6 +1146,8 @@ latitud/longitud y la fecha:
 
 ---
 
+---
+
 ## Informe de hardware al arranque
 
 Cada dispositivo opcional informa de su resultado de detección por
@@ -1005,29 +1167,6 @@ HW: TM1637 clock display  enabled (GPIO PA8/PB4, write-only - not verifiable)
 Un dispositivo ausente informa `not found` y el firmware continúa sin él.
 
 ---
-
-## Entrada de fase LTIC (Lars' TIC)
-
-Con `GPSDO_LTIC` activado, el firmware lee un contador de intervalo de tiempo
-por hardware (el TIC de Lars Walenius): un condensador de 1 nF se carga con una
-corriente constante durante el intervalo GPS-1PPS → OCXO-1PPS, y la tensión
-retenida en PA1 se muestrea en el pico de la rampa ~50 µs tras el flanco PPS;
-no hace falta descarga activa: el diodo bloquea y la fuga de ~25 ms limpia el
-condensador antes del siguiente pulso de 1 Hz. La tensión
-es una medida directa y de alta resolución de la diferencia de fase entre ambos
-pulsos — mucho más fina que el contador de ciclos TIM2 que usan los algoritmos
-de frecuencia (3–9).
-
-El lazo de control **disciplina el OCXO directamente desde esta fase** mediante
-el algoritmo 10 (`LA 10`) — el lazo de tres etapas ACQ → DPLL → LOCK descrito
-abajo. La fase aparece en el informe serie (`Vphase:` y `dph:` en ns), como una
-fila `Vph:`/`dph:` en el TFT y como una línea `LTIC phase (PA1)` en la lista de
-verificación de arranque. Una vez que `LC` ha calibrado la rampa, la fase se
-reporta en nanosegundos relativa al `zero_offset` calibrado, usando el
-`ns_per_volt` medido; antes de calibrar solo se muestran voltios. (La constante
-de compilación `LTIC_NS_PER_VOLT` en `gpsdo_config.h` es un fallback heredado y
-normalmente queda en 0 — `LC` mide la pendiente real por placa y la guarda en
-los parámetros vivos.)
 
 ---
 
@@ -1052,6 +1191,8 @@ variación entre unidades de dos piezas nominalmente idénticas.
 
 ---
 
+---
+
 ## Configuración de compilación
 
 El archivo `gpsdo_config.h` controla la compilación. Interruptores clave:
@@ -1073,7 +1214,6 @@ El archivo `gpsdo_config.h` controla la compilación. Interruptores clave:
 #define GPSDO_BLUETOOTH          // HC-06 en Serial2 (57600 Bd)
 
 // Otros:
-#define GPSDO_EEPROM             // Persistencia de parámetros
 #define GPSDO_PICDIV             // Soporte de picDIV
 #define GPSDO_UBX_CONFIG         // Configuración UBX de NEO-6M/7M
 #define GPSDO_GEN_2kHz_PB5       // Generador de 2 kHz en PB5
@@ -1094,6 +1234,8 @@ cuando la tarea GPS se interrumpe brevemente. Un `#define` normal en el sketch
 no funcionaría — el `HardwareSerial.cpp` del core es una unidad de traducción
 separada que solo ve flags del compilador. El archivo se detecta
 automáticamente; no hay nada que activar.
+
+---
 
 ---
 
@@ -1119,14 +1261,94 @@ automáticamente; no hay nada que activar.
 
 ---
 
+---
+
+## Hoja de ruta
+
+### Planeado
+
+**Dos puertos USB CDC.** Hoy un único dispositivo serie comparte el CLI con todo
+lo demás, así que tunelizar el receptor hacia u-center supone renunciar a la
+consola. Dos endpoints CDC en un dispositivo compuesto los separarían: el primero
+sigue siendo el CLI tal cual, el segundo pasa a ser un túnel GPS transparente, de
+modo que u-center pueda configurar el receptor mientras la consola sigue
+informando.
+
+**DAC delta-sigma de 24 bits sobre SPI + DMA.** La tensión de control procede hoy
+de un PWM de 16 bits a través de un filtro RC. Con las pendientes típicas de
+estos osciladores un LSB ya equivale a unas pocas partes en 10¹¹, así que la
+cuantización no es hoy el límite — pero fija un suelo, y la constante de tiempo
+RC necesaria para alisar un PWM de 16 bits retarda además el lazo.
+
+El sustituto previsto saca un **modulador delta-sigma de segundo orden** por SPI
+con DMA, conformando el ruido de cuantización lejos de las frecuencias que
+importan al lazo en vez de limitarse a filtrarlo. El trabajo lo hace el DMA, así
+que el modulador no cuesta tiempo de CPU ni latencia de interrupción. Una
+resolución efectiva del orden de 24 bits con una constante analógica mucho más
+corta parece alcanzable.
+
+El diseño de Alan (MIS42N) sobre PIC llega al mismo sitio por otro camino — un PWM
+de 10 bits con dithering mediante un acumulador de 14 bits, lo que da 24 bits a
+40 kHz — y fue lo que sugirió esta línea de trabajo.
+
+### No planeado
+
+**Los algoritmos 0–9 están congelados.** Permanecen en el firmware, siguen
+funcionando y se respetan los ajustes ya afinados para ellos. Pero el desarrollo
+se ha detenido: el algoritmo 11 midió entre 2 y 3 veces mejor que un algoritmo 10
+correctamente ajustado en los tiempos de promediado donde un GPSDO se gana su
+sitio, sobre hardware independiente y contra una referencia de rubidio. El
+esfuerzo va a los algoritmos 10 y 11.
+
+Se conservan en vez de borrarse porque once enfoques documentados del mismo
+problema de control valen más como referencia que un árbol de fuentes más
+limpio, y porque la configuración existente de nadie debería romperse. No habrá
+funciones nuevas ahí, y conviene tratar el feed-forward autoaprendido (`LRN`)
+como parte de ese mismo grupo congelado: sirve solo a los algoritmos 3–9.
+
+---
+
 ## Requisitos
 
 - **Placa**: WeAct BlackPill STM32F411CE o F401CCU6
-- **IDE**: Arduino IDE con core STM32duino ≥ 2.2.0
+- **IDE**: Arduino IDE con core STM32duino **2.2.0 – 2.12.0**
+  (véase la nota sobre el core 3.0.0 más abajo)
 - **Bibliotecas**: STM32duino FreeRTOS, TinyGPS++, U8g2,
   Adafruit AHTX0, Adafruit BMP280, Adafruit INA219,
-  hd44780 (para LCD), TFT_eSPI (para TFT), EEPROM (STM32)
+  hd44780 (para LCD), TFT_eSPI (para TFT) (los ajustes viven en el flash-ring del chip, así que no hace falta la biblioteca EEPROM)
 - **Ajustes de compilación**: Tools → C Runtime Library → Newlib Nano + Float Printf/Scanf
+
+### Core STM32duino 3.0.0 — todavía no soportado
+
+**Compila con el core 2.12.0 o anterior.** El core 3.0.0 (publicado el 23 de
+julio de 2026) trae dos cambios que sus propias notas de versión marcan como
+mayores: el **despliegue de ArduinoCore-API** y HALv2 para la serie STM32C5xx.
+Tres consecuencias importan aquí:
+
+1. **`ltoa()` ha desaparecido.** Es una extensión no estándar que suministraba
+   el core anterior; el firmware la usa en cuatro sitios. En 3.0.0 no compilan y
+   tendrían que pasar a `snprintf(buf, n, "%ld", …)`.
+2. **`HardwareSerial` deja de ser la clase concreta.** Bajo ArduinoCore-API es
+   una interfaz abstracta, así que `HardwareSerial Serial2(PA3, PA2)` ya no
+   instancia. Lo habitual es un typedef que elija la clase correcta según la
+   versión del core.
+3. **TFT_eSPI deja de controlar el panel.** Este es el bloqueante. La biblioteca
+   usa `SPIClass` solo para configurar los pines y levantar el periférico, y
+   luego habla con el controlador mediante `HAL_SPI_Transmit()` en bruto sobre
+   su propio manejador. Cuando la capa SPI subyacente cambia, el panel puede
+   quedarse sin una secuencia de inicialización válida — el síntoma observado es
+   una **pantalla en blanco**, con el CLI y la telemetría funcionando con normalidad.
+
+Los puntos 1 y 2 son menores y podrían condicionarse por versión en cualquier
+momento. El punto 3 reside en TFT_eSPI, no en este firmware, así que 3.0.0 debe
+esperar a la biblioteca. Dado que 2.12.0 es una versión completa y nada de aquí
+necesita 3.0.0, quedarse en 2.12.0 no cuesta nada.
+
+> Conviene saberlo al buscar: la mayoría del material sobre «Arduino core 3.0.0»
+> en la red trata del core **ESP32**, un proyecto distinto cuya guía de migración
+> a 3.0 no aplica a STM32.
+
+---
 
 ---
 
@@ -1134,26 +1356,3 @@ automáticamente; no hay nada que activar.
 
 Publicado bajo los mismos términos que el proyecto original de André Balsa.
 
-
-## Disciplina LTIC de tres etapas (algoritmo 10) — novedades v0.5x–v0.88
-
-- **`LC` — autocalibración con un comando**: arma el picDIV, parte del punto
-  inferior determinista, ordena una velocidad de barrido derivada de K,
-  muestrea toda la banda en una pasada abajo→arriba y escala ns/V con
-  avg100. Veredicto `PASSED`/`MARGINAL`.
-- **Ganancias auto-ajustadas** desde K (`CT`) y ns/V + rango (`LC`).
-  LOCK: banda muerta, codo suave, tope ~4 mHz.
-- **ADC robusto**: mediana de 16 lecturas por PPS + puerta de outliers.
-- **Guardián de fuga**: fase saturada + |df| > 0,5 Hz congela el lazo.
-- **Color de lock fiable**: verde SOLO en LOCK vivo (algoritmo 10).
-- **Comandos**: `LC`, `LL`, `LPOL -1|0|1`, `LIV 1..30`, `WU 0|1`, `SPL 0|1` (animación de arranque, EEPROM), `FR 0|1` (buffer circular en Flash para datos vivos, EEPROM), `EW` (estadísticas de desgaste de Flash), `SAW 0|1` (corrección de diente de sierra qErr para LTIC, EEPROM).
-  Animaciones LED: warmup = onda 'o' inferior, survey-in = 'o' superior,
-  calibración = "CAL" + spinner.
-
-## Soporte de TFT a color (TFT_eSPI)
-
-Cualquier pantalla TFT_eSPI de **320×240** o **480×320** debería funcionar
-(`TFT_SX()/TFT_SY()`). Probadas: ILI9341, ST7789, ILI9488. Activa el
-`GPSDO_TFT_*` adecuado en `gpsdo_config.h` y configura el controlador y los
-pines en `User_Setup.h` (SPI1: SCK=PA5, MOSI=PA7); cualquier panel de
-320×240 o 480×320 encaja sin cambios de código.

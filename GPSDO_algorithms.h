@@ -1,7 +1,7 @@
 /**
  * GPSDO_algorithms.h — Control loop algorithm declarations and tunable parameters
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -29,13 +29,8 @@ typedef struct {
     double I_LIMIT;
 } PidParams_t;
 
-/* g_pid[3..7] hold Kp/Ki/Kd/I_LIMIT for algorithms 3-7. Indices 8 and 9 are NOT
- * spare: algorithms 8 (hybrid) and 9 (NN) read their I_LIMIT from here, and the
- * IL command accordingly accepts 3-9 where KP/KI/KD accept only 3-7. What those
- * two ignore is Kp/Ki/Kd — the hybrid takes its PID from g_pid[6] and g_pid[7],
- * the NN uses fixed weights — so CT leaves those fields alone on purpose.
- * Indices 0-2 really are unused: algorithms 0-2 are open-loop (primitive,
- * forced drift, random walk) and have nothing to tune.
+/* g_pid[3..7] hold the tunable coefficients for algorithms 3-7.
+ * Indices 0-2, 8, 9 are unused placeholders.
  * Algorithms read these at runtime; CLI commands KP/KI/KD/IL modify them. */
 extern PidParams_t g_pid[10];
 
@@ -53,8 +48,10 @@ extern double g_nn_max_step;       /* LSB — max PWM delta per step, default 20
  * frequency+phase quickly with a wide-band PID, LOCK then updates slowly
  * (every lock_interval_s) with a narrow-band PID to approach minimum error.
  *
- * Calibrate ns_per_volt / zero_offset / range_ns on real hardware (LC) before
- * selecting the algorithm: without them the phase reading has no scale. */
+ * NOTE: the loop itself is not implemented yet (planned "phase A"); these
+ * parameters, their CLI commands and EEPROM persistence exist now so the
+ * configuration survives reboots and is ready when the loop is written.
+ * Calibrate ns_per_volt / zero_offset / range_ns on real hardware first. */
 typedef struct {
     /* TIC calibration */
     float ns_per_volt;       /* voltage→time slope [ns/V] (0 = uncalibrated) */
@@ -76,6 +73,39 @@ typedef struct {
 
 extern LticParams_t g_ltic;
 void ltic_autotune(void);
+
+/* ---- Algorithm 11 (LTIC-Lars) — continuous PI loop after Lars Walenius ----
+ * A single continuous PI loop (no ACQ/DPLL/LOCK state machine), with a filtered
+ * phase term, adaptive pre-filter, and an optional temperature feed-forward.
+ * Shares the algo-10 TIC calibration (ns_per_volt / zero_offset) for scale. */
+typedef struct {
+    float    gain;           /* VCO gain: DAC bits per TIC ns (0 = auto from CT) */
+    float    damping;        /* loop damping on the integral term            */
+    uint16_t time_const_s;   /* loop time constant [s], 1..600               */
+    uint8_t  filter_div;     /* pre-filter const = time_const_s / filter_div */
+    uint16_t tic_offset;     /* phase reference point [ADC counts]           */
+    uint16_t lock_ns_lim;    /* phase window for lock detect [ns]            */
+    uint8_t  lock_factor;    /* lock needs window held for factor*time_const */
+    int16_t  temp_coeff;     /* temperature feed-forward [DAC bits/ADC step] */
+    uint16_t temp_ref;       /* temperature reference point [ADC counts]     */
+    uint8_t  flags;          /* bit0: temp comp enable; other bits reserved  */
+    uint8_t  reserved[6];    /* reserved for future fields                   */
+} LarsParams_t;
+
+extern LarsParams_t g_lars;
+
+/* Algo 11 live telemetry, published by ltic_lars_pi() each cycle so the Learn
+ * line can report what is actually steering instead of stale LRN figures. */
+extern float g_lars_scale;      /* effective frequency-branch scale in use     */
+extern float g_lars_phase_filt; /* filtered phase [ns]                         */
+extern bool  g_lars_locked;     /* loop's own lock flag                        */
+extern bool  g_lars_gain_auto;  /* true = scale came from CT, false = manual LG */
+
+/* flags bits */
+#define LARS_FLAG_TEMP_COMP  0x01
+
+uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount);
+
 extern bool     g_lrn_enable;
 extern float    g_lrn_drift;
 extern float    g_lrn_damp;

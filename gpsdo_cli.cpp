@@ -1,7 +1,7 @@
 /**
  * gpsdo_cli.cpp — vCliTask — Serial / Bluetooth command line interface
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -22,12 +22,15 @@
 #include "GPSDO_algorithms.h"
 #include "flash_ring.h"
 #include "live_store.h"
+#include "settings_store.h"
 #include "ubx_timtp.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
 
-#ifdef GPSDO_BLUETOOTH
+#if defined(GPSDO_BLUETOOTH_PARALLEL)
+  #define CLI_SERIAL g_tee
+#elif defined(GPSDO_BLUETOOTH)
   #define CLI_SERIAL Serial2
 #else
   #define CLI_SERIAL Serial
@@ -66,6 +69,51 @@ static void cli_putln(const char *s)
         xSemaphoreGive(xSerialMutex);
     }
 }
+/* ---- persistence hints -------------------------------------------------
+ * Two classes of setting, and the CLI says which is which every time so the
+ * operator never has to remember:
+ *
+ *  - PREFERENCES (timezone, sensor offsets, boot flags, survey-in) are things
+ *    you set once and expect to stick, and none of them touch the control
+ *    loop. These auto-save, and the message names the group that was written.
+ *  - LOOP TUNING (PID, LTIC, LTIC-Lars, damping windows) stays manual: while
+ *    you are experimenting, "reboot to revert" is a feature, not a nuisance.
+ *    The message names the exact command that would save it.
+ *
+ * Note on SET_FLAGS: it carries WU/SPL/SV (preferences) together with SAW and
+ * LRN (loop-affecting toggles). Auto-saving a preference therefore also commits
+ * whatever SAW/LRN currently are, so the message lists the whole group rather
+ * than pretending otherwise. */
+/* Set when a handler rejected the argument, so the persistence hint can say
+ * "out of range" instead of "not saved — run ES", which would imply there was
+ * a new value worth keeping. Cleared for every command line. */
+static bool s_cli_rejected = false;
+
+static void cli_reject(const char *msg)
+{
+    s_cli_rejected = true;
+    cli_putln(msg);
+}
+
+static void cli_autosaved(settings_partial_t grp, const char *members)
+{
+    if (settings_save_partial(grp)) {
+        cli_puts("  [auto-saved: "); cli_puts(members); cli_putln("]");
+    } else {
+        cli_puts("  [AUTO-SAVE FAILED — run 'ES ' manually: "); cli_puts(members);
+        cli_putln("]");
+    }
+}
+
+static void cli_manual_save(const char *escmd)
+{
+    if (s_cli_rejected) {
+        cli_putln("  [not saved — value out of range; accepted range shown above]");
+        return;
+    }
+    cli_puts("  [not saved — run '"); cli_puts(escmd); cli_putln("' to keep it]");
+}
+
 static void cli_putint(int v)
 {
     static char tmp[14];
@@ -134,11 +182,10 @@ extern bool    g_show_local_time;
 extern bool    g_report_paused;
 extern bool    g_svin_enabled;
 
-/* EEPROM helpers declared in gpsdo_state.cpp (EeGroup_t is in gpsdo_state.h). */
-extern void eeprom_save(void);                 /* == eeprom_save_group(EE_GRP_ALL) */
-extern void eeprom_save_group(EeGroup_t grp);
-extern void eeprom_recall(void);
-extern void eeprom_erase(void);
+/* EEPROM helpers declared in gpsdo_state.cpp */
+extern void persist_save(void);
+extern void persist_recall(void);
+extern void persist_erase(void);
 
 /* -----------------------------------------------------------------------
  * Help text
@@ -159,7 +206,7 @@ static void print_help(void)
     cli_putln("  RH / RD     Human readable / Tab Delimited reporting");
     cli_putln("  RP / RR     Report Pause / Report Resume");
     cli_putln("  MH / MD     Mode Holdover / Mode Disciplined");
-    cli_putln("  LA <0-10>   Loop Algorithm select (10 = LTIC phase discipline)");
+    cli_putln("  LA <0-11>   Loop Algorithm select (10=LTIC 3-stage, 11=LTIC-Lars)");
     cli_putln("  LP [n]      List PID Parameters (algo n or current)");
     cli_putln("  KP n val    set Kp for algo n (3-7)");
     cli_putln("  KI n val    set Ki for algo n (3-7)");
@@ -177,21 +224,32 @@ static void print_help(void)
     cli_putln("  LKP/I/D/L   LOCK PID Kp/Ki/Kd/I_LIMIT");
     cli_putln("  LAT/LDT/LIV ACQ thr, DPLL->LOCK thr, LOCK interval s");
     cli_putln("  LPOL [-1/0/1] PWM->phase polarity (0=auto)");
+    cli_putln("  FA/FAD/FAL n  LTIC damping avg window (10/100/1000; both/DPLL/LOCK)");
+    cli_putln("  -- LTIC-Lars (algo 11) continuous-PI params --");
+    cli_putln("  LG [val]    Gain: 0=auto from CT calibration, else manual");
+    cli_putln("  LD [val]    Damping");
+    cli_putln("  LTC [s]     Time Constant (loop, 1-600 s)");
+    cli_putln("  LFD [n]     Filter Divisor (pre-filter = LTC/this)");
+    cli_putln("  LTO [adc]   TIC Offset (phase target, ADC counts)");
+    cli_putln("  LPL [ns]    lock Phase Limit (window)");
+    cli_putln("  LPF [n]     lock Factor (hold = LPF*LTC seconds)");
+    cli_putln("  LTK [val]   Temp coefficient (feed-forward; 0=off)");
+    cli_putln("  LTR [adc]   Temp Reference (ADC counts)");
+    cli_putln("     (credit: Lars Walenius' original PI GPSDO loop)");
     cli_putln("  WU 0|1        - OCXO warmup on boot (saved with ES)");
     cli_putln("  SPL 0|1       - boot animation: 1=full show, 0=static (saved with ES)");
     cli_putln("  LRN 0|1|R     - self-learning drift/damping (R=reset, ES saves)");
     cli_putln("  LCV [V]     ACQ centring target (0=range mid)");
     cli_putln("  AP          Arm picDIV");
-    cli_putln("  ES [group]  EEPROM Save (all, or one: CORE PID TZ LTIC LCAL CAL MISC)");
-    cli_putln("  ER          EEPROM Recall");
-    cli_putln("  EE          EEPROM Erase");
+    cli_putln("  ES [obj]    Save settings to flash ring (obj: TZ/PID/LTIC/FLAGS/ALGO/PO)");
+    cli_putln("  ER          Recall settings (flash ring)");
+    cli_putln("  EE          Erase settings (reset to defaults)");
     cli_putln("  EW          Flash wear stats (ring buffer erase cycles)");
     cli_putln("  FR 0|1      Flash ring buffer on/off (saved with ES)");
-    cli_putln("  SAW 0|1     Sawtooth qErr correction on/off (saved with ES)");
-    cli_putln("  FA/FAD/FAL [n]  Damping avg window 10/100/1000s: both/DPLL/LOCK (ES saves)");
+    cli_putln("  SAW 0|1     Sawtooth qErr correction on/off (algo 10; saved with ES)");
     cli_putln("  ACG g [cap] ACQ centring drive: LSB/V and max step (algo 10)");
-    cli_putln("  RB          Reboot (warm, keep EEPROM)");
-    cli_putln("  CR YES      Cold Restart (erase EEPROM, factory)");
+    cli_putln("  RB          Reboot (warm, keep settings)");
+    cli_putln("  CR YES      Cold Restart (wipe settings, factory defaults)");
     cli_putln("  PO <f>      Pressure Offset");
     cli_putln("  AO <f>      Altitude Offset");
     cli_putln("  TO <n|A>    Fixed UTC offset (h or h:mm) or Auto (EU only)");
@@ -237,9 +295,7 @@ static void print_help_tz(void)
     cli_putln("                   the EU DST rule. Europe only — elsewhere it");
     cli_putln("                   gives whole hours and no DST.");
     cli_putln("  LT 0|1           show UTC or local time");
-    cli_putln("  ES [group]       save to EEPROM (bare = everything; a group = only");
-    cli_putln("                   that block, others on the page kept unchanged:");
-    cli_putln("                   CORE PID TZ LTIC LCAL CAL MISC)");
+    cli_putln("  ES [obj]         save settings to flash ring (obj: TZ/PID/LTIC/FLAGS/ALGO/PO)");
 }
 
 /* -----------------------------------------------------------------------
@@ -253,6 +309,8 @@ static void dispatch(char *line)
                         line[len-1] == ' '))
         line[--len] = '\0';
     if (len == 0) return;
+
+    s_cli_rejected = false;      /* per-command; see cli_reject() */
 
     /* Split verb / argument */
     char *verb = line;
@@ -275,7 +333,12 @@ static void dispatch(char *line)
         cli_putln("Programming assistant: Claude AI (Anthropic)");
         cli_putln("Inspired by v0.06c by Andre Balsa");
         cli_putln("https://github.com/AndrewBCN/STM32-GPSDO");
-        cli_putln("PCB design: Scrachi (EEVBlog forum)");
+        cli_putln("");
+        cli_putln("Algo 11 continuous-PI loop:  the late Lars Walenius");
+        cli_putln("Measurements, algos 10 & 11: Dan Wiering (Rb reference)");
+        cli_putln("ILI9486/9488 support urged:  lucido (EEVBlog)");
+        cli_putln("Dither / DAC discussion:     Alan, MIS42N (EEVBlog)");
+        cli_putln("PCB design (prototype):      Scrachi (EEVBlog)");
         return;
     }
 
@@ -307,13 +370,26 @@ static void dispatch(char *line)
     if (cli_ieq(verb, "CT")) {
         xEventGroupSetBits(xSysEvents, EVT_NEED_TUNE);
         cli_putln("CT: calibrate + auto-tune started (~3 min, 3 PWM points)");
-        cli_putln("Derives K then computes PID for algos 3-9. 'ES' saves.");
+        cli_putln("Derives K, tunes PID (3-9) and LTIC (10 & 11); auto-saves the PID group.");
         return;
     }
 
 #ifdef GPSDO_LTIC
     /* ---- LC: LTIC self-calibration (ns_per_volt, zero_offset, range_ns) ---- */
     if (cli_ieq(verb, "LC")) {
+        /* LC steers the PWM to hit a target phase-sweep rate, and to know how far
+         * to steer it needs K — the Hz-per-LSB slope that CT measures. Without it
+         * the loop falls back to a generic 3000 LSB/Hz, which on a real board is
+         * wrong by whatever factor its OCXO differs by. The result is not
+         * obviously broken, just quietly off: one board reported ns_per_volt
+         * 1592.8 before CT and 921.2 after, a factor of 1.7, with nothing to
+         * suggest the first was suspect. Warn rather than refuse — a re-run of LC
+         * after CT is cheap, and there are legitimate reasons to sweep first. */
+        if (g_pid[7].Kp <= 100.0) {
+            cli_putln("LC: WARNING — no CT calibration yet, so the sweep will use a");
+            cli_putln("    generic VCO slope and the result may be off by a large factor.");
+            cli_putln("    Run 'CT' first, then 'LC'. Continuing anyway.");
+        }
         xEventGroupSetBits(xSysEvents, EVT_NEED_LTIC_CAL);
         cli_putln("LC: LTIC self-calibration started (auto: arms picDIV, centres phase, then ~3 min sweep)");
         cli_putln("Measures TIC slope vs known phase rate. Auto-saves to flash ring if it passes.");
@@ -469,9 +545,10 @@ static void dispatch(char *line)
                 }
                 cli_puts("PWM set: "); cli_putint((int)v);
             } else {
-                cli_putln("SP: value must be 1..65535");
+                cli_reject("SP: value must be 1..65535");
             }
         }
+        if (arg != NULL) cli_manual_save("ES ALGO");
         return;
     }
 
@@ -496,6 +573,21 @@ static void dispatch(char *line)
 #else
                 cli_putln("LA 10 needs GPSDO_LTIC enabled at build time.");
 #endif
+            } else if (v == 11) {
+#ifdef GPSDO_LTIC
+                /* Algo 11 = LTIC-Lars continuous PI. Shares the LTIC detector
+                 * calibration; gain auto-derives from CT unless set with LG. */
+                if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    gCtrl.active_algo = 11;
+                    xSemaphoreGive(xCtrlMutex);
+                }
+                cli_putln("Algorithm: 11 (LTIC-Lars continuous PI)");
+                if (g_ltic.ns_per_volt == 0.0f)
+                    cli_putln("WARNING: LTIC uncalibrated — run LC first for ns-accurate phase.");
+                cli_putln("Watch trend: ACQ (freq-led) / PLL (phase) / LOCK (locked).");
+#else
+                cli_putln("LA 11 needs GPSDO_LTIC enabled at build time.");
+#endif
             } else if (v >= 0 && v <= 9) {
                 if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     gCtrl.active_algo = (uint8_t)v;
@@ -503,9 +595,10 @@ static void dispatch(char *line)
                 }
                 cli_puts("Algorithm: "); cli_putint(v);
             } else {
-                cli_putln("LA: value must be 0..10 (10 = LTIC phase discipline)");
+                cli_reject("LA: value must be 0..11 (10=LTIC 3-stage, 11=LTIC-Lars)");
             }
         }
+        if (arg != NULL) cli_manual_save("ES ALGO");
         return;
     }
 
@@ -658,9 +751,10 @@ static void dispatch(char *line)
         if (arg == NULL) { cli_puts("lock_interval_s="); cli_putint(g_ltic.lock_interval_s); }
         else {
             long v = atol(arg);
-            if (v >= 1 && v <= 30) { g_ltic.lock_interval_s = (uint16_t)v; cli_puts("lock_interval_s="); cli_putint((int)v); }
-            else cli_putln("LIV: 1..30 s (LOCK correction interval)");
+            if (v >= 1 && v <= 600) { g_ltic.lock_interval_s = (uint16_t)v; cli_puts("lock_interval_s="); cli_putint((int)v); }
+            else cli_reject("LIV: 1..600 s (LOCK correction interval)");
         }
+        if (arg != NULL) cli_manual_save("ES LTIC");
         return;
     }
     /* ---- LPOL [-1/0/1] — PWM→phase polarity (0=auto-detect) ---- */
@@ -674,11 +768,13 @@ static void dispatch(char *line)
             cli_puts("s/"); cli_putfloat(g_lrn_osc_amp_ns, 1); cli_putln("ns");
         } else if (arg[0] == 'R' || arg[0] == 'r') {
             g_lrn_drift = 0.0f; g_lrn_damp = 1.0f;
-            cli_putln("LRN: learned drift/damping reset to theory (ES to save)");
+            cli_putln("LRN: learned drift/damping reset to theory");
+            cli_manual_save("ES FLAGS");
         } else {
             int v = atoi(arg);
-            if (v == 0 || v == 1) { g_lrn_enable = (v != 0); cli_puts("learn="); cli_putint(v); cli_putln(" (ES to save)"); }
-            else cli_putln("LRN: 0 (off), 1 (on), or R (reset learned values)");
+            if (v == 0 || v == 1) { g_lrn_enable = (v != 0); cli_puts("learn="); cli_putint(v); cli_putln("");
+                                    cli_manual_save("ES FLAGS"); }
+            else cli_reject("LRN: 0 (off), 1 (on), or R (reset learned values)");
         }
         return;
     }
@@ -687,7 +783,8 @@ static void dispatch(char *line)
             cli_puts("warmup="); cli_putln(g_warmup_enable ? "1 (on)" : "0 (off)");
         } else {
             int v = atoi(arg);
-            if (v == 0 || v == 1) { g_warmup_enable = (v != 0); cli_puts("warmup="); cli_putint(v); cli_putln(" (ES to save)"); }
+            if (v == 0 || v == 1) { g_warmup_enable = (v != 0); cli_puts("warmup="); cli_putint(v); cli_putln("");
+                                    cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV"); }
             else cli_putln("WU: 0 (skip warmup) or 1 (warm up on boot)");
         }
         return;
@@ -699,7 +796,8 @@ static void dispatch(char *line)
             cli_puts("splash="); cli_putln(g_splash_enable ? "1 (animated)" : "0 (static)");
         } else {
             int v = atoi(arg);
-            if (v == 0 || v == 1) { g_splash_enable = (v != 0); cli_puts("splash="); cli_putint(v); cli_putln(" (ES to save)"); }
+            if (v == 0 || v == 1) { g_splash_enable = (v != 0); cli_puts("splash="); cli_putint(v); cli_putln("");
+                                    cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV"); }
             else cli_putln("SPL: 0 (static title only) or 1 (boot animation)");
         }
         return;
@@ -711,8 +809,88 @@ static void dispatch(char *line)
         } else {
             int v = atoi(arg);
             if (v == -1 || v == 0 || v == 1) { g_ltic.polarity = (int8_t)v; cli_puts("polarity="); cli_putint(v); }
-            else cli_putln("LPOL: -1, 0 (auto), or 1");
+            else cli_reject("LPOL: -1, 0 (auto), or 1");
         }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+
+    /* ---- LTIC-Lars (algo 11) parameters ---- */
+    if (cli_ieq(verb, "LG")) {                 /* gain: 0=auto from CT, else manual */
+        if (arg == NULL) {
+            if (g_lars.gain > 0.0f) { cli_puts("gain="); cli_putfloat(g_lars.gain, 3); }
+            else cli_putln("gain=0 (auto from CT calibration)");
+        } else { float v = atof(arg);
+            if (v >= 0.0f && v <= 10000.0f) {
+                g_lars.gain = v;
+                if (v > 0.0f) { cli_puts("gain="); cli_putfloat(v, 3); }
+                else cli_putln("gain=0 (auto from CT calibration)");
+            } else cli_reject("LG: 0..10000 (0=auto from CT, else manual VCO gain)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LD")) {                 /* damping */
+        if (arg == NULL) { cli_puts("damping="); cli_putfloat(g_lars.damping, 3); }
+        else { float v = atof(arg);
+            if (v > 0.0f && v <= 1000.0f) { g_lars.damping = v; cli_puts("damping="); cli_putfloat(v, 3); }
+            else cli_reject("LD: 0..1000 (loop damping)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LTC")) {                /* time constant [s] */
+        if (arg == NULL) { cli_puts("time_const_s="); cli_putint(g_lars.time_const_s); }
+        else { long v = atol(arg);
+            if (v >= 1 && v <= 600) { g_lars.time_const_s = (uint16_t)v; cli_puts("time_const_s="); cli_putint((int)v); }
+            else cli_reject("LTC: 1..600 s (loop time constant)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LFD")) {                /* filter divisor */
+        if (arg == NULL) { cli_puts("filter_div="); cli_putint(g_lars.filter_div); }
+        else { long v = atol(arg);
+            if (v >= 1 && v <= 100) { g_lars.filter_div = (uint8_t)v; cli_puts("filter_div="); cli_putint((int)v); }
+            else cli_reject("LFD: 1..100 (pre-filter = time_const / this)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LTO")) {                /* TIC offset (phase target) [ADC] */
+        if (arg == NULL) { cli_puts("tic_offset="); cli_putint(g_lars.tic_offset); }
+        else { long v = atol(arg);
+            if (v >= 0 && v <= 4095) { g_lars.tic_offset = (uint16_t)v; cli_puts("tic_offset="); cli_putint((int)v); }
+            else cli_reject("LTO: 0..4095 (phase reference, ADC counts)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LPL")) {                /* lock phase window [ns] */
+        if (arg == NULL) { cli_puts("lock_ns_lim="); cli_putint(g_lars.lock_ns_lim); }
+        else { long v = atol(arg);
+            if (v >= 1 && v <= 10000) { g_lars.lock_ns_lim = (uint16_t)v; cli_puts("lock_ns_lim="); cli_putint((int)v); }
+            else cli_reject("LPL: 1..10000 ns (lock phase window)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LPF")) {                /* lock factor */
+        if (arg == NULL) { cli_puts("lock_factor="); cli_putint(g_lars.lock_factor); }
+        else { long v = atol(arg);
+            if (v >= 1 && v <= 100) { g_lars.lock_factor = (uint8_t)v; cli_puts("lock_factor="); cli_putint((int)v); }
+            else cli_reject("LPF: 1..100 (lock hold = factor * time_const)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LTK")) {                /* temp coefficient */
+        if (arg == NULL) { cli_puts("temp_coeff="); cli_putint(g_lars.temp_coeff); }
+        else { long v = atol(arg);
+            if (v >= -32000 && v <= 32000) { g_lars.temp_coeff = (int16_t)v; cli_puts("temp_coeff="); cli_putint((int)v); }
+            else cli_reject("LTK: -32000..32000 (temp feed-forward, DAC/ADC step)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
+        return;
+    }
+    if (cli_ieq(verb, "LTR")) {                /* temp reference [ADC] */
+        if (arg == NULL) { cli_puts("temp_ref="); cli_putint(g_lars.temp_ref); }
+        else { long v = atol(arg);
+            if (v >= 0 && v <= 4095) { g_lars.temp_ref = (uint16_t)v; cli_puts("temp_ref="); cli_putint((int)v); }
+            else cli_reject("LTR: 0..4095 (temp reference, ADC counts)"); }
+        if (arg != NULL) cli_manual_save("ES LTIC");
         return;
     }
     /* ---- LCV [volts] — ACQ centring target (0=use range middle) ---- */
@@ -721,8 +899,9 @@ static void dispatch(char *line)
         else {
             double v = atof(arg);
             if (v >= 0.0 && v <= 3.3) { g_ltic.centre_v = (float)v; cli_puts("centre_v="); cli_putfloat((float)v, 3); }
-            else cli_putln("LCV: 0..3.3 V (0=auto)");
+            else cli_reject("LCV: 0..3.3 V (0=auto)");
         }
+        if (arg != NULL) cli_manual_save("ES LTIC");
         return;
     }
     /* ---- LL — list all LTIC parameters + current state ---- */
@@ -771,9 +950,10 @@ static void dispatch(char *line)
                 g_blend_crossover = v;
                 cli_puts("Blend crossover: "); cli_putfloat((float)v, 4);
             } else {
-                cli_putln("BC: value must be 0.0001..1.0");
+                cli_reject("BC: value must be 0.0001..1.0");
             }
         }
+        if (arg != NULL) cli_manual_save("ES PID");
         return;
     }
 
@@ -787,9 +967,10 @@ static void dispatch(char *line)
                 g_blend_scale = v;
                 cli_puts("Blend scale: "); cli_putfloat((float)v, 4);
             } else {
-                cli_putln("BS: value must be 0.0001..1.0");
+                cli_reject("BS: value must be 0.0001..1.0");
             }
         }
+        if (arg != NULL) cli_manual_save("ES PID");
         return;
     }
 
@@ -803,8 +984,31 @@ static void dispatch(char *line)
                 g_nn_max_step = v;
                 cli_puts("NN max step: "); cli_putfloat((float)v, 1);
             } else {
-                cli_putln("NS: value must be 1..10000");
+                cli_reject("NS: value must be 1..10000");
             }
+        }
+        if (arg != NULL) cli_manual_save("ES PID");
+        return;
+    }
+
+    /* ---- LT [0|1] — show UTC or local time --------------------------------
+     * The help has always documented this and g_show_local_time has always been
+     * read by the display and report paths, but the handler itself was never
+     * written, so the verb silently did nothing. Implemented here to match what
+     * the help promises. Saved by ES with the rest of the timezone group. */
+    if (cli_ieq(verb, "LT")) {
+        if (arg == NULL) {
+            cli_puts("Time display: ");
+            cli_putln(g_show_local_time ? "1 (local)" : "0 (UTC)");
+            return;
+        }
+        if (arg[0] == '0' || arg[0] == '1') {
+            g_show_local_time = (arg[0] == '1');
+            cli_puts("Time display: ");
+            cli_putln(g_show_local_time ? "1 (local)" : "0 (UTC)");
+            cli_autosaved(SET_TZ, "TZ: zone/offset/LT");
+        } else {
+            cli_putln("LT: 0 = UTC, 1 = local time");
         }
         return;
     }
@@ -827,6 +1031,7 @@ static void dispatch(char *line)
             cli_putln("Time offset: AUTO — zone from GPS position, EU DST rule");
             cli_putln("Reliable in Europe only: no DST elsewhere, whole hours");
             cli_putln("only. For anywhere else use TZ (see H TZ).");
+            cli_autosaved(SET_TZ, "TZ: zone/offset/LT");
             return;
         }
         /* Accept "9:30" and "-3:30" as well as plain hours — half-hour zones
@@ -842,6 +1047,7 @@ static void dispatch(char *line)
         cli_puts("Time offset: ");
         cli_put_offset(mins);
         cli_putln("  (manual, no DST)");
+        cli_autosaved(SET_TZ, "TZ: zone/offset/LT");
         return;
     }
 
@@ -875,7 +1081,8 @@ static void dispatch(char *line)
             cli_putln("Note: this zone's DST rule can't be expressed in the");
             cli_putln("POSIX form — using its standard offset year-round.");
         }
-        cli_putln("(takes effect on the next fix; ES saves it)");
+        cli_putln("(takes effect on the next fix)");
+        cli_autosaved(SET_TZ, "TZ: zone/offset/LT");
         return;
     }
 
@@ -885,13 +1092,14 @@ static void dispatch(char *line)
         if (arg == NULL) {
             cli_puts("Survey-in (Time Mode): ");
             cli_putln(g_svin_enabled ? "ENABLED" : "DISABLED");
-            cli_putln("(SV 1 = on, SV 0 = off; takes effect at next boot; ES saves)");
+            cli_putln("(SV 1 = on, SV 0 = off; takes effect at next boot; auto-saved)");
         } else {
             int v = atoi(arg);
             if (v == 0 || v == 1) {
                 g_svin_enabled = (v == 1);
                 cli_puts("Survey-in: ");
                 cli_putln(g_svin_enabled ? "ENABLED (next boot)" : "DISABLED (next boot)");
+                cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV");
                 cli_putln("(ES to save; reboot to apply)");
             } else {
                 cli_putln("SV: use 0 (off) or 1 (on)");
@@ -912,6 +1120,7 @@ static void dispatch(char *line)
             if (v >= -3000.0f && v <= 3000.0f && v != 0.0f) {
                 g_pressure_offset = v;
                 cli_puts("Pressure offset: "); cli_putfloat(v, 2);
+                cli_autosaved(SET_PO, "PO/AO");
             } else {
                 cli_putln("PO: invalid value");
             }
@@ -928,6 +1137,7 @@ static void dispatch(char *line)
             if (v >= -3000.0f && v <= 3000.0f && v != 0.0f) {
                 g_altitude_offset = v;
                 cli_puts("Altitude offset: "); cli_putfloat(v, 2);
+                cli_autosaved(SET_PO, "PO/AO");
             } else {
                 cli_putln("AO: invalid value");
             }
@@ -935,67 +1145,69 @@ static void dispatch(char *line)
         return;
     }
 
-    /* ---- EEPROM ---- */
+    /* ---- Settings persistence (flash ring) ----
+     * ES without an argument saves EVERYTHING (backwards compatible). With
+     * an object name it saves only that group: a deliberate ES TZ cannot
+     * clobber a hand-tuned PID set the way the old full EEPROM write could. */
     if (cli_ieq(verb, "ES")) {
-        /* Bare ES saves the whole page, as it always has. ES <group> saves only
-         * that group, leaving every other setting on the page at its stored
-         * value — so committing a timezone change cannot also stamp in a PID
-         * you were still experimenting with. */
-        EeGroup_t grp = EE_GRP_ALL;
-        if (arg != NULL) {
-            if      (cli_ieq(arg, "CORE")) grp = EE_GRP_CORE;
-            else if (cli_ieq(arg, "PID"))  grp = EE_GRP_PID;
-            else if (cli_ieq(arg, "TZ"))   grp = EE_GRP_TZ;
-            else if (cli_ieq(arg, "LTIC")) grp = EE_GRP_LTIC;
-            else if (cli_ieq(arg, "LCAL")) grp = EE_GRP_LCAL;
-            else if (cli_ieq(arg, "CAL"))  grp = EE_GRP_CAL;
-            else if (cli_ieq(arg, "MISC")) grp = EE_GRP_MISC;
-            else {
-                cli_putln("ES: unknown group. Use one of:");
-                cli_putln("  CORE  PWM + active algorithm");
-                cli_putln("  PID   algo 3-9 gains, blend, NN step");
-                cli_putln("  TZ    timezone (mode, offset, rule)");
-                cli_putln("  LTIC  algo 10 loop tuning + thresholds");
-                cli_putln("  LCAL  algo 10 ramp calibration (LC/LCV)");
-                cli_putln("  CAL   pressure / altitude offsets");
-                cli_putln("  MISC  survey, warmup, splash, ring, saw, learn");
-                cli_putln("  (ES with no group saves everything)");
-                return;
-            }
+        if (arg == NULL) {
+            cli_putln("Saving settings (full)...");
+            settings_save();
+            live_store_request_save();
+            cli_putln("Done.");
+        } else if (cli_ieq(arg, "TZ")) {
+            cli_putln("Saving TZ...");
+            settings_save_partial(SET_TZ);
+            cli_putln("Done.");
+        } else if (cli_ieq(arg, "PID")) {
+            cli_putln("Saving PID...");
+            settings_save_partial(SET_PID);
+            cli_putln("Done.");
+        } else if (cli_ieq(arg, "LTIC")) {
+            cli_putln("Saving LTIC params...");
+            settings_save_partial(SET_LTIC);
+            cli_putln("Done.");
+        } else if (cli_ieq(arg, "FLAGS")) {
+            cli_putln("Saving flags...");
+            settings_save_partial(SET_FLAGS);
+            cli_putln("Done.");
+        } else if (cli_ieq(arg, "ALGO")) {
+            cli_putln("Saving algo+PWM...");
+            settings_save_partial(SET_ALGO);
+            cli_putln("Done.");
+        } else if (cli_ieq(arg, "PO")) {
+            cli_putln("Saving pressure/alt offset...");
+            settings_save_partial(SET_PO);
+            cli_putln("Done.");
+        } else {
+            cli_putln("ES usage: ES | ES TZ|PID|LTIC|FLAGS|ALGO|PO");
         }
-        cli_putln("Saving EEPROM...");
-        eeprom_save_group(grp);
-        /* Snapshot live data to the flash ring only on a full save. A selective
-         * ES is a deliberately narrow act — the user asked to touch one group —
-         * so it must not drag a fresh ring slot in behind it; the ring keeps its
-         * own cadence. A stale ring slot restoring an old PWM after a full ES
-         * would be confusing, hence the snapshot there (costs one of 4095). */
-        if (grp == EE_GRP_ALL) live_store_request_save();
-        cli_putln("Done.");
         return;
     }
     if (cli_ieq(verb, "ER")) {
-        cli_putln("Recalling EEPROM...");
-        eeprom_recall();
+        cli_putln("Recalling settings...");
+        persist_recall();
         return;
     }
     if (cli_ieq(verb, "EE")) {
-        cli_putln("Erasing EEPROM...");
-        eeprom_erase();
+        cli_putln("Erasing settings (will reset to defaults on next boot if sector wiped)...");
+        persist_erase();
         cli_putln("Done.");
         return;
     }
     if (cli_ieq(verb, "EW")) {
-        /* flash-wear diagnostics for the live-data ring buffer */
+        /* flash-wear diagnostics for the ring buffer */
         uint16_t slots = flash_ring_slot_count();
         if (slots == 0) {
-            cli_putln("Flash ring: disabled (FR 0). Enable with 'FR 1' then 'ES'.");
+            cli_putln("Flash ring: not initialised — the sector failed to format.");
         } else {
-            char line[96];
+            char line[112];
             snprintf(line, sizeof(line),
-                     "Flash ring: erase cycles=%lu  slots used=%u/%u  (sector 6, 0x08040000)",
+                     "Flash ring: erase cycles=%lu  slots used=%u/%u  (sector %u, 0x%08lX)",
                      (unsigned long)flash_ring_erase_count(),
-                     (unsigned)flash_ring_slots_used(), (unsigned)slots);
+                     (unsigned)flash_ring_slots_used(), (unsigned)slots,
+                     (unsigned)flash_ring_sector_no(),
+                     (unsigned long)flash_ring_base_addr());
             cli_putln(line);
         }
         return;
@@ -1014,15 +1226,16 @@ static void dispatch(char *line)
                 if (sp != NULL) {
                     float cp = (float)atof(sp + 1);
                     if (cp >= 5.0f && cp <= 1000.0f) g_ltic_acq_centre_cap = cp;
-                    else { cli_putln("ACG: cap 5..1000 LSB"); return; }
+                    else { cli_reject("ACG: cap 5..1000 LSB"); return; }
                 }
                 cli_puts("ACG gain="); cli_putfloat(g_ltic_acq_centre_gain, 0);
                 cli_puts(" cap="); cli_putfloat(g_ltic_acq_centre_cap, 0);
                 cli_putln("  (higher = faster centring, risk of wrap)");
             } else {
-                cli_putln("ACG: gain 50..20000 LSB/V [cap 5..1000 LSB]");
+                cli_reject("ACG: gain 50..20000 LSB/V [cap 5..1000 LSB]");
             }
         }
+        if (arg != NULL) cli_manual_save("ES LTIC");
         return;
     }
 
@@ -1049,9 +1262,10 @@ static void dispatch(char *line)
                 if (set_lock) g_freq_damp_win_lock = (uint16_t)v;
                 cli_puts(set_dpll && set_lock ? "FA (both) = "
                        : set_dpll             ? "FAD (DPLL) = " : "FAL (LOCK) = ");
-                cli_putint(v); cli_putln(" s (ES to save)");
+                cli_putint(v); cli_putln(" s");
+                cli_manual_save("ES LTIC");
             } else {
-                cli_putln("FA: 10, 100 or 1000 (no arg = status)");
+                cli_reject("FA: 10, 100 or 1000 (no arg = status)");
             }
         }
         return;
@@ -1070,56 +1284,49 @@ static void dispatch(char *line)
             int v = atoi(arg);
             if (v == 0 || v == 1) {
                 g_qerr_enable = (v != 0);
-                cli_puts("sawtooth="); cli_putint(v); cli_putln(" (ES to save)");
+                cli_puts("sawtooth="); cli_putint(v); cli_putln("");
+                cli_manual_save("ES FLAGS");
             } else {
-                cli_putln("SAW: 0 (off) or 1 (on); no arg = status");
+                cli_reject("SAW: 0 (off) or 1 (on); no arg = status");
             }
         }
         return;
     }
 
     if (cli_ieq(verb, "FR")) {
-        /* enable/disable the wear-levelled flash ring buffer at runtime.
-         * Enabling initialises the ring immediately so EW works at once. */
-        if (arg == NULL) {
-            cli_puts("flash_ring="); cli_putln(g_flash_ring_enable ? "1 (on)" : "0 (off)");
-        } else {
-            int v = atoi(arg);
-            if (v == 0 || v == 1) {
-                g_flash_ring_enable = (v != 0);
-                if (g_flash_ring_enable) flash_ring_begin();   /* init now */
-                cli_puts("flash_ring="); cli_putint(v); cli_putln(" (ES to save)");
-            } else {
-                cli_putln("FR: 0 (disable) or 1 (enable ring buffer)");
-            }
-        }
+        /* flash_ring is always enabled in v0.96+ (settings + live data share
+         * sector 7). FR is retained as a read-only status command for users
+         * familiar with the old toggle. */
+        cli_putln("flash_ring: always on (settings + live data in sector 7)");
+        cli_putln("Use 'EW' for wear diagnostics.");
         return;
     }
 
     /* ---- RB — warm reboot: software reset, EEPROM kept ----
-     * Restarts the firmware via NVIC_SystemReset(). EEPROM (PWM, model,
-     * calibration, LTIC params) is preserved, so after reboot the OCXO — still
-     * warm — recalls its disciplined state. Does NOT auto-save first; run ES
-     * beforehand if you have unsaved changes. */
+     * Restarts the firmware via NVIC_SystemReset(). Settings (PWM, model,
+     * calibration, LTIC params in the flash ring) are preserved, so after
+     * reboot the OCXO — still warm — recalls its disciplined state. Does NOT
+     * auto-save first; run ES beforehand if you have unsaved changes. */
     if (cli_ieq(verb, "RB")) {
-        cli_putln("Warm reboot (EEPROM kept). Resetting...");
+        cli_putln("Warm reboot (settings kept). Resetting...");
         vTaskDelay(pdMS_TO_TICKS(150));   /* let the line flush */
         NVIC_SystemReset();
         return;                           /* not reached */
     }
-    /* ---- CR YES — cold restart: erase EEPROM, then software reset ----
-     * Wipes the EEPROM (back to compile-time defaults: PWM=DEFAULT, survey-in
-     * from scratch, no learned OCXO model, LTIC params reset) and reboots, as
-     * if powered on for the first time. Requires the literal confirmation
-     * "CR YES" because it discards the learned model (days to rebuild). */
+    /* ---- CR YES — cold restart: wipe settings, then software reset ----
+     * Resets to compile-time defaults (PWM=DEFAULT, survey-in from scratch,
+     * no learned OCXO model, LTIC params reset) and reboots, as if powered on
+     * for the first time. The flash ring sector is marked invalid so the next
+     * boot falls back to defaults. Requires the literal confirmation "CR YES"
+     * because it discards the learned model (days to rebuild). */
     if (cli_ieq(verb, "CR")) {
         if (arg != NULL && cli_ieq(arg, "YES")) {
-            cli_putln("Cold restart: erasing EEPROM and rebooting...");
-            eeprom_erase();
+            cli_putln("Cold restart: wiping settings and rebooting...");
+            persist_erase();
             vTaskDelay(pdMS_TO_TICKS(150));
             NVIC_SystemReset();
         } else {
-            cli_putln("Cold restart wipes EEPROM (PWM, model, calibration, "
+            cli_putln("Cold restart wipes settings (PWM, model, calibration, "
                       "LTIC). Type 'CR YES' to confirm.");
         }
         return;

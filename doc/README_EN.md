@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v0.95
+# GPSDO FreeRTOS v1.01
 
 **English** | [Polski](README_PL.md) | [Español](README_ES.md)
 
@@ -13,9 +13,12 @@ on the STM32 BlackPill platform (WeAct F411CE / F401CCU6).
 
 | Role | Person / source |
 |------|-----------------|
-| FreeRTOS port author, algorithms 3–10 | **J. M. Niewiński** — [repository](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
+| FreeRTOS port author, algorithms 3–11 | **J. M. Niewiński** — [repository](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
 | Programming assistant (Anthropic) | **Claude AI** |
+| Measurement and field testing, algorithms 10 and 11 | **Dan Wiering** — rubidium-referenced ADEV runs that found the algorithm-10 limit cycle, settled the `FA` damping question, reported the ACQ lock-up, and established the algorithm-11 comparison |
+| ILI9486 / ILI9488 support — the push to implement it | **lucido** (EEVBlog forum) |
 | v0.06c author — inspiration for the RTOS port | **André Balsa** — [repository](https://github.com/AndrewBCN/STM32-GPSDO) |
+| Continuous-PI loop (algorithm 11) — original design | **Lars Walenius** (in memoriam) — GPSDO controller shared on the [time-nuts](http://www.leapsecond.com/time-nuts.htm) community and EEVBlog. Extended here with CT auto-calibration, a frequency-led acquisition branch and a picDIV phase-capture bridge. |
 | PCB design (prototype) | **Scrachi** (EEVBlog forum) — [post with files](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/825/) · [profile](https://www.eevblog.com/forum/profile/?u=762266) |
 | Project thread | [Yet another DIY GPSDO](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/) — EEVBlog Forum |
 
@@ -23,6 +26,12 @@ This firmware was written from scratch as a port of André Balsa's original
 code to the FreeRTOS architecture, with a complete redesign of tasks,
 synchronisation, and display handling. The hardware design is based on the
 v0.06c schematic, using PCBs shared by the user Scrachi on the EEVBlog forum.
+
+---
+
+
+> **PC tuning console:** see [README_TUNER_EN](README_TUNER_EN.md) for the
+> desktop tuner — live plots, parameter tabs and the `tz_table.h` generator.
 
 ---
 
@@ -39,7 +48,7 @@ of 10⁻¹⁰–10⁻¹², while preserving the OCXO's short-term stability.
                                             10 MHz
                ┌─────────────┐       ┌──────────────┐
    GPS Antenna ┤  u-blox     │       │    OCXO      ├── TIM2 ETR (PA15) ──┐
-               │  NEO-6M/7M  │       │  10 MHz      │                     │
+               │ NEO-6M/8M   │       │  10 MHz      │                     │
                └──┬──────┬───┘       └──────▲───────┘                     │
                   │      │                  │                             │
         NMEA      │  1PPS (PB10)      PWM (PB9)                           │
@@ -84,22 +93,18 @@ of 10⁻¹⁰–10⁻¹², while preserving the OCXO's short-term stability.
 
 **Displays** (optional):
 
-- **OLED 128×64** I2C (SH1106 / SSD1306 / SSD1309) — rotating pages; a third
-  page shows the algo-10 loop state, phase and LPOL? warning when LTIC is enabled
-- **LCD 20×4** I2C (HD44780 + PCF8574T) — the alternating line adds an algo-10
-  state/phase/LPOL? mode when LTIC is enabled
+- **OLED 128×64** I2C (SH1106 / SSD1306 / SSD1309)
+- **LCD 20×4** I2C (HD44780 + PCF8574T)
 - **TM1637** (4- or 6-digit clock display)
 - **TFT 320×240** SPI (ILI9341 / ST7789, TFT_eSPI library)
-- **TFT 480×320** SPI (ILI9488, TFT_eSPI library) — the primary panel in
-  current use, confirmed disciplining to LOCK on several builders' hardware.
-  The layout is drawn natively at 480×320 (not merely up-scaled): a six-field
-  sensor grid with right-anchored units, the algo-10 phase readout (Vph / dph
-  with an out-of-band `ovf` guard / qErr), and a status bar carrying SURVEY and
-  the LPOL? polarity warning
+- **TFT 480×320** SPI (ILI9488, TFT_eSPI library) — field-tested against a
+  rubidium reference; the 320×240 layout is auto-scaled up
 - **HT16K33** 4-digit 7-segment clock with colon, I2C addr 0x70 (HH:MM)
 
 OLED and LCD can operate simultaneously (different I2C addresses).
 LCD and TM1637 **cannot** operate simultaneously (bus conflict).
+
+---
 
 ---
 
@@ -129,6 +134,8 @@ priority levels:
 
 ---
 
+---
+
 ## Control algorithms
 
 Eleven algorithms selectable via the `LA n` (0–10) command:
@@ -146,6 +153,7 @@ Eleven algorithms selectable via the `LA n` (0–10) command:
 | 8 | Hybrid | FLL+PLL | 100 s | Automatic FLL↔PLL sigmoid blend |
 | 9 | Neural net | e/∫e/de + temp | 10 s | 5-input MLP; learns oscillator tempco, thermally compensated holdover |
 | 10 | LTIC | TIC phase + freq | staged | Three-stage ACQ→DPLL→LOCK; hardware phase detector, self-calibrating |
+| 11 | LTIC-Lars | TIC phase | continuous | Single continuous PI, no state machine; gain auto-derived from `CT`. After Lars Walenius |
 
 PLL algorithms (4, 5, 7 and the PLL branch of 8) use a **two-timescale**
 design tuned for "fast capture, gentle phase-hold":
@@ -164,7 +172,9 @@ free-runs on its own short-term stability.
 
 Algorithms 3–9 have runtime-tunable PID parameters (`Kp`, `Ki`, `Kd`,
 `I_LIMIT`) configurable via CLI commands (`KP`, `KI`, `KD`, `IL`) —
-no recompilation needed. Parameters are persisted to EEPROM with `ES`.
+no recompilation needed. Parameters are persisted to the flash ring with `ES`.
+
+---
 
 ---
 
@@ -197,6 +207,8 @@ Holdover indication on row 7: `H` (manual) or `A` (automatic — fix lost).
 
 ---
 
+---
+
 ## LCD 20×4 display layout
 
 Version splash for 2 seconds, then:
@@ -223,6 +235,8 @@ Holdover on line 3: `[H]` (manual) or `[A]` (automatic) — 500 ms blink.
 
 ---
 
+---
+
 ## TFT display layout (ILI9341 / ST7789 320×240, ILI9488 480×320, TFT_eSPI)
 
 Cheap SPI TFT modules are supported in landscape orientation, driven over
@@ -232,6 +246,42 @@ requires only changing the driver define and the width/height. The
 `TFT_RGB_ORDER` / `TFT_INVERSION_OFF` lines are needed for correct colours on
 ST7789 modules and are harmless on the others. Independent of the I2C
 displays — OLED, LCD and TFT can all run simultaneously.
+
+### The two panel sizes
+
+The operating screen is authored once, at 320×240, and scaled to 480×320 at
+compile time through `TFT_SX` / `TFT_SY` / `TFT_F`. The arrangement of fields is
+therefore identical on both panels — nothing moves relative to anything else.
+What differs is how the text is rendered, and that difference is large enough to
+matter.
+
+```
+ ┌──────────────────────────────────────────┐
+ │  GPSDO v1.00-rtos            LOCK        │  status bar + loop trend
+ │                                          │
+ │        1 0 0 0 0 0 0 0   H z             │  frequency, large monospace
+ │                                          │
+ │  PWM  40849      Vctl  1.799 V           │  control output and voltage
+ │  dph   -5.3 ns   Vphase 2.083 V          │  phase error and detector
+ │  Sat 11  HDOP 0.77   Up 000d 01:42:12    │  GPS state and uptime
+ │  BMP 51.1C  1006.7hPa   INA 4.92V 182mA  │  sensors
+ │  14:32:45  Mon 28/07/2026                │  clock
+ └──────────────────────────────────────────┘
+```
+
+**320×240 (ILI9341, ST7789)** uses the classic GLCD numeric fonts for the
+operating screen. They are already the right size at 1:1, they render fast, and
+they need no `LOAD_GFXFF` in `User_Setup.h`. See *Why the small panel keeps the
+classic fonts* below for the reasoning.
+
+**480×320 (ILI9488, ILI9486)** uses Adafruit GFX free fonts through a per-role
+abstraction (`GF_DATA`, `GF_HEAD`, `GF_STATUS` and so on in `gpsdo_config.h`).
+Scaling the classic bitmap fonts by 1.5 would have produced visibly blocky
+digits; the free fonts stay clean at the larger size. This build **does** need
+`LOAD_GFXFF`.
+
+The larger panel also moves 2.4x the pixels per redraw, so `SPI_FREQUENCY` should
+not be reduced below 40 MHz on it — see the wiring notes below.
 
 > **ILI9488 / ILI9486 480×320 support is verified on-panel (v0.93).** The
 > 320×240 operating screen and splash are auto-scaled to 480×320 at compile time
@@ -268,7 +318,7 @@ displays — OLED, LCD and TFT can all run simultaneously.
 
 ```
 ┌────────────────────────────────────────────┐
-│ v0.95-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
+│ v1.01-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
 ├────────────────────────────────────────────┤
 │                                            │
 │        10000000.0000 Hz                    │ ← frequency (large, colour-coded)
@@ -431,6 +481,60 @@ TFT: data sprite (1-bit) created
 
 ---
 
+### Colour TFT support (TFT_eSPI)
+
+Any display supported by the TFT_eSPI library at **320×240** or **480×320**
+should work — the UI scales via `TFT_SX()/TFT_SY()`. Tested: ILI9341
+(320×240), ST7789 (240×320), ILI9488 (480×320). To add yours:
+
+1. enable the matching `GPSDO_TFT_*` in `gpsdo_config.h`,
+2. set the driver and pins in TFT_eSPI `User_Setup.h` (SPI1: SCK=PA5,
+   MOSI=PA7; CS/DC/RST as in `gpsdo_config.h`),
+3. a different controller just needs selecting in `User_Setup.h` — any panel
+   reporting 320×240 or 480×320 fits without code changes.
+
+---
+
+---
+
+## Clock displays (HT16K33 and TM1637)
+
+Two small 7-segment clock modules are supported. Both show local time, follow the
+`LT` setting for UTC versus local, and blink the colon so a stopped display is
+obvious at a glance. Neither shows any GPSDO state — they exist to make the unit
+useful as a clock while it disciplines.
+
+### HT16K33 — 4 digits, I2C
+
+```
+ ┌────────────────┐
+ │  1 4 : 3 2     │   HH:MM, colon blinks once per second
+ └────────────────┘
+```
+
+I2C address 0x70, shares the bus with the sensors and the OLED. Enabled with
+`GPSDO_HT16K33`. Reported at boot as `HW: HT16K33 clock display OK (I2C 0x70)`
+so a missing or mis-addressed module is caught immediately.
+
+### TM1637 — 4 or 6 digits, 2-wire
+
+```
+ ┌────────────────┐
+ │  1 4 : 3 2     │   4-digit build: HH:MM
+ └────────────────┘
+ ┌────────────────────┐
+ │  1 4 : 3 2 : 4 5   │   6-digit build: HH:MM:SS
+ └────────────────────┘
+```
+
+Uses its own CLK/DIO pins rather than I2C. `GPSDO_TM1637` selects the 4-digit
+variant, `GPSDO_TM1637_6` the 6-digit one. The colon blinks on even seconds.
+
+> **TM1637 and the 20×4 LCD cannot be used together** — they contend for the same
+> pins. Pick one at compile time.
+
+---
+
 ## LED signalling
 
 | LED | Pin | Function |
@@ -446,6 +550,8 @@ TFT: data sprite (1-bit) created
 | Fix OK, disciplined mode | Normal operation | ON steady |
 | Manual holdover (`MH`) | User enabled holdover | Slow pulse 1000 ms |
 | Auto-holdover | Fix lost during operation | Fast pulse 200 ms |
+
+---
 
 ---
 
@@ -488,6 +594,8 @@ immediately.
 
 ---
 
+---
+
 ## Automatic holdover
 
 When GPS loses fix during normal operation (e.g. antenna disconnected):
@@ -500,6 +608,8 @@ When GPS loses fix during normal operation (e.g. antenna disconnected):
 
 Manual command `MH` sets holdover independently (indicated as `H`).
 `MD` disables holdover (both manual and automatic).
+
+---
 
 ---
 
@@ -517,7 +627,7 @@ Commands terminated by `\r\n` or `\n`. Command names are **case-insensitive**
 | `V` | Version, authors and GitHub links |
 | `F` | Flush frequency ring buffers (restart averaging) |
 | `C` | Start auto-calibration (PWM centring only) |
-| `CT` | Calibrate + auto-tune: measure K, derive PID for all algos 3-9 |
+| `CT` | Calibrate + auto-tune: measure K, derive PID for algos 3-9 **and both LTIC loops (10 and 11)**; auto-saves the PID group on success |
 | `T [baud]` | GPS tunnel on USB for u-center — clean bidirectional NMEA/UBX (telemetry moves to Bluetooth if present, else muted); optional GPS-UART baud, kept after exit; exits after 300 s |
 | `SP <n>` | Set PWM DAC directly (1–65535), bypasses algorithm |
 | `RH` | Report mode: human-readable (default) |
@@ -595,26 +705,20 @@ elsewhere and returns whole hours only — so it cannot express Adelaide's
 +9:30, or India's +5:30. Use `TZ` outside Europe.
 
 
-### EEPROM & restart
+### Saving and restart
 
-| Command | Description |
-|---------|-------------|
-| `ES [group]` | Save to EEPROM — everything, or one group (see below) |
-| `ER` | Recall parameters from EEPROM |
-| `EE` | Erase EEPROM (restore defaults) |
-| `RB` | Warm reboot — software reset, **EEPROM kept** (OCXO stays warm, recalls disciplined state) |
-| `CR YES` | Cold restart — **erase EEPROM** then reset (factory state; requires the `YES` confirmation) |
+Storage is the flash ring described under *Settings storage* below — there is no
+EEPROM. Preferences save themselves; loop tuning needs an explicit `ES`, and the
+reply always says which applied.
 
-`ES` on its own saves the whole parameter page, as before. `ES <group>` saves
-only one block and leaves every other setting on the page at its stored value —
-so committing a timezone change cannot also stamp in a PID you were still
-experimenting with. The groups are `CORE` (PWM, active algorithm), `PID` (algo
-3-9 gains, blend, NN step), `TZ` (timezone), `LTIC` (algo-10 loop tuning,
-thresholds and the FA windows), `LCAL` (algo-10 ramp calibration), `CAL`
-(pressure/altitude offsets) and `MISC` (survey, warmup, splash, ring, saw,
-learn). `ES` with an unknown name lists them rather than guessing. Each save
-fills the emulation buffer from flash, writes the requested section, and
-flushes; untouched bytes keep their on-flash values.
+| Command | Effect |
+|---------|--------|
+| `ES [group]` | Save all settings, or one group: `TZ` / `PID` / `LTIC` / `FLAGS` / `ALGO` / `PO` |
+| `ER` | Recall settings from the ring |
+| `EE` | Erase settings (restore defaults) |
+| `EW` | Flash wear: erase cycles and slots used |
+| `RB` | Warm reboot — settings kept, OCXO stays warm, disciplined state recalled |
+| `CR YES` | Cold restart — wipe the ring, then reset (requires the `YES` confirmation) |
 
 ### LTIC — algorithm 10 (three-stage ACQ/DPLL/LOCK)
 
@@ -635,7 +739,7 @@ loop works in nanoseconds against `zero_offset`; uncalibrated, it falls back
 to a volts-based error around mid-rail with a one-time warning. Crucially the
 detector's working band may sit well away from mid-ADC (e.g. 0–0.45 V), so the
 loop never assumes 1.65 V is centre — it uses the calibrated `zero_offset`.
-State persists in EEPROM, so a warm reboot (`RB`) resumes where it left off
+State persists in the flash ring, so a warm reboot (`RB`) resumes where it left off
 rather than restarting cold from ACQ.
 
 Select it with `LA 10`; the picDIV arms automatically on ACQ entry. Run `LC`
@@ -661,9 +765,69 @@ parameters, which `ES` saves.
 | `LKP/LKI/LKD/LKL [v]` | LOCK-stage PID: Kp / Ki / Kd / I_LIMIT |
 | `LAT [v]` | ACQ→DPLL threshold (phase in range, ns) |
 | `LDT [v]` | DPLL→LOCK threshold (frequency error) |
-| `LIV [v]` | LOCK update interval (seconds, default 300) |
+| `LIV [v]` | LOCK update interval (seconds, default 300, 1..600 s) |
 | `LPOL [-1/0/1]` | Phase-detector polarity (0 = auto) |
 | `LCV` | Show the current TIC voltage (calibration aid) |
+
+### Calibration order: `CT` first, then `LC`
+
+**Run `CT` before `LC`.** The two are not independent: `LC` sweeps the PWM to hit
+a target phase rate, and to know how far to steer it needs K — the Hz-per-LSB
+slope of your OCXO, which is exactly what `CT` measures. Run without it, `LC`
+falls back to a generic 3000 LSB/Hz and the calibration comes out scaled by
+however far your oscillator differs from that guess.
+
+The trap is that the wrong answer does not look wrong. On one board, `LC` before
+`CT` reported ns_per_volt = 1592.8 and a WEAK result; after `CT` the same board
+gave 921.2 and PASSED — a factor of 1.7, with nothing in the first run to suggest
+it was suspect.
+
+So the order for a new board is:
+
+1. `CT` — measures K, derives the PID sets, auto-saves them
+2. `LC` — calibrates the phase detector, auto-saves on PASS
+3. `LPOL -1` or `LPOL 1` if the loop reports the polarity is unset, then `ES LTIC`
+4. `LA 10` or `LA 11`, then `ES ALGO`
+
+`LC` warns if `CT` has not been run, but continues anyway — a re-run costs three
+minutes and there are legitimate reasons to sweep first.
+
+### Algorithm 11 — LTIC-Lars (continuous PI)
+
+A single continuous PI loop with no ACQ/DPLL/LOCK state machine, after the
+original GPSDO controller by the late Lars Walenius. It shares the algo-10
+detector calibration (`LC`), so calibrate once and both loops benefit. Trend
+labels are the same vocabulary as algorithm 10: **ACQ** (frequency-led, phase
+detector blind), **PLL** (phase-led) and **LOCK**.
+
+| Command | Description |
+|---------|-------------|
+| `LG [v]` | Gain. **0 = auto**, derived from the `CT` calibration; non-zero sets a manual scale |
+| `LD [v]` | Damping |
+| `LTC [s]` | Loop time constant, 1..600 s |
+| `LFD [n]` | Filter divisor — the pre-filter constant is `LTC / n` |
+| `LTO [adc]` | TIC offset: phase target in ADC counts |
+| `LPL [ns]` | Lock phase limit — width of the lock window |
+| `LPF [n]` | Lock factor: the window must hold for `LPF × LTC` seconds |
+| `LTK [v]` | Temperature coefficient feed-forward (0 = off) |
+| `LTR [adc]` | Temperature reference, ADC counts |
+
+None of these auto-save; `ES LTIC` stores them together with the algorithm-10
+parameters.
+
+### Damping average window — `FA` / `FAD` / `FAL`
+
+| Command | Description |
+|---------|-------------|
+| `FA [n]` | Set the damping-term averaging window in **both** LTIC stages (10/100/1000 s) |
+| `FAD [n]` | DPLL stage only |
+| `FAL [n]` | LOCK stage only |
+
+100 is the historical value and changes nothing. A shorter window is the
+candidate fix for a limit cycle whose period is a couple of times the averaging
+length — the group delay of a long average can land near quadrature with the
+loop's own response.
+
 
 #### Sawtooth (qErr) correction — `SAW 0|1`
 
@@ -683,40 +847,12 @@ out if TIM-TP stops (receiver reset) so a stale value is never applied.
 
 `SAW` with no argument shows the state and live qErr; `SAW 1`/`SAW 0` toggles
 it (saved with `ES`, default off). When on, the `Learn:` telemetry line shows
-`qErr=…ns` whatever algorithm is running, and the value is subtracted from each
-TIC phase reading — both the loop's and the one the display shows. Because Vphase is sampled on the ramp peak right after the PPS edge
+`qErr=…ns` for algorithm 10, and the value is subtracted from each TIC phase
+reading. Because Vphase is sampled on the ramp peak right after the PPS edge
 (see the TIC hardware notes below), each phase reading already pairs with the
 qErr reported for that same second's pulse.
 
-#### Damping-term averaging window — `FA` / `FAD` / `FAL`
-
-The algorithm-10 loop feeds its frequency (damping) term from a running
-frequency average. Rubidium-referenced measurements (Dan Wiering, tinyPFA
-against an S250) showed a ~220 s limit cycle in algo 10 whose mechanism is the
-group delay of the long 100 s average landing near quadrature — while algorithm
-7 on the same reference was clean, which points to the DPLL's second-order
-structure rather than the average alone.
-
-`FA` selects which window that damping term reads, and the DPLL (acquisition)
-and LOCK (steady-state) states can be set independently:
-
-| Command | Effect |
-|---------|--------|
-| `FAD [n]` | Window for the **DPLL** state only |
-| `FAL [n]` | Window for the **LOCK** state only |
-| `FA [n]` | Both at once |
-| `FA` | Show both current windows |
-
-`n` is 10, 100 or 1000 seconds; **100 is the default in each and reproduces the
-previous behaviour bit-for-bit**. Only the frequency term is affected — escape
-detection, self-learning, the state machine and the phase PI all stay on the
-smooth 100 s average. Both windows are saved with `ES` (LTIC group).
-
-The split is a diagnostic as much as a fix: if `FAD` changes the cycle it lives
-in acquisition, if only `FAL` does it is in steady state, and if neither touches
-it the cycle is in the phase branch rather than the frequency term. This is
-deliberately a switch, not a new default — the shorter window is a candidate,
-to be validated against a reference before anything changes by default.
+---
 
 ---
 
@@ -790,35 +926,100 @@ better than Lars' single-read HC4046 at ~1 ns. The ~25 ms decay is irrelevant
 to loop bandwidth: LOCK updates every few seconds (well under 0.2 Hz), so the
 detector's own time constant is orders of magnitude clear of the loop.
 
-## EEPROM
+### LTIC phase input (Lars' TIC)
 
-EEPROM (emulated in STM32 Flash) stores 200 bytes under signature `"GPSD2"`:
+With `GPSDO_LTIC` enabled, the firmware reads a hardware time-interval
+counter (Lars Walenius' TIC): a 1 nF capacitor is charged with a constant
+current during the GPS-1PPS → OCXO-1PPS interval, and the latched voltage on
+PA1 is sampled on the ramp peak ~50 µs after the PPS edge; no active
+discharge is needed — the diode blocks and the ~25 ms leakage clears the cap
+before the next 1 Hz pulse. The voltage is a
+direct, high-resolution measure of the phase difference between the two pulses
+— far finer than the TIM2 cycle-counter used by the frequency-domain
+algorithms (3–9).
 
-| Address | Size | Content |
-|---------|------|---------|
-| 0–5 | 6 B | Signature `"GPSD2"` |
-| 6–7 | 2 B | PWM DAC value (big-endian) |
-| 8 | 1 B | Algorithm number (0–9) |
-| 9 | 1 B | Legacy whole-hour offset (superseded by 234; still written so older firmware reads something sane) |
-| 10–121 | 112 B | PID: g_pid[3..9] × {Kp, Ki, Kd, I_LIMIT} |
-| 122–133 | 12 B | g_blend_crossover, g_blend_scale, g_nn_max_step |
-| 134–137 | 4 B | g_pressure_offset (PO command) |
-| 138–141 | 4 B | g_altitude_offset (AO command) |
-| 142 | 1 B | Legacy tz_auto flag (superseded by 234) |
-| 234 | 1 B | Timezone mode (0 = manual, 1 = auto-EU, 2 = POSIX rule) |
-| 235 | 2 B | Manual offset, minutes (int16) |
-| 237 | 48 B | POSIX TZ rule, as text |
-| 143 | 1 B | survey-in enable (0 = off, 1 = on, `SV` command) |
-| 144–199 | 56 B | **LTIC (algo 10)**: ns_per_volt, zero_offset, range_ns, DPLL PID, LOCK PID, ACQ/DPLL thresholds, lock interval, state, submode |
-| 200–207 | 8 B | reserved for future LTIC params |
+The control loop **disciplines directly from this phase** via algorithm 10
+(`LA 10`) — the three-stage ACQ → DPLL → LOCK loop described below. The phase
+appears in the serial report (`Vphase:` and `dph:` in ns), as a `Vph:`/`dph:`
+row on the TFT, and as an `LTIC phase (PA1)` line in the boot checklist. Once
+`LC` has calibrated the ramp, phase is reported in nanoseconds relative to the
+calibrated `zero_offset`, using the measured `ns_per_volt`; before calibration
+only volts are shown. (The compile-time `LTIC_NS_PER_VOLT` in `gpsdo_config.h`
+is a legacy fallback and normally stays 0 — `LC` measures the real slope per
+board and stores it in the live parameters.)
 
-The LTIC block was added under the **same `GPSD2` signature** for backward
-compatibility: an EEPROM saved by older firmware has fresh-flash `0xFF` there,
-which every field guards against (NaN / `0xFF` → compile-time default). So old
-saves load cleanly and the LTIC parameters come up at their defaults until set
-and saved.
+**Self-calibration (`LC`).** Once the TIC hardware is built, `LC` calibrates it
+automatically — no external reference needed. It briefly forces a small PWM
+offset so the phase ramps at a rate known from the TIM2 frequency error, fits
+the TIC voltage against time, and derives `ns_per_volt`, `zero_offset` and
+`range_ns` (GPS is the implicit time reference). Review with `LL`, then `ES` to
+save. The absolute scale is only as good as the TIM2 measurement of the ramp
+rate, but the linearity and range it captures are what the loop actually needs.
 
+---
 
+---
+
+## Settings storage (flash ring)
+
+Settings live in a wear-levelled ring buffer in flash **sector 7**
+(0x08060000, 128 KB) — the last sector, so firmware keeps the maximum contiguous
+space below it. There is no EEPROM, emulated or otherwise.
+
+Records are typed, so the settings block and the live learned data share one ring
+without colliding. Each slot carries a CRC16, slots are sequence-numbered so the
+newest valid one wins, and every write is read back and verified. A power cut
+mid-write therefore leaves the previous settings intact rather than a corrupt
+half-record.
+
+The settings block holds the PWM and algorithm, the PID sets for algorithms 3-9,
+the LTIC calibration and stage gains, the LTIC-Lars parameters, the damping
+windows, the sensor offsets, the boot flags and the timezone. It is versioned:
+a block written by an older firmware whose layout differs is rejected rather than
+misread, and the board comes up on compile-time defaults.
+
+| Command | Effect |
+|---------|--------|
+| `ES [group]` | Save all settings, or one group: `TZ` / `PID` / `LTIC` / `FLAGS` / `ALGO` / `PO` |
+| `ER` | Recall settings from the ring |
+| `EE` | Erase settings — back to defaults |
+| `EW` | Flash wear: erase cycles and slots used |
+| `CR YES` | Cold restart: wipe the ring entirely |
+
+Preferences save themselves; loop tuning needs an explicit `ES`. Either way the
+reply says which applied — see the persistence notes under the CLI section.
+
+### Flash wear levelling (live data)
+
+"Live" data — learned drift/damping (`LRN`), LC calibration, and the last
+PWM — changes far more often than settings, so it is stored separately from
+the settings block in a **wear-levelled ring buffer** occupying flash
+sector 6 (0x08040000, 128 KB). Toggle it with `FR 0|1` (saved by `ES`,
+default on); check wear with `EW`.
+
+Each save writes the next 32-byte slot; the sector is erased only when the
+ring wraps (once per 4095 saves). At 100 saves/day that is ~9 erases/year, so
+the flash endurance (~10 000 cycles) lasts on the order of a thousand years.
+A save happens only when a value has settled on a new level — drift changed
+by > 8 LSB or damping by > 0.03, and ≥ 20 min since the last save — while a
+successful `LC` saves immediately. Every slot has a CRC and sequence number,
+so a power-cut mid-write is detected and the previous good slot is used.
+
+With the ring **on**, `ES` never overwrites calibration or learned values —
+it saves only genuine settings (PID gains, thresholds, flags). With the ring
+**off**, `ES` still saves those live values to the settings block as a fallback.
+
+### Keeping live data when re-flashing firmware
+
+- **Bootloader / DFU / Arduino IDE upload** touches only the firmware sectors
+  (0–5); the ring in sector 7 survives.
+- **J-Link/ST-Link full-chip erase** wipes everything. To keep calibration and
+  learning, erase only sectors 0–5:
+  `erase 0x08000000 0x0803FFFF` then `loadbin firmware.bin 0x08000000`.
+- If the ring is wiped, the firmware relearns/recalibrates from defaults —
+  nothing breaks, only the accumulated tuning is lost.
+
+---
 
 ---
 
@@ -890,36 +1091,6 @@ path unchanged.
 
 ---
 
-## Flash wear levelling (live data)
-
-"Live" data — learned drift/damping (`LRN`), LC calibration, and the last
-PWM — changes far more often than settings, so it is stored separately from
-the settings EEPROM in a **wear-levelled ring buffer** occupying flash
-sector 6 (0x08040000, 128 KB). Toggle it with `FR 0|1` (saved by `ES`,
-default on); check wear with `EW`.
-
-Each save writes the next 32-byte slot; the sector is erased only when the
-ring wraps (once per 4095 saves). At 100 saves/day that is ~9 erases/year, so
-the flash endurance (~10 000 cycles) lasts on the order of a thousand years.
-A save happens only when a value has settled on a new level — drift changed
-by > 8 LSB or damping by > 0.03, and ≥ 20 min since the last save — while a
-successful `LC` saves immediately. Every slot has a CRC and sequence number,
-so a power-cut mid-write is detected and the previous good slot is used.
-
-With the ring **on**, `ES` never overwrites calibration or learned values —
-it saves only genuine settings (PID gains, thresholds, flags). With the ring
-**off**, `ES` still saves those live values to EEPROM as a fallback.
-
-### Keeping live data when re-flashing firmware
-
-- **Bootloader / DFU / Arduino IDE upload** touches only the firmware sectors
-  (0–5); the ring (6) and settings EEPROM (7) survive.
-- **J-Link/ST-Link full-chip erase** wipes everything. To keep calibration and
-  learning, erase only sectors 0–5:
-  `erase 0x08000000 0x0803FFFF` then `loadbin firmware.bin 0x08000000`.
-- If the ring is wiped, the firmware relearns/recalibrates from defaults —
-  nothing breaks, only the accumulated tuning is lost.
-
 ---
 
 ## Auto-tuning (`CT` command)
@@ -940,10 +1111,12 @@ Procedure (~3 minutes, deterministic):
 
 The result is sanity-checked (K must be 0.1–2 mHz/LSB and the GPS must hold
 a fix); on failure the parameters are left unchanged. Run `ES` afterwards to
-save the tuned values to EEPROM. Unlike relay-feedback auto-tuning, `CT`
+save the tuned values to the flash ring. Unlike relay-feedback auto-tuning, `CT`
 never destabilises the loop — the loop time constant here is hundreds of
 seconds, so forced oscillation would take hours and be corrupted by thermal
 drift; deriving the gains directly from a measured K is both faster and safer.
+
+---
 
 ---
 
@@ -963,6 +1136,8 @@ and the date:
 
 `TO <n>` switches back to a fixed manual offset. The mode and offset are
 saved with `ES` and restored at boot.
+
+---
 
 ---
 
@@ -986,36 +1161,6 @@ A missing device reports `not found` and the firmware continues without it.
 
 ---
 
-## LTIC phase input (Lars' TIC)
-
-With `GPSDO_LTIC` enabled, the firmware reads a hardware time-interval
-counter (Lars Walenius' TIC): a 1 nF capacitor is charged with a constant
-current during the GPS-1PPS → OCXO-1PPS interval, and the latched voltage on
-PA1 is sampled on the ramp peak ~50 µs after the PPS edge; no active
-discharge is needed — the diode blocks and the ~25 ms leakage clears the cap
-before the next 1 Hz pulse. The voltage is a
-direct, high-resolution measure of the phase difference between the two pulses
-— far finer than the TIM2 cycle-counter used by the frequency-domain
-algorithms (3–9).
-
-The control loop **disciplines directly from this phase** via algorithm 10
-(`LA 10`) — the three-stage ACQ → DPLL → LOCK loop described below. The phase
-appears in the serial report (`Vphase:` and `dph:` in ns), as a `Vph:`/`dph:`
-row on the TFT, and as an `LTIC phase (PA1)` line in the boot checklist. Once
-`LC` has calibrated the ramp, phase is reported in nanoseconds relative to the
-calibrated `zero_offset`, using the measured `ns_per_volt`; before calibration
-only volts are shown. (The compile-time `LTIC_NS_PER_VOLT` in `gpsdo_config.h`
-is a legacy fallback and normally stays 0 — `LC` measures the real slope per
-board and stores it in the live parameters.)
-
-**Self-calibration (`LC`).** Once the TIC hardware is built, `LC` calibrates it
-automatically — no external reference needed. It briefly forces a small PWM
-offset so the phase ramps at a rate known from the TIM2 frequency error, fits
-the TIC voltage against time, and derives `ns_per_volt`, `zero_offset` and
-`range_ns` (GPS is the implicit time reference). Review with `LL`, then `ES` to
-save. The absolute scale is only as good as the TIM2 measurement of the ramp
-rate, but the linearity and range it captures are what the loop actually needs.
-
 ---
 
 ## Oscillator (OCXO)
@@ -1035,6 +1180,8 @@ from a universal mid-range PWM (32767 ≈ 1.65 V), which is safe for any
 This replaces the earlier per-oscillator coefficient tables — one calibration
 adapts the loop to whatever crystal is installed, including unit-to-unit
 variation between two nominally identical parts.
+
+---
 
 ---
 
@@ -1059,7 +1206,6 @@ The file `gpsdo_config.h` controls the build. Key switches:
 #define GPSDO_BLUETOOTH          // HC-06 on Serial2 (57600 Bd)
 
 // Other:
-#define GPSDO_EEPROM             // Parameter persistence
 #define GPSDO_PICDIV             // picDIV support
 #define GPSDO_UBX_CONFIG         // NEO-6M/7M UBX configuration
 #define GPSDO_GEN_2kHz_PB5       // 2 kHz generator on PB5
@@ -1079,6 +1225,8 @@ sentences are not dropped or merged at 38400 baud when the GPS task is
 briefly preempted. A plain `#define` in the sketch would not work — the
 core's `HardwareSerial.cpp` is a separate translation unit that only sees
 compiler flags. The file is picked up automatically; nothing to enable.
+
+---
 
 ---
 
@@ -1104,55 +1252,94 @@ compiler flags. The file is picked up automatically; nothing to enable.
 
 ---
 
+---
+
+## Roadmap
+
+### Planned
+
+**Two USB CDC ports.** One serial device is currently shared between the CLI and
+everything else, so tunnelling the receiver to u-center means giving up the
+console. Two composite CDC endpoints would separate them: the first stays the CLI
+exactly as now, the second becomes a transparent GPS tunnel, so u-center can
+configure the receiver while the console keeps reporting.
+
+**24-bit delta-sigma DAC on SPI + DMA.** The control voltage currently comes from
+a 16-bit PWM through an RC filter. At the tuning slopes typical of these
+oscillators one LSB is already a few parts in 10¹¹, so the quantisation is not
+the limit today — but it sets a floor, and the RC time constant needed to smooth
+a 16-bit PWM also delays the loop.
+
+The intended replacement drives a **second-order delta-sigma modulator** out of
+SPI with DMA, shaping the quantisation noise away from the frequencies the loop
+cares about instead of merely filtering it. DMA does the work, so the modulator
+costs no CPU time and no interrupt latency. Effective resolution around 24 bits
+with a far shorter analogue time constant looks reachable.
+
+Alan (MIS42N)'s PIC-based design reaches the same end differently — a 10-bit PWM
+dithered by a 14-bit accumulator, giving 24 bits at 40 kHz — which is what
+prompted this line of thought.
+
+### Not planned
+
+**Algorithms 0–9 are frozen.** They remain in the firmware, they still work, and
+settings already tuned for them are still honoured. But development has stopped:
+algorithm 11 measured 2–3× better than a properly tuned algorithm 10 at the
+averaging times where a GPSDO earns its keep, on independent hardware against a
+rubidium reference. Effort goes to algorithms 10 and 11.
+
+They are kept rather than deleted because eleven documented approaches to the
+same control problem are worth more as a reference than a tidier source tree, and
+because nobody's existing configuration should break. Expect no new features
+there, and treat the self-learning feed-forward (`LRN`) as belonging to that same
+frozen group — it serves algorithms 3–9 only.
+
+---
+
 ## Requirements
 
 - **Board**: WeAct BlackPill STM32F411CE or F401CCU6
-- **IDE**: Arduino IDE with STM32duino core ≥ 2.2.0
+- **IDE**: Arduino IDE with STM32duino core **2.2.0 – 2.12.0**
+  (see the note below on core 3.0.0)
 - **Libraries**: STM32duino FreeRTOS, TinyGPS++, U8g2,
   Adafruit AHTX0, Adafruit BMP280, Adafruit INA219,
-  hd44780 (for LCD), TFT_eSPI (for TFT), EEPROM (STM32)
+  hd44780 (for LCD), TFT_eSPI (for TFT) (settings live in the on-chip flash ring, so no EEPROM library is needed)
 - **Build settings**: Tools → C Runtime Library → Newlib Nano + Float Printf/Scanf
+
+### STM32duino core 3.0.0 — not yet supported
+
+**Build against core 2.12.0 or earlier.** Core 3.0.0 (released 23 July 2026)
+carries two changes flagged as major by its own release notes: the
+**ArduinoCore-API deployment** and HALv2 for the STM32C5xx series. Three
+consequences matter here:
+
+1. **`ltoa()` is gone.** It is a non-standard extension that the older core
+   supplied; the firmware uses it in four places. On 3.0.0 these fail to compile
+   and would have to become `snprintf(buf, n, "%ld", …)`.
+2. **`HardwareSerial` is no longer the concrete class.** Under ArduinoCore-API
+   it is an abstract interface, so `HardwareSerial Serial2(PA3, PA2)` no longer
+   instantiates. A typedef selecting the right class per core version is the
+   usual remedy.
+3. **TFT_eSPI stops driving the panel.** This is the blocking one. The library
+   uses `SPIClass` only to configure the pins and bring the peripheral up, then
+   talks to the controller through raw `HAL_SPI_Transmit()` on its own handle.
+   When the SPI layer beneath it changes, the panel can be left without a valid
+   init sequence — the observed symptom is a **white screen**, with the CLI and
+   telemetry still working normally.
+
+Points 1 and 2 are small and could be made version-conditional at any time.
+Point 3 lives in TFT_eSPI, not in this firmware, so 3.0.0 has to wait for the
+library. Since 2.12.0 is a full release and nothing here needs 3.0.0, staying
+on 2.12.0 costs nothing.
+
+> Worth knowing when searching: most "Arduino core 3.0.0" material online is
+> about the **ESP32** core, a different project whose 3.0.0 migration guide does
+> not apply to STM32.
+
+---
 
 ---
 
 ## Licence
 
 Published under the same terms as André Balsa's original project.
-
-
-## LTIC three-stage GPS discipline (algorithm 10) — v0.5x–v0.88 highlights
-
-The LTIC loop (ACQ→DPLL→LOCK) is now fully self-configuring:
-
-- **`LC` — one-command self-calibration.** Arms the picDIV, starts from the
-  detector's deterministic bottom point, commands a known sweep rate derived
-  from the measured OCXO sensitivity K, samples the whole band in a single
-  bottom-to-top pass (upper saturation terminates it) and scales ns/V with a
-  precise avg100 read-back. Guards reject saturation artefacts, partial wrap
-  jumps and physically impossible ranges; a clear `PASSED`/`MARGINAL` verdict
-  tells you whether to `ES`.
-- **Auto-tuned loop gains** from two measured constants (K from `CT`,
-  ns/V + range from `LC`) — no per-board hand tuning. LOCK adds a deadband,
-  a soft knee and a ~4 mHz step cap.
-- **Robust ADC path**: 16-read burst median per PPS + a single-outlier gate.
-- **Runaway guard**: phase railed + |df| > 0.5 Hz freezes the loop.
-- **Trustworthy lock colour**: with algorithm 10 the frequency turns green
-  ONLY in live LOCK.
-- **Commands**: `LC`, `LL`, `LPOL -1|0|1`, `LIV 1..30`, `WU 0|1` (OCXO warmup
-  on boot, EEPROM-saved), `SPL 0|1` (boot animation on/off, EEPROM-saved), `FR 0|1` (wear-levelled
-  flash ring buffer for live data, EEPROM-saved), `EW` (flash wear stats),
-  `SAW 0|1` (LTIC sawtooth qErr correction, EEPROM-saved).
-  LED animations: warmup = lower-'o' wave, survey-in
-  = upper-'o' wave, calibration = "CAL" + spinner.
-
-## Colour TFT support (TFT_eSPI)
-
-Any display supported by the TFT_eSPI library at **320×240** or **480×320**
-should work — the UI scales via `TFT_SX()/TFT_SY()`. Tested: ILI9341
-(320×240), ST7789 (240×320), ILI9488 (480×320). To add yours:
-
-1. enable the matching `GPSDO_TFT_*` in `gpsdo_config.h`,
-2. set the driver and pins in TFT_eSPI `User_Setup.h` (SPI1: SCK=PA5,
-   MOSI=PA7; CS/DC/RST as in `gpsdo_config.h`),
-3. a different controller just needs selecting in `User_Setup.h` — any panel
-   reporting 320×240 or 480×320 fits without code changes.

@@ -40,6 +40,14 @@ import sys
 import os
 import re
 import time
+import math
+
+# Tracks the firmware release it was built against. The tuner reads the board's
+# own version on connect and says so when the two disagree — an older tuner
+# against newer firmware silently mis-parses telemetry and writes commands the
+# board no longer understands, which is a confusing way to lose an evening.
+# Bump this whenever the firmware version changes, even if nothing here moved.
+TOOL_VERSION = "1.01"
 from collections import deque, defaultdict
 
 # Force pyqtgraph to use the same Qt binding as the rest of this file (PySide6).
@@ -64,11 +72,32 @@ try:
         QDoubleSpinBox, QSpinBox, QTabWidget, QGroupBox, QSplitter, QCheckBox,
         QMessageBox,
     )
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import (QFont, QPainter, QPen, QColor, QLinearGradient,
+                               QPalette)
     import pyqtgraph as pg
 except ImportError:
     print("PySide6 / pyqtgraph not found — run: pip install pyqtgraph PySide6")
     sys.exit(1)
+
+
+def theme_colours(widget):
+    """Text colours that survive both light and dark desktop themes.
+
+    The Help tab and the small note labels used to hardcode colours chosen
+    against a white background — #333 descriptions and a navy heading. Under the
+    Windows 11 dark theme that put dark grey on near-black and the command
+    reference was effectively invisible. Qt already knows which palette the OS
+    handed us, so ask it and pick accordingly rather than guessing."""
+    dark = widget.palette().color(QPalette.Window).lightness() < 128
+    if dark:
+        return {"muted": "#9aa4b2",   # secondary text
+                "head":  "#7ab8ff",   # section headings
+                "verb":  "#ffb27a",   # command verbs
+                "desc":  "#d6dbe3"}   # descriptions
+    return {"muted": "#666666",
+            "head":  "#1a4d80",
+            "verb":  "#8a2b2b",
+            "desc":  "#333333"}
 
 
 # ------------------------------------------------------------------------------
@@ -106,6 +135,60 @@ LTIC_CAL = {
 
 FA_VALUES = ["10", "100", "1000"]
 
+# Visible span of the live plots, as (label, seconds); 0 means "everything held".
+# Without a window the X axis stretches to cover the whole buffer, so after an
+# hour of acquisition 3600 points are crushed into the plot width and the trace
+# stops appearing to move — new samples just thicken the right-hand edge. A
+# fixed span makes the plot scroll instead, which is what the eye needs to judge
+# a loop that is settling.
+PLOT_SPANS = [("1 min", 60), ("5 min", 300), ("15 min", 900),
+              ("1 h", 3600), ("all", 0)]
+PLOT_SPAN_DEFAULT = "5 min"
+
+# Which telemetry field feeds each of the two upper plots, per algorithm family.
+# The LTIC loops (10, 11) are the only ones with a phase detector, so under any
+# other algorithm those two panes would sit empty for the whole session. Drift
+# and Vctl are the informative pair there: drift is what the self-learning
+# feed-forward is doing, Vctl is the voltage actually reaching the OCXO. PWM was
+# the obvious alternative for the second pane but carries the same information as
+# Vctl — same signal either side of the RC — so it would waste a window.
+PLOT_SERIES = {
+    "ltic": [("dph",    "Phase  dph (ns)",                        "#22aa44"),
+             ("Vphase", "Detector Vphase (V) — ramp position",    "#2277cc")],
+    "pid":  [("drift",  "Learned drift (LSB) — LRN feed-forward", "#22aa44"),
+             ("Vctl",   "Control voltage Vctl (V)",               "#2277cc")],
+}
+
+# Algorithm 11 (LTIC-Lars) parameters: verb -> (label, lo, hi, decimals).
+# These share the LTIC tab, shown when algorithm 11 is active. Saved by ES LTIC
+# alongside the algo-10 block. gain is board-specific (see firmware note).
+LARS_PARAMS = {
+    "LG":  ("gain (DAC/ns)",   0.0, 10000.0, 3),
+    "LD":  ("damping",         0.0, 1000.0,  3),
+    "LTC": ("time_const s",    1.0, 600.0,   0),
+    "LFD": ("filter_div",      1.0, 100.0,   0),
+    "LTO": ("tic_offset ADC",  0.0, 4095.0,  0),
+    "LPL": ("lock_ns_lim",     1.0, 10000.0, 0),
+    "LPF": ("lock_factor",     1.0, 100.0,   0),
+    "LTK": ("temp_coeff",  -32000.0, 32000.0, 0),
+    "LTR": ("temp_ref ADC",    0.0, 4095.0,  0),
+}
+
+# Firmware prints each algo 11 parameter as "<field>=<value>" when queried with
+# no argument. Map that field name back to the verb so the readback lands in the
+# right spinbox. Field names match the firmware's cli_puts() strings.
+LARS_FIELD_NAMES = {
+    "LG":  "gain",
+    "LD":  "damping",
+    "LTC": "time_const_s",
+    "LFD": "filter_div",
+    "LTO": "tic_offset",
+    "LPL": "lock_ns_lim",
+    "LPF": "lock_factor",
+    "LTK": "temp_coeff",
+    "LTR": "temp_ref",
+}
+
 
 # ------------------------------------------------------------------------------
 # Telemetry parser
@@ -120,17 +203,22 @@ class TelemetryParser:
     """
 
     # Live telemetry fields -> label used on plots / spin boxes
-    LIVE_FIELDS = ["Vphase", "Vctl", "dph", "qErr", "PWM", "drift", "damp"]
+    LIVE_FIELDS = ["Vphase", "Vctl", "dph", "qErr", "PWM", "drift", "damp",
+                   "scale", "phase"]
 
     def extract(self, line, name):
-        """Return the first number following `name` on the line, or None."""
-        pattern = re.escape(name) + r"\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)"
+        """Return the first number following `name` on the line, or None.
+        The leading \\b prevents a short field name from matching inside a longer
+        one — e.g. 'phase' (algo 11) must not match the 'phase' inside 'Vphase'."""
+        pattern = r"\b" + re.escape(name) + r"\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)"
         m = re.search(pattern, line, re.IGNORECASE)
         return float(m.group(1)) if m else None
 
     def parse_state(self, line):
         """Loop state from the PWM/Vctl telemetry line, e.g. '... LOCK'."""
-        for st in ("LOCK", "DPLL", "ACQ", "SURVEY", "WARMUP", "HOLD"):
+        # DPLL must be tested before PLL: "DPLL" contains "PLL", and \b would
+        # otherwise let the shorter algo-11 label match an algo-10 line.
+        for st in ("LOCK", "DPLL", "PLL", "ACQ", "SURVEY", "WARMUP", "HOLD"):
             if re.search(r"\b" + st + r"\b", line):
                 return st
         return None
@@ -281,11 +369,14 @@ class SerialWorker(QThread):
 # Main window
 # ------------------------------------------------------------------------------
 class GpsdoTuner(QMainWindow):
-    MAXPTS = 3600          # ~1 h at 1 Hz telemetry
+    # 30 h at 1 Hz telemetry: enough headroom to scroll back through a full
+    # 24-hour acquisition and still hold the run-up to it. Costs a few MB of
+    # host RAM, which is free on a PC; the firmware is unaffected either way.
+    MAXPTS = 108000
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("GPSDO Tuner — live tuning & phase visualisation")
+        self.setWindowTitle(f"GPSDO Tuner v{TOOL_VERSION} — live tuning & phase visualisation")
         self.resize(1280, 820)
 
         self.parser = TelemetryParser()
@@ -298,6 +389,10 @@ class GpsdoTuner(QMainWindow):
         self.data = defaultdict(lambda: deque(maxlen=self.MAXPTS))
         self.tbuf = deque(maxlen=self.MAXPTS)
         self.last_state = "?"
+        self._active_algo = None   # set from telemetry; toggles LTIC tab sections
+        self._logfile = None       # open handle while logging to file, else None
+        self._log_path = ""
+        self._log_lines = 0
         self._monitor_lines = 0
         self._ll_buf = []
         self._ll_active = False
@@ -359,6 +454,40 @@ class GpsdoTuner(QMainWindow):
         w = QWidget()
         v = QVBoxLayout(w)
 
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Span:"))
+        self.span_combo = QComboBox()
+        for label, _ in PLOT_SPANS:
+            self.span_combo.addItem(label)
+        self.span_combo.setCurrentText(PLOT_SPAN_DEFAULT)
+        self.span_combo.currentTextChanged.connect(self._on_span_changed)
+        bar.addWidget(self.span_combo)
+
+        # Follow keeps the window pinned to the newest sample. Untick it (or just
+        # drag a plot) to hold the view still and scroll back through everything
+        # the buffer holds — the axis is then left entirely to the mouse, so pan
+        # and zoom behave normally instead of being yanked back once a second.
+        self.follow_chk = QCheckBox("Follow live")
+        self.follow_chk.setChecked(True)
+        self.follow_chk.toggled.connect(self._on_follow_toggled)
+        bar.addWidget(self.follow_chk)
+
+        clr = QPushButton("Clear plots")
+        clr.setToolTip("Discard all buffered samples and restart the time axis")
+        clr.clicked.connect(self.clear_plots)
+        bar.addWidget(clr)
+
+        about = QPushButton("About")
+        about.clicked.connect(self.show_about)
+        bar.addWidget(about)
+
+        self.span_hint = QLabel("")
+        self.span_hint.setStyleSheet("font-size:11px;")
+        bar.addWidget(self.span_hint)
+        bar.addStretch(1)
+        holder = QWidget(); holder.setLayout(bar)
+        v.addWidget(holder)
+
         self.plot_phase = pg.PlotWidget(title="Phase  dph (ns)")
         self.plot_vph = pg.PlotWidget(title="Detector Vphase (V) — ramp position")
         self.plot_freq = pg.PlotWidget(title="Frequency error (Hz, from 1ks avg)")
@@ -368,6 +497,17 @@ class GpsdoTuner(QMainWindow):
         self.curve_phase = self.plot_phase.plot(pen=pg.mkPen("#22aa44", width=2))
         self.curve_vph = self.plot_vph.plot(pen=pg.mkPen("#2277cc", width=2))
         self.curve_freq = self.plot_freq.plot(pen=pg.mkPen("#cc7722", width=2))
+
+        # Dragging or wheeling a plot means the operator wants to look at
+        # something, so stop following rather than fighting them for the axis.
+        # sigRangeChangedManually fires only for mouse-driven changes, so the
+        # tool's own setXRange() calls do not trip it.
+        for plot in (self.plot_phase, self.plot_vph, self.plot_freq):
+            try:
+                plot.getViewBox().sigRangeChangedManually.connect(
+                    self._on_manual_range)
+            except Exception:
+                pass          # older pyqtgraph without the signal: checkbox only
 
         # Vphase band guides: anchor and the 15-85% Vsat window get drawn once
         # calibration is known (updated from LL). They make it obvious at a
@@ -392,10 +532,12 @@ class GpsdoTuner(QMainWindow):
     def _build_control_tabs(self):
         tabs = QTabWidget()
         tabs.addTab(self._tab_ltic(), "LTIC (algo 10)")
+        tabs.addTab(self._tab_lars(), "LTIC-Lars (algo 11)")
         tabs.addTab(self._tab_fa(), "FA damping")
         tabs.addTab(self._tab_pid(), "PID algo 3-9")
         tabs.addTab(self._tab_cal(), "Calibration")
         tabs.addTab(self._build_monitor(), "Raw monitor")
+        tabs.addTab(self._tab_help(), "Help")
         return tabs
 
     def _spin(self, lo, hi, dec, step):
@@ -444,9 +586,178 @@ class GpsdoTuner(QMainWindow):
         note = QLabel("Values read back from LL. Apply writes one stage live via "
                       "AQ*/DP*/LK* verbs. Nothing is saved until ES.")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#666; font-size:11px;")
+        note.setStyleSheet(f"color:{theme_colours(w)['muted']}; font-size:11px;")
         g.addWidget(note, row, 0, 1, 6)
+        row += 1
+
         g.setRowStretch(row + 1, 1)
+        return w
+
+    def _tab_lars(self):
+        """Algorithm 11 (LTIC-Lars) parameters on their own tab, mirroring the
+        algo-10 LTIC tab for a consistent view."""
+        w = QWidget()
+        g = QGridLayout(w)
+        row = 0
+        title = QLabel("Algorithm 11 — LTIC-Lars continuous PI")
+        title.setStyleSheet("font-weight:bold;")
+        g.addWidget(title, row, 0, 1, 6); row += 1
+
+        self.lars_boxes = {}
+        grid = QGridLayout()
+        for c, (verb, (label, lo, hi, dec)) in enumerate(LARS_PARAMS.items()):
+            gr, gc = divmod(c, 3)          # 3 params per row
+            cell = QVBoxLayout()
+            cell.addWidget(QLabel(label))
+            box = self._spin(lo, hi, dec, 0.1 if dec else 1.0)
+            self.lars_boxes[verb] = box
+            cell.addWidget(box)
+            btn = QPushButton("Set")
+            btn.clicked.connect(lambda _, v=verb: self.apply_lars_param(v))
+            cell.addWidget(btn)
+            holder = QWidget(); holder.setLayout(cell)
+            grid.addWidget(holder, gr, gc)
+        gwrap = QWidget(); gwrap.setLayout(grid)
+        g.addWidget(gwrap, row, 0, 1, 6); row += 1
+
+        read11 = QPushButton("Read all (LG/LD/…)")
+        read11.clicked.connect(self.read_lars_params)
+        g.addWidget(read11, row, 0, 1, 2)
+        saveb = QPushButton("Save (ES LTIC)")
+        saveb.clicked.connect(lambda: self.confirm_send(
+            "ES LTIC", "Save LTIC + Lars params to the flash ring?"))
+        g.addWidget(saveb, row, 2, 1, 2); row += 1
+
+        note = QLabel("gain=0 means auto from CT calibration; set a non-zero LG "
+                      "for a manual scale. Trend: ACQ=freq-led, PLL=phase, "
+                      "LOCK=locked. Saved together with LTIC by ES LTIC.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{theme_colours(w)['muted']}; font-size:11px;")
+        g.addWidget(note, row, 0, 1, 6); row += 1
+
+        g.setRowStretch(row + 1, 1)
+        return w
+
+    def _tab_help(self):
+        """Command reference, grouped the way the firmware's own H output is.
+        Kept in sync with gpsdo_cli.cpp — if a verb changes there, change it
+        here too, or the console starts lying to the operator."""
+        w = QWidget()
+        outer = QVBoxLayout(w)
+
+        intro = QLabel(
+            "Firmware CLI reference. Anything here can also be typed into the "
+            "manual command box at the bottom of the window. Most parameter "
+            "verbs READ when given no argument and WRITE when given one "
+            "(e.g. <b>LG</b> shows the gain, <b>LG 0.3</b> sets it). "
+            "Nothing is persistent until you run <b>ES</b>.")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        intro.setStyleSheet(f"color:{theme_colours(w)['muted']}; font-size:11px;")
+        outer.addWidget(intro)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setFont(QFont("Consolas" if os.name == "nt" else "Monospace", 9))
+
+        sections = [
+            ("General", [
+                ("V",           "Version, authors and links"),
+                ("H / ?",       "Firmware help (H TZ for timezone details)"),
+                ("SW",          "Stack watermarks (FreeRTOS diagnostic)"),
+                ("RB",          "Reboot (warm — settings kept)"),
+                ("CR YES",      "Cold restart: wipe the flash ring, factory defaults"),
+            ]),
+            ("Reporting", [
+                ("RH / RD",     "Report format: human readable / tab delimited"),
+                ("RP / RR",     "Report pause / resume"),
+                ("F",           "Flush the frequency ring buffers"),
+                ("T [baud]",    "GPS tunnel on USB for u-center (300 s)"),
+            ]),
+            ("Discipline mode", [
+                ("MH / MD",     "Mode holdover / mode disciplined"),
+                ("LA <0-11>",   "Loop algorithm select. 10 = LTIC 3-stage, 11 = LTIC-Lars"),
+                ("SP <n>",      "Set the PWM DAC directly (1-65535) — manual override"),
+                ("AP",          "Arm picDIV (resync the divider to 1PPS)"),
+            ]),
+            ("Calibration", [
+                ("C",           "Auto-calibration: centre the PWM"),
+                ("CT",          "Calibrate + auto-tune: measures K, tunes PID (algos 3-9)"),
+                ("",            "  and both LTIC loops (10 and 11)"),
+                ("LC",          "LTIC self-calibrate: ns/V, zero offset, range"),
+                ("LL",          "List all LTIC parameters and state"),
+                ("LNV / LZO / LRN", "Calibration: ns per volt, zero-offset V, range ns"),
+                ("LPOL [-1/0/1]", "PWM->phase polarity (0 = auto-detect)"),
+                ("SAW 0|1",     "Sawtooth (qErr) correction on/off"),
+            ]),
+            ("PID algorithms 3-9", [
+                ("LP [n]",      "List PID parameters (algo n, or the current one)"),
+                ("KP n val",    "Set Kp for algo n"),
+                ("KI n val",    "Set Ki for algo n"),
+                ("KD n val",    "Set Kd for algo n"),
+                ("IL n val",    "Set I_LIMIT for algo n"),
+                ("BC / BS",     "Algo 8 blend crossover / blend scale (Hz)"),
+                ("NS [val]",    "Algo 9 neural-net max step (LSB)"),
+                ("LRN 0|1|R",   "Self-learning drift/damping (R = reset)"),
+            ]),
+            ("Algorithm 10 — LTIC 3-stage", [
+                ("AQP/AQI/AQD/AQL", "ACQ stage PID: Kp / Ki / Kd / I_LIMIT"),
+                ("DPP/DPI/DPD/DPL", "DPLL stage PID: Kp / Ki / Kd / I_LIMIT"),
+                ("LKP/LKI/LKD/LKL", "LOCK stage PID: Kp / Ki / Kd / I_LIMIT"),
+                ("LAT / LDT / LIV", "ACQ threshold, DPLL->LOCK threshold, LOCK interval s"),
+                ("LCV [V]",     "ACQ centring target (0 = range middle)"),
+                ("ACG g [cap]", "ACQ centring drive: LSB per volt and max step"),
+            ]),
+            ("Algorithm 11 — LTIC-Lars", [
+                ("LG [val]",    "Gain. 0 = auto from the CT calibration, else a manual scale"),
+                ("LD [val]",    "Damping"),
+                ("LTC [s]",     "Loop time constant (1-600 s)"),
+                ("LFD [n]",     "Filter divisor — pre-filter constant = LTC / this"),
+                ("LTO [adc]",   "TIC offset: phase target in ADC counts"),
+                ("LPL [ns]",    "Lock phase limit — the window width"),
+                ("LPF [n]",     "Lock factor: window must hold for LPF x LTC seconds"),
+                ("LTK [val]",   "Temperature coefficient feed-forward (0 = off)"),
+                ("LTR [adc]",   "Temperature reference, ADC counts"),
+                ("",            "  Trend: ACQ = frequency-led, PLL = phase, LOCK = locked"),
+            ]),
+            ("Storage (flash ring)", [
+                ("ES [obj]",    "Save settings. Optional group: TZ / PID / LTIC / FLAGS / ALGO / PO"),
+                ("ER",          "Recall settings from the ring"),
+                ("EE",          "Erase settings (back to defaults)"),
+                ("EW",          "Flash wear stats: erase cycles and slots used"),
+                ("FR 0|1",      "Flash ring on/off"),
+            ]),
+            ("GPS and environment", [
+                ("SV <0|1>",    "Survey-in / Time Mode on a timing receiver"),
+                ("TZ <zone>",   "Timezone with DST, e.g. TZ Adelaide (see H TZ)"),
+                ("TO <n|A>",    "Fixed UTC offset (h or h:mm), or A to guess from position"),
+                ("LT 0|1",      "Show UTC or local time"),
+                ("PO <f>",      "Pressure offset"),
+                ("AO <f>",      "Altitude offset"),
+            ]),
+            ("Boot behaviour", [
+                ("WU 0|1",      "OCXO warm-up on boot"),
+                ("SPL 0|1",     "Boot animation: 1 = full show, 0 = static"),
+            ]),
+        ]
+
+        col = theme_colours(w)
+        html = ["<style>"
+                f"h3{{margin:10px 0 3px 0;color:{col['head']};font-size:12px;}}"
+                "table{border-collapse:collapse;margin-bottom:4px;}"
+                "td{padding:1px 10px 1px 0;vertical-align:top;font-size:11px;}"
+                f"td.v{{color:{col['verb']};font-weight:bold;white-space:nowrap;}}"
+                f"td.d{{color:{col['desc']};}}"
+                "</style>"]
+        for title, rows in sections:
+            html.append(f"<h3>{title}</h3><table>")
+            for verb, desc in rows:
+                v = verb.replace("<", "&lt;").replace(">", "&gt;")
+                d = desc.replace("<", "&lt;").replace(">", "&gt;")
+                html.append(f"<tr><td class='v'>{v}</td><td class='d'>{d}</td></tr>")
+            html.append("</table>")
+        body.setHtml("".join(html))
+        outer.addWidget(body, 1)
         return w
 
     def _tab_fa(self):
@@ -517,7 +828,7 @@ class GpsdoTuner(QMainWindow):
         note = QLabel("KP/KI/KD apply to algos 3-7; IL (I-limit) to 3-9. "
                       "Read LP first to load the current values.")
         note.setWordWrap(True)
-        note.setStyleSheet("color:#666; font-size:11px;")
+        note.setStyleSheet(f"color:{theme_colours(w)['muted']}; font-size:11px;")
         g.addWidget(note, row, 0, 1, 3)
         g.setRowStretch(row + 1, 1)
         return w
@@ -566,9 +877,33 @@ class GpsdoTuner(QMainWindow):
         self.monitor.setFont(QFont("Consolas", 9))
         self.monitor.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         v.addWidget(self.monitor)
+        row = QHBoxLayout()
         clear = QPushButton("Clear")
         clear.clicked.connect(self.monitor.clear)
-        v.addWidget(clear)
+        row.addWidget(clear)
+
+        # Continuous logging rather than a buffer dump. The monitor keeps only the
+        # last 2000 lines — under five minutes at the telemetry rate — so a "save
+        # what is on screen" button would quietly hand back five minutes of a
+        # thirty-hour test. Writing each line as it arrives captures the whole
+        # session, costs no memory, and leaves the data on disk if the tool or the
+        # machine falls over mid-run.
+        self.log_btn = QPushButton("Start logging")
+        self.log_btn.setToolTip("Write every received line to a .log file next to this script")
+        self.log_btn.clicked.connect(self.toggle_logging)
+        row.addWidget(self.log_btn)
+
+        tzb = QPushButton("Generate tz_table.h")
+        tzb.setToolTip("Rebuild the timezone table from this machine's IANA tzdata")
+        tzb.clicked.connect(self.generate_tz_table)
+        row.addWidget(tzb)
+
+        self.log_lbl = QLabel("not logging")
+        self.log_lbl.setStyleSheet("font-size:11px;")
+        row.addWidget(self.log_lbl)
+        row.addStretch(1)
+        holder = QWidget(); holder.setLayout(row)
+        v.addWidget(holder)
         return w
 
     def _build_command_row(self):
@@ -602,6 +937,60 @@ class GpsdoTuner(QMainWindow):
     def apply_cal(self, verb):
         val = self.cal_boxes[verb].value()
         self.worker.send(f"{verb} {val:g}")
+
+    def apply_lars_param(self, verb):
+        """Write one algo 11 (LTIC-Lars) parameter live."""
+        _, _, _, dec = LARS_PARAMS[verb]
+        val = self.lars_boxes[verb].value()
+        self.worker.send(f"{verb} {int(val) if dec == 0 else val:g}"
+                         if dec == 0 else f"{verb} {val:g}")
+
+    def read_lars_params(self):
+        """Query every algo 11 parameter; each replies 'name=value' on one line."""
+        for verb in LARS_PARAMS:
+            self.worker.send(verb)
+
+    def _set_active_algo(self, algo):
+        """Track the active algorithm from telemetry and retitle the plots.
+
+        Algorithms 10 and 11 have a phase detector; nothing else does. Leaving
+        the phase and detector panes up under a PID algorithm gives two panes
+        that stay empty for the whole session, so they are repointed at drift
+        and Vctl instead and the titles follow."""
+        if algo == self._active_algo:
+            return
+        self._active_algo = algo
+        self._apply_plot_series()
+
+    def _plot_family(self):
+        return "ltic" if self._active_algo in (10, 11) else "pid"
+
+    def _apply_plot_series(self):
+        """Point the two upper curves at the fields that suit the active family
+        and relabel them. Clears the curves so a switch cannot leave the previous
+        algorithm's trace on screen looking like current data."""
+        if not hasattr(self, "curve_phase"):
+            return
+        fam = PLOT_SERIES[self._plot_family()]
+        for (field, title, colour), plot, curve in (
+                (fam[0], self.plot_phase, self.curve_phase),
+                (fam[1], self.plot_vph,   self.curve_vph)):
+            plot.setTitle(title)
+            curve.setPen(pg.mkPen(colour, width=2))
+            curve.setData([], [])
+        self._series_top = fam[0][0]
+        self._series_mid = fam[1][0]
+        # The Vphase band guides only mean anything against the detector trace,
+        # so they come down when that pane is showing a control voltage instead.
+        show_guides = (self._plot_family() == "ltic")
+        for attr in ("vph_anchor", "vph_lo", "vph_hi"):
+            ln = getattr(self, attr, None)
+            if ln is not None:
+                try:
+                    ln.setVisible(show_guides)
+                except Exception:
+                    pass
+        self.refresh_plots()
 
     def send_manual(self):
         txt = self.cmd_edit.text().strip()
@@ -641,9 +1030,26 @@ class GpsdoTuner(QMainWindow):
         self.status_lbl.setText(msg if ok else f"disconnected ({msg})")
         self.connect_btn.setText("Disconnect" if ok else "Connect")
         if ok:
-            # pull current parameters so the panels start populated
-            QTimer.singleShot(400, lambda: self.worker.send("LL"))
-            QTimer.singleShot(700, lambda: self.worker.send("FA"))
+            # Pull the FULL device state so every panel starts populated, not just
+            # the LTIC/FA tabs. Commands are spaced out with staggered timers so
+            # the replies don't collide on the UART or overrun the RX buffer.
+            self._read_all_params()
+
+    def _read_all_params(self):
+        """Query every parameter group the panels display, spaced over time.
+        LL (LTIC algo 10), FA (damping), LP n (PID for each algo 3-9), the algo 11
+        Lars params, and LL again for the calibration fields (which share LL)."""
+        seq = []
+        seq.append("V")                  # firmware version — checked against TOOL_VERSION
+        seq.append("LL")                 # LTIC algo 10 + calibration fields
+        seq.append("FA")                 # FA damping
+        for n in range(3, 10):           # PID algos 3-9, one reply block each
+            seq.append(f"LP {n}")
+        seq += list(LARS_PARAMS.keys())  # algo 11: LG/LD/LTC/LFD/LTO/LPL/LPF/LTK/LTR
+        # 150 ms between commands keeps the link unsaturated; the whole sweep
+        # finishes in ~3 s, after which the panels reflect the device.
+        for i, cmd in enumerate(seq):
+            QTimer.singleShot(300 + i * 150, lambda c=cmd: self.worker.send(c))
 
     def on_line(self, line):
         # Data arriving proves the link is live — if the status label somehow
@@ -652,12 +1058,25 @@ class GpsdoTuner(QMainWindow):
             self.connect_btn.setText("Disconnect")
             self.status_lbl.setText(self.worker.port or "connected")
 
+        if self._logfile is not None:
+            try:
+                self._logfile.write(line + "\n")
+                self._log_lines += 1
+            except OSError as e:
+                self._stop_logging()
+                self.monitor.append(f"*** logging failed, stopped: {e}")
+
         # raw monitor — keep it bounded without touching cursor enums (which
         # differ between Qt5/Qt6 bindings). Once it grows past the cap, drop the
         # oldest lines by rewriting from the retained tail.
         self.monitor.append(line)
         self._monitor_lines += 1
-        if self._monitor_lines > 2000:
+        # Trim in blocks, not on every line. Rebuilding the document costs O(n),
+        # so doing it once per line past the cap meant several full rebuilds per
+        # second — for thirty hours that is close to a million of them. Letting it
+        # overshoot to 2500 before cutting back to 1500 does the same job for a
+        # fraction of the work, and the operator cannot see the difference.
+        if self._monitor_lines > 2500:
             text = self.monitor.toPlainText()
             kept = text.split("\n")[-1500:]
             self.monitor.setPlainText("\n".join(kept))
@@ -669,7 +1088,8 @@ class GpsdoTuner(QMainWindow):
         # live numeric fields
         now = time.time() - self.t0
         got_any = False
-        for field in ("Vphase", "Vctl", "dph", "PWM", "drift", "damp", "qErr"):
+        for field in ("Vphase", "Vctl", "dph", "PWM", "drift", "damp", "qErr",
+                      "scale", "phase"):
             v = self.parser.extract(line, field)
             if v is not None:
                 self.data[field].append(v)
@@ -685,6 +1105,19 @@ class GpsdoTuner(QMainWindow):
         if st:
             self.last_state = st
             self.state_lbl.setText(f"state: {st}")
+
+        # Track the active algorithm from the Learn line so the LTIC tab can show
+        # the algo-10 stage PID or the algo-11 Lars params as appropriate. The
+        # Both LTIC loops now share the ACQ/LOCK labels, so only the middle state
+        # tells them apart: DPLL is algo 10, PLL is algo 11. The "algo=N" field on
+        # the Learn line stays the primary and unambiguous source.
+        m_algo = re.search(r"algo=(\d+)", line)
+        if m_algo:
+            self._set_active_algo(int(m_algo.group(1)))
+        elif st == "PLL":
+            self._set_active_algo(11)
+        elif st == "DPLL":
+            self._set_active_algo(10)
 
         # Read-back blocks arrive one field per line, so accumulate them into a
         # buffer from the header until the block ends, then parse the whole thing.
@@ -716,6 +1149,35 @@ class GpsdoTuner(QMainWindow):
                 self._lp_active = False
                 self._absorb_lp_block("\n".join(self._lp_buf))
                 # fall through to handle this line normally
+        # Firmware version banner, e.g. "GPSDO v1.00-rtos". Compared against the
+        # release this tuner was written for; a mismatch is reported once and not
+        # treated as fatal, because an older board is still worth talking to — the
+        # operator just needs to know why something might read oddly.
+        m_ver = re.match(r"\s*GPSDO\s+v(\d+\.\d+)", line)
+        if m_ver:
+            fw = m_ver.group(1)
+            if fw == TOOL_VERSION:
+                self.status_lbl.setText(f"connected — firmware v{fw}")
+            else:
+                self.status_lbl.setText(
+                    f"connected — firmware v{fw}, tuner v{TOOL_VERSION} (MISMATCH)")
+                self.monitor.append(
+                    f"*** Version mismatch: firmware v{fw}, tuner v{TOOL_VERSION}."
+                    f" Some fields may read wrong or some commands may be"
+                    f" rejected. Use the matching pair.")
+            return
+
+        # Algo 11 (LTIC-Lars) single-line readbacks: "gain=0.300", "damping=3.000",
+        # "time_const_s=60", etc. Map the firmware field name back to its verb and
+        # drop the value into the matching spinbox without echoing a write.
+        for verb, fname in LARS_FIELD_NAMES.items():
+            m = re.match(rf"\s*{fname}=([-+]?\d+(?:\.\d+)?)\s*$", line)
+            if m and verb in self.lars_boxes:
+                self.lars_boxes[verb].blockSignals(True)
+                self.lars_boxes[verb].setValue(float(m.group(1)))
+                self.lars_boxes[verb].blockSignals(False)
+                return
+
         if "DPLL=" in line and "LOCK=" in line:
             d, l = self.parser.parse_fa(line)
             if d:
@@ -755,29 +1217,583 @@ class GpsdoTuner(QMainWindow):
                 if k in self.pid_boxes and k in vals:
                     self.pid_boxes[k].setValue(vals[k])
 
+    # ---- tz_table.h generation ------------------------------------------
+    # Absorbed from the former tools/gen_tz_table.py so the tuner is the only
+    # script anyone has to keep. The logic is unchanged; what is new is that the
+    # zone data is looked for in several places rather than assuming
+    # /usr/share/zoneinfo, which does not exist on Windows — where this tool
+    # mostly runs. Python's own zoneinfo module knows where to look, and the
+    # tzdata PyPI package is the usual answer on Windows.
+
+    @staticmethod
+    def _tz_pkg_dir():
+        """Directory of the tzdata package, or "" if it is not installed."""
+        try:
+            import tzdata
+            d = os.path.join(os.path.dirname(tzdata.__file__), "zoneinfo")
+            return d if os.path.isdir(d) else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _tz_iana_version():
+        """Which IANA release the data came from, when it can be established.
+
+        The tzdata package states it directly. A system zoneinfo directory
+        usually cannot: TZif files carry no version field, which is a known gap
+        in the format, so an OS-supplied database is stamped as unknown rather
+        than guessed at."""
+        try:
+            import tzdata
+            return getattr(tzdata, "IANA_VERSION", "") or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _tz_sources():
+        """Directories that may hold TZif files, best candidate first."""
+        paths = []
+        try:
+            import zoneinfo
+            paths.extend(str(x) for x in zoneinfo.TZPATH)
+        except Exception:
+            pass
+        try:
+            import tzdata
+            paths.append(os.path.join(os.path.dirname(tzdata.__file__), "zoneinfo"))
+        except Exception:
+            pass
+        for p in ("/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/etc/zoneinfo"):
+            paths.append(p)
+        seen, out = set(), []
+        for p in paths:
+            if p and p not in seen and os.path.isdir(p):
+                seen.add(p); out.append(p)
+        return out
+
+    @staticmethod
+    def _tz_collect(base):
+        """Zones as (name, posix_rule). The final line of a TZif file is the
+        POSIX TZ string for the CURRENT rule, which is all a GPSDO needs."""
+        zones = []
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in ("posix", "right")]
+            for f in files:
+                fp = os.path.join(root, f)
+                if os.path.islink(fp):          # aliases: US/Eastern -> America/New_York
+                    continue
+                name = os.path.relpath(fp, base).replace(os.sep, "/")
+                if name.endswith((".tab", ".list")) or "/" not in name:
+                    continue
+                if name.startswith("Etc/"):     # GMT+N aliases with inverted signs
+                    continue
+                try:
+                    data = open(fp, "rb").read()
+                except OSError:
+                    continue
+                if not data.startswith(b"TZif"):
+                    continue
+                parts = data.split(b"\n")
+                if len(parts) >= 2 and parts[-2]:
+                    zones.append((name, parts[-2].decode("ascii", "ignore")))
+        return zones
+
+    def generate_tz_table(self):
+        """Write tz_table.h next to this script from the machine's own tzdata."""
+        sources = self._tz_sources()
+        zones = []
+        used = ""
+        for base in sources:
+            zones = self._tz_collect(base)
+            if zones:
+                used = base
+                break
+        if not zones:
+            self.monitor.append(
+                "*** tz_table: no zone data on this machine. Run:  pip install tzdata")
+            self.monitor.append(
+                "*** (IANA publishes source that needs the zic compiler; the tzdata "
+                "package is the same data already compiled, and Windows ships none "
+                "of its own.)")
+            return
+
+        # The lookup in gpsdo_tz.cpp bisects on the city name, so the table must
+        # be sorted exactly the way it compares and must not contain duplicates.
+        # Both are checked here rather than debugged on the bench.
+        # Resolve city-name collisions before sorting. On Linux the legacy zone
+        # names (US/Eastern, America/Buenos_Aires) are symlinks and were already
+        # skipped above; the tzdata package stores them as real files, so the same
+        # zone arrives twice under two names and the bisect would be ambiguous.
+        # Rather than guess which entry is an alias, keep the most specific path —
+        # America/Argentina/Buenos_Aires over America/Buenos_Aires — and drop the
+        # rest. Deterministic, and a no-op on a system zoneinfo tree, which has no
+        # collisions left to resolve.
+        by_city = {}
+        for n, r in zones:
+            by_city.setdefault(n.split("/")[-1], []).append((n, r))
+        zones, dropped = [], []
+        for ent in by_city.values():
+            if len(ent) == 1:
+                zones.append(ent[0])
+                continue
+            ent.sort(key=lambda e: (-e[0].count("/"), e[0]))
+            zones.append(ent[0])
+            dropped.extend(e[0] for e in ent[1:])
+
+        zones.sort(key=lambda z: z[0].split("/")[-1].lower())
+        cities = [n.split("/")[-1] for n, _ in zones]
+        if len(set(cities)) != len(cities):
+            self.monitor.append("*** tz_table: internal, collisions unresolved")
+            return
+        if cities != sorted(cities, key=str.lower):
+            self.monitor.append("*** tz_table: internal sort mismatch, aborted")
+            return
+
+        rules = sorted({s for _, s in zones})
+        regions = sorted({n.split("/")[0] for n, _ in zones})
+        if len(rules) > 255 or len(regions) > 255:
+            self.monitor.append("*** tz_table: rule/region count exceeds uint8_t")
+            return
+        rule_id = {s: i for i, s in enumerate(rules)}
+        reg_id = {r: i for i, r in enumerate(regions)}
+
+        blob, offs = bytearray(), []
+        for n, _ in zones:
+            offs.append(len(blob))
+            blob += n.split("/")[-1].encode("ascii") + b"\0"
+        if len(blob) > 65535:
+            self.monitor.append("*** tz_table: string blob exceeds uint16 offsets")
+            return
+
+        out = []
+        w = out.append
+        # Only claim an IANA release when the data actually came from the tzdata
+        # package, which states its version. A system zoneinfo tree carries no
+        # version field, so quoting the installed package's number against it
+        # would be asserting something we have not checked.
+        iana = self._tz_iana_version() if used == self._tz_pkg_dir() else ""
+        w("/* AUTO-GENERATED by the GPSDO Tuner (Raw monitor tab) -- do not edit.\n"
+          f" * IANA release: {iana or 'unknown (system zoneinfo carries no version)'}\n"
+          f" * Generated:    {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+          " * Zone data comes from this machine. To refresh it:\n"
+          " *   pip install -U tzdata      (any OS; zic-compiled IANA data)\n"
+          " * then press the button again. */\n")
+        w("#ifndef TZ_TABLE_H\n#define TZ_TABLE_H\n\n#include <stdint.h>\n\n")
+        w(f"#define TZ_NZONES   {len(zones)}\n")
+        w(f"#define TZ_NRULES   {len(rules)}\n")
+        w(f"#define TZ_NREGIONS {len(regions)}\n\n")
+        w("/* POSIX TZ rule strings, deduplicated across zones. */\n")
+        w("static const char *const tz_rule_str[TZ_NRULES] = {\n")
+        for s in rules:
+            w(f'    "{s}",\n')
+        w("};\n\n")
+        w("static const char *const tz_region_str[TZ_NREGIONS] = {\n")
+        for r in regions:
+            w(f'    "{r}",\n')
+        w("};\n\n")
+        w("/* City names, NUL-separated, sorted case-insensitively. */\n")
+        w("static const char tz_city_blob[] =\n")
+        line = ""
+        for n, _ in zones:
+            piece = f'"{n.split("/")[-1]}\\0"'
+            if len(line) + len(piece) > 72:
+                w(f"    {line}\n"); line = ""
+            line += piece
+        if line:
+            w(f"    {line}\n")
+        w(";\n\n")
+        w("static const uint16_t tz_city_off[TZ_NZONES] = {\n")
+        for i in range(0, len(offs), 12):
+            w("    " + ",".join(f"{x:5d}" for x in offs[i:i + 12]) + ",\n")
+        w("};\n\n")
+        w("static const uint8_t tz_zone_region[TZ_NZONES] = {\n")
+        ids = [reg_id[n.split("/")[0]] for n, _ in zones]
+        for i in range(0, len(ids), 20):
+            w("    " + ",".join(f"{x:3d}" for x in ids[i:i + 20]) + ",\n")
+        w("};\n\n")
+        w("static const uint8_t tz_zone_rule[TZ_NZONES] = {\n")
+        ids = [rule_id[s] for _, s in zones]
+        for i in range(0, len(ids), 20):
+            w("    " + ",".join(f"{x:3d}" for x in ids[i:i + 20]) + ",\n")
+        w("};\n\n")
+        w("#endif /* TZ_TABLE_H */\n")
+
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tz_table.h")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("".join(out))
+        except OSError as e:
+            self.monitor.append(f"*** tz_table: cannot write {path}: {e}")
+            return
+
+        approx = (len(blob) + len(zones) * 4
+                  + sum(len(s) + 1 for s in rules)
+                  + sum(len(r) + 1 for r in regions))
+        self.monitor.append(
+            f"*** tz_table.h written: {len(zones)} zones, {len(rules)} rules, "
+            f"{len(regions)} regions, ~{approx / 1024:.1f} KB flash")
+        self.monitor.append(
+            f"*** source: {used}"
+            + (f"  (IANA {iana})" if iana
+               else "  (system tree — carries no version field)"))
+        self.monitor.append(f"*** file:   {path}")
+        if dropped:
+            self.monitor.append(
+                f"*** {len(dropped)} legacy alias(es) dropped in favour of their "
+                f"canonical names, e.g. {', '.join(sorted(dropped)[:3])}")
+
+    def toggle_logging(self):
+        """Start or stop writing every received line to a file.
+
+        The file is created next to this script as gpsdo_YYYY-MM-DD_HH-MM-SS.log
+        and opened line-buffered, so a run that ends badly still leaves usable
+        data behind rather than an empty file full of unflushed buffers."""
+        if self._logfile is not None:
+            self._stop_logging()
+            return
+        name = time.strftime("gpsdo_%Y-%m-%d_%H-%M-%S.log")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        try:
+            self._logfile = open(path, "w", encoding="utf-8",
+                                 errors="replace", buffering=1)
+        except OSError as e:
+            self._logfile = None
+            self.log_lbl.setText(f"cannot open log: {e}")
+            return
+        self._log_lines = 0
+        self._log_path = path
+        self.log_btn.setText("Stop logging")
+        self.log_lbl.setText(f"logging to {name}")
+        self.monitor.append(f"*** logging started: {path}")
+
+    def _stop_logging(self):
+        if self._logfile is None:
+            return
+        try:
+            self._logfile.close()
+        except OSError:
+            pass
+        name = os.path.basename(self._log_path)
+        lines = self._log_lines
+        self._logfile = None
+        self.log_btn.setText("Start logging")
+        self.log_lbl.setText(f"saved {name} ({lines} lines)")
+        self.monitor.append(f"*** logging stopped: {lines} lines written")
+
+    def clear_plots(self):
+        """Drop every buffered sample and restart the time axis at zero.
+
+        The Raw monitor has always had a Clear; the plots did not, so the only
+        way to get a clean trace after a false start was to restart the script
+        and lose the connection with it. Buffers, curves and the time origin all
+        go together — resetting t0 as well keeps the axis starting from 0 rather
+        than resuming at whatever the session clock had reached."""
+        for d in self.data.values():
+            d.clear()
+        self.tbuf.clear()
+        self.t0 = time.time()
+        for curve in (self.curve_phase, self.curve_vph, self.curve_freq):
+            curve.setData([], [])
+        if hasattr(self, "follow_chk"):
+            self.follow_chk.setChecked(True)
+        self._update_span_hint()
+
+    def show_about(self):
+        """Replay the boot animation on demand. Purely for the pleasure of it."""
+        self._about = SplashScreen(lambda: None)
+        self._about.show()
+        self._about.raise_()
+        self._about.activateWindow()
+
+    def _on_span_changed(self, _label):
+        """Changing the span is an explicit request to see that window live."""
+        if hasattr(self, "follow_chk"):
+            self.follow_chk.setChecked(True)
+        self.refresh_plots()
+
+    def _on_follow_toggled(self, on):
+        if on:
+            self.refresh_plots()          # snap back to the live window
+        else:
+            for plot in (self.plot_phase, self.plot_vph, self.plot_freq):
+                plot.enableAutoRange(axis="x", enable=False)
+        self._update_span_hint()
+
+    def _on_manual_range(self, *_):
+        """Mouse-driven pan or zoom: hand the axis over to the operator."""
+        if hasattr(self, "follow_chk") and self.follow_chk.isChecked():
+            self.follow_chk.blockSignals(True)
+            self.follow_chk.setChecked(False)
+            self.follow_chk.blockSignals(False)
+            for plot in (self.plot_phase, self.plot_vph, self.plot_freq):
+                plot.enableAutoRange(axis="x", enable=False)
+        self._update_span_hint()
+
+    def _update_span_hint(self):
+        if not hasattr(self, "span_hint"):
+            return
+        held = len(self.tbuf)
+        if hasattr(self, "follow_chk") and not self.follow_chk.isChecked():
+            self.span_hint.setText(
+                f"paused — {held} s held, drag/zoom to explore, tick Follow to resume")
+        else:
+            self.span_hint.setText(f"{held} s held")
+
+    def _plot_span(self):
+        """Seconds of history the plots should show, 0 for everything held."""
+        label = self.span_combo.currentText() if hasattr(self, "span_combo") \
+                else PLOT_SPAN_DEFAULT
+        for name, secs in PLOT_SPANS:
+            if name == label:
+                return secs
+        return 300
+
     def refresh_plots(self):
         if not self.tbuf:
             return
         t = list(self.tbuf)
+        now = t[-1]
+        span = self._plot_span()
+
+        # Trim to the visible span and pin the X axis to it, so the trace scrolls
+        # leftwards at a constant scale instead of the axis stretching to cover
+        # the whole buffer. Sending every held point and letting the view
+        # auto-range is what made an hour of acquisition collapse into an
+        # unreadable band with no apparent motion.
+        following = (not hasattr(self, "follow_chk")) or self.follow_chk.isChecked()
+
+        # While paused the whole buffer is drawn, so panning and zooming reach
+        # every sample held rather than stopping at the edge of the live window.
+        if span > 0 and following:
+            cutoff = now - span
+            keep = sum(1 for x in t if x >= cutoff)
+            keep = max(keep, 2)          # a single point draws nothing
+        else:
+            keep = len(t)
+
+        # Decimate for display. Paused on a full buffer this would otherwise push
+        # 108 000 points per curve into the view once a second, which pyqtgraph
+        # will draw but not quickly. No plot pane is more than a couple of
+        # thousand pixels wide, so beyond that the extra points cost time and show
+        # nothing; stepping through the data keeps panning responsive.
+        MAX_DRAW = 4000
         def series(name):
             d = list(self.data[name])
-            n = min(len(d), len(t))
-            return t[-n:], d[-n:]
-        tx, ph = series("dph");     self.curve_phase.setData(tx, ph)
-        tx, vp = series("Vphase");  self.curve_vph.setData(tx, vp)
+            n = min(len(d), len(t), keep)
+            xs, ys = t[-n:], d[-n:]
+            if n > MAX_DRAW:
+                step = (n // MAX_DRAW) + 1
+                xs, ys = xs[::step], ys[::step]
+            return xs, ys
+
+        top = getattr(self, "_series_top", "dph")
+        mid = getattr(self, "_series_mid", "Vphase")
+        tx, a = series(top);         self.curve_phase.setData(tx, a)
+        tx, b = series(mid);         self.curve_vph.setData(tx, b)
         tx, fe = series("freq_err"); self.curve_freq.setData(tx, fe)
 
+        # Left edge is clamped to the oldest sample we actually hold, so a fresh
+        # session grows from t0 to the full width and only then starts sliding.
+        # Pinning it to now-span from the start would put the axis into negative
+        # time and squeeze the first minutes into the right-hand edge.
+        if following:
+            left = max(t[0], now - span) if span > 0 else t[0]
+            for plot in (self.plot_phase, self.plot_vph, self.plot_freq):
+                if span > 0:
+                    plot.setXRange(left, max(now, left + 1.0), padding=0)
+                else:
+                    plot.enableAutoRange(axis="x")
+        self._update_span_hint()
+
     def closeEvent(self, ev):
+        self._stop_logging()
         if self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(1000)
         ev.accept()
 
 
+class SplashScreen(QWidget):
+    """Five-second animated splash mirroring the firmware's TFT boot screen:
+    two phase-shifted sine waves (blue and amber) that drift into agreement and
+    merge into a single green trace — GPS and OCXO pulling into phase lock.
+
+    Timeline over ~5 s: fade the waves up, converge them, then hold the merged
+    green wave briefly before closing. Purely cosmetic."""
+
+    # Colours chosen to match the TFT splash constants (RGB565 0x3D7F / 0xFD80).
+    COL_BG    = QColor(12, 14, 20)
+    COL_UPPER = QColor(60, 172, 255)    # blue  — the GPS reference
+    COL_LOWER = QColor(255, 176, 0)     # amber — the free-running OCXO
+    COL_MERGE = QColor(64, 224, 128)    # green — locked
+    COL_TEXT  = QColor(220, 226, 235)
+    COL_DIM   = QColor(120, 132, 150)
+
+    DURATION_MS = 5000
+    FRAME_MS    = 25
+    CYCLES      = 5.0        # sine cycles across the width
+    PHASE0      = 2.5        # initial phase offset [rad]
+
+    def __init__(self, on_done):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self._on_done = on_done
+        self.resize(560, 300)
+        self._t = 0.0                     # 0..1 progress
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(self.FRAME_MS)
+        # centre on the primary screen
+        scr = QApplication.primaryScreen()
+        if scr:
+            geo = scr.availableGeometry()
+            self.move(geo.center().x() - self.width() // 2,
+                      geo.center().y() - self.height() // 2)
+
+    def _tick(self):
+        self._t += self.FRAME_MS / self.DURATION_MS
+        if self._t >= 1.0:
+            self._timer.stop()
+            self.close()
+            self._on_done()
+            return
+        self.update()
+
+    def mousePressEvent(self, ev):
+        """Let an impatient user skip the animation."""
+        self._timer.stop()
+        self.close()
+        self._on_done()
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, self.COL_BG)
+
+        t = max(0.0, min(1.0, self._t))
+        # Stage weights: fade in (0..0.30), converge (0.30..0.80), hold (0.80..1)
+        fade    = min(1.0, t / 0.30)
+        if t <= 0.30:
+            conv = 0.0
+        else:
+            conv = min(1.0, (t - 0.30) / 0.50)
+        merged  = conv >= 0.999
+
+        # Wave geometry: the two traces start apart and close on the midpoint.
+        yc      = int(h * 0.56)
+        amp     = h * 0.085
+        gap_top = h * 0.10
+        gap_bot = h * 0.16
+        meet    = (gap_bot - gap_top) / 2.0
+        off_top = -gap_top * (1.0 - conv) + meet * conv
+        off_bot = +gap_bot * (1.0 - conv) + meet * conv
+        # Phase converges alongside position, so they truly coincide at the end.
+        ph_top  = self.PHASE0 * (1.0 - conv)
+
+        def wave_points(y_off, phase):
+            pts = []
+            for x in range(0, w + 1, 3):
+                y = yc + y_off + amp * math.sin(x / w * 2.0 * math.pi
+                                                * self.CYCLES + phase)
+                pts.append((x, y))
+            return pts
+
+        def draw_wave(pts, colour, alpha, width_px):
+            c = QColor(colour)
+            c.setAlphaF(max(0.0, min(1.0, alpha)))
+            pen = QPen(c, width_px)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            for i in range(1, len(pts)):
+                p.drawLine(int(pts[i-1][0]), int(pts[i-1][1]),
+                           int(pts[i][0]),   int(pts[i][1]))
+
+        if merged:
+            # Single thicker green trace once the two have coincided.
+            draw_wave(wave_points(meet, 0.0), self.COL_MERGE, 1.0, 3.0)
+        else:
+            # As they converge, blend each toward green so the merge looks earned
+            # rather than abrupt.
+            def blend(a, b, f):
+                return QColor(int(a.red()   + (b.red()   - a.red())   * f),
+                              int(a.green() + (b.green() - a.green()) * f),
+                              int(a.blue()  + (b.blue()  - a.blue())  * f))
+            f = conv ** 2
+            draw_wave(wave_points(off_top, ph_top),
+                      blend(self.COL_UPPER, self.COL_MERGE, f), fade, 2.0)
+            draw_wave(wave_points(off_bot, 0.0),
+                      blend(self.COL_LOWER, self.COL_MERGE, f), fade, 2.0)
+
+        # ---- text ----------------------------------------------------------
+        title = QFont(); title.setPointSize(19); title.setBold(True)
+        p.setFont(title)
+        p.setPen(self.COL_TEXT)
+        p.drawText(0, int(h * 0.16), w, 34, Qt.AlignHCenter, "GPSDO Tuner")
+
+        sub = QFont(); sub.setPointSize(10)
+        p.setFont(sub)
+        p.setPen(self.COL_DIM)
+        p.drawText(0, int(h * 0.16) + 34, w, 22, Qt.AlignHCenter,
+                   f"v{TOOL_VERSION}  —  GPS Disciplined OCXO tuning console")
+
+        # status line fades in with the merge, echoing the firmware's metaphor
+        if conv > 0.55:
+            lock = QFont(); lock.setPointSize(10); lock.setBold(True)
+            p.setFont(lock)
+            c = QColor(self.COL_MERGE)
+            c.setAlphaF(min(1.0, (conv - 0.55) / 0.45))
+            p.setPen(c)
+            p.drawText(0, int(h * 0.84), w, 22, Qt.AlignHCenter,
+                       "PHASE LOCKED" if merged else "acquiring…")
+        p.end()
+
+
+def _minimise_spawned_console():
+    """Double-clicking a .py file on Windows spawns a console window that then
+    sits behind the GUI doing nothing. Send it to the taskbar — minimised rather
+    than hidden, so a traceback is still reachable if something goes wrong.
+
+    Only a console this process owns is touched. If the tuner was started from a
+    terminal the operator already had open, that window is theirs and minimising
+    it would be rude; GetConsoleProcessList reporting exactly one attached
+    process is what distinguishes the two cases. Cosmetic throughout, so every
+    failure path is silent — this must never stop the tuner from starting."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        hwnd = k32.GetConsoleWindow()
+        if not hwnd:
+            return                      # no console at all (e.g. run as .pyw)
+        buf = (wintypes.DWORD * 8)()
+        if k32.GetConsoleProcessList(buf, 8) != 1:
+            return                      # shared terminal — leave it alone
+        ctypes.windll.user32.ShowWindow(hwnd, 6)   # SW_MINIMIZE
+    except Exception:
+        pass
+
+
 def main():
     app = QApplication(sys.argv)
+    _minimise_spawned_console()
+
+    # The main window goes up first and maximised, with the splash laid over it,
+    # so the animation plays against the console it is introducing rather than
+    # against the desktop — and there is no jarring resize when it clears.
     win = GpsdoTuner()
-    win.show()
+    win.showMaximized()
+
+    def splash_done():
+        win.raise_()
+        win.activateWindow()
+
+    splash = SplashScreen(splash_done)
+    splash.show()
+    splash.raise_()
+    splash.activateWindow()
+
     sys.exit(app.exec())
 
 

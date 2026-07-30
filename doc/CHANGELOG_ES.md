@@ -21,51 +21,180 @@ El sufijo de versión `-rtos` marca el linaje del port a FreeRTOS.
 
 ---
 
+## [v1.01-rtos] — 2026-07-29
+
+> **Compila con el core STM32duino 2.12.0 o anterior.** El core 3.0.0 (23 de
+> julio de 2026) despliega ArduinoCore-API, lo que elimina `ltoa()` y convierte
+> `HardwareSerial` en una interfaz abstracta — ambos se usan aquí — y, más
+> importante, deja a TFT_eSPI sin poder inicializar el panel (pantalla en blanco,
+> el CLI no se ve afectado). Los dos primeros son menores y podrían condicionarse
+> por versión; el tercero reside en la biblioteca. Detalles en el README.
+
+Versión hito: fusiona la rama de persistencia por flash-ring con la rama del
+algoritmo 11 (LTIC-Lars). El algoritmo 11 se basa en el controlador GPSDO
+original de lazo PI continuo del difunto **Lars Walenius**, compartido con la
+comunidad time-nuts; se amplía aquí con la autocalibración y la adquisición
+descritas abajo, en su memoria.
+
+### Añadido
+- **Algoritmo 11 "LTIC-Lars"** — un único lazo PI continuo (sin máquina de estados
+  ACQ/DPLL/LOCK), que disciplina el OCXO desde la fase del TIC por hardware.
+  Seleccionable con `LA 11`; tendencia LFQ (guiado por frecuencia) / LPH (fase) /
+  LLK (enganchado). Ajustable en vivo con LG/LD/LTC/LFD/LTO/LPL/LPF/LTK/LTR.
+- **Autocalibración por CT para el algoritmo 11.** gain vale por defecto 0 = auto:
+  el lazo deriva su escala de frecuencia de la K medida por CT (Hz por LSB de PWM),
+  la misma constante que usa el algo 10, así que una CT calibra también el lazo de
+  Lars. Un LG no nulo lo sobrescribe con una escala manual.
+- **Adquisición guiada por frecuencia** con un término proporcional dominante y
+  autofrenante, un límite de paso y anti-windup, para que un arranque en frío
+  enganche sin la fuga ni la oscilación de ±2 Hz vistas durante el desarrollo.
+- **Puente de captura de fase picDIV**: cuando la frecuencia está asentada pero la
+  fase sigue saturada, se rearma el picDIV una vez para llevar la fase a la ventana
+  del detector, donde la rama de fase completa el enganche.
+- **Tuner: versionado y emparejado con el firmware.** Las herramientas llevan
+  ahora un TOOL_VERSION que sigue la versión del firmware, y el tuner lee la
+  versión de la placa al conectar: una discrepancia se informa en la barra de
+  estado y en el monitor, en vez de manifestarse como campos que se leen raro. La
+  ventana principal se abre maximizada con el splash encima, y en Windows la
+  consola que aparece al hacer doble clic en el script se minimiza a la barra de
+  tareas (solo cuando pertenece al tuner — una terminal abierta por el operador se
+  deja en paz).
+- **Tuner: pestaña de ayuda y splash de inicio.** El tuner incorpora una pestaña
+  Help con la referencia completa de comandos agrupada por tema y un splash de tres
+  segundos que anima dos senoides desfasadas convergiendo en una — la misma metáfora
+  de enganche que la pantalla de arranque del TFT (un clic lo omite). Además lee
+  todos los grupos de parámetros al conectar (LTIC, FA, PID 3-9, Lars) en lugar de
+  solo dos, y el algoritmo 11 tiene su propia pestaña junto al algoritmo 10.
+- **Persistencia por flash-ring para el algoritmo 11.** Todos los parámetros
+  g_lars se guardan en el flash-ring junto a los ajustes LTIC (SETTINGS_VER 2);
+  `ES LTIC` guarda ambos. Sin EEPROM en ningún sitio — persistencia 100% flash-ring.
+
+### Cambiado
+- **`LC` avisa cuando se ejecuta antes que `CT`.** No son independientes: `LC`
+  necesita la pendiente en Hz por LSB que mide `CT`, y sin ella recurre a un valor
+  genérico. El fallo es silencioso, no evidente — una placa informó ns_per_volt
+  1592,8 antes de `CT` y 921,2 después, un factor de 1,7, sin nada en la primera
+  ejecución que lo insinuara. `LC` ahora lo indica de entrada y continúa igual, y
+  el README expone el orden explícitamente.
+- **Cada ajuste indica ahora si se ha guardado.** Las preferencias que no tocan el
+  lazo de control — zona horaria (`TZ`/`TO`/`LT`), offsets de sensores (`PO`/`AO`) y
+  los indicadores de arranque y survey-in (`WU`/`SPL`/`SV`) — se guardan solas, y la
+  respuesta nombra el grupo escrito. El ajuste del lazo sigue siendo manual, y su
+  respuesta nombra el comando exacto que lo conservaría, p. ej.
+  `[not saved — run 'ES LTIC' to keep it]`, así que nunca hay que adivinar el grupo.
+  `SET_FLAGS` lleva `SAW` y `LRN` junto a los indicadores de arranque, así que un
+  guardado automático los confirma también; el mensaje enumera todo el grupo en
+  lugar de ocultarlo. Un valor rechazado se informa como tal —
+  `[not saved — value out of range; accepted range shown above]` — en vez de
+  ofrecer un comando `ES` para un cambio que nunca ocurrió.
+- **`LT` ahora es persistente.** El comando estaba implementado pero no tenía campo
+  en el bloque de ajustes, así que la elección UTC/local no sobrevivía a un
+  reinicio. Añadido al grupo de zona horaria (SETTINGS_VER 4).
+- **`CT` guarda su resultado automáticamente.** Igual que `LC`, la calibración de
+  tres minutos escribe ahora sus coeficientes en el flash-ring al terminar con
+  éxito, en lugar de confiar en que el operador recuerde `ES PID`. Solo se escribe
+  el grupo PID, así que el ajuste del lazo en curso queda intacto.
+- **Etiquetas de tendencia del algoritmo 11 renombradas** a ACQ / PLL / LOCK, en
+  línea con el vocabulario del algoritmo 10, para que pantallas, CLI y tuner se
+  lean de forma coherente. El algo 11 muestra PLL donde el algo 10 muestra DPLL,
+  lo que sigue distinguiéndolos en un registro.
+- **La telemetría Learn informa de lo que realmente controla cada lazo**: el algo
+  11 muestra modo de ganancia / escala / fase filtrada, el algo 10 su máquina de
+  estados, los algos 3-9 conservan las cifras LRN. qErr permanece en cada línea
+  (compartido por ambas ramas LTIC).
+- **El mensaje de CT** indica ahora que ajusta los algos 3-9 más LTIC 10 y 11.
+- **Wrappers de persistencia renombrados** eeprom_* → persist_*, para reflejar que
+  el almacenamiento es el flash-ring, no EEPROM; los nombres dejan de confundir.
+
+### Corregido
+- **El algoritmo 10 podía congelarse durante un enganche sano.** La protección
+  contra fugas se disparaba solo con el detector saturado más un error de
+  frecuencia grande — pero ese es el estado normal de un OCXO frío o alejado al
+  principio de la adquisición, y congelarlo ahí elimina el único camino de vuelta,
+  ya que el término de frecuencia es precisamente lo que lleva al oscilador a la
+  ventana del detector. Una ejecución observada recorrió 3855 LSB durante un
+  enganche DPLL perfectamente sano y quedó congelada a medio camino. Ambas
+  protecciones exigen ahora además que el error haya dejado de mejorar durante
+  varios ciclos (LTIC_RUNAWAY_STALL), algo que una fuga real por polaridad
+  invertida provoca y una adquisición sana nunca. El umbral de saturación vuelve a
+  tomarse de la calibración LC en lugar de unos 3,28 V fijos válidos para una sola placa.
+- **`LIV` estaba limitado a 30 s.** Tanto el CLI como el lazo recortaban el
+  intervalo de corrección LOCK a 30, y el lazo saltaba a 5 s ante un valor fuera de
+  rango — así que pedir un lazo más lento daba en silencio el más rápido. Restaurado
+  a 1..600 s, recortando al límite más cercano. Importaba de inmediato: un probador
+  comparando LIV 30 con LIV 60 habría visto rechazado el 60.
+- **Los ajustes nunca se guardaban realmente.** La cabecera del slot guardaba la
+  longitud de los datos en un solo byte, así que todo lo que superara 255 B se
+  truncaba: un bloque de ajustes de 324 bytes se registraba como 68. Los datos en
+  sí se escribían bien y el CRC los cubría, así que nada parecía mal — pero cada
+  lectura devolvía una longitud truncada, dejando la cola del bloque recuperado
+  con lo que hubiera en la pila. De ahí venía el extraño `temp_coeff=-1`, y en
+  cuanto la longitud se comprobó de forma estricta la lectura rechazó el registro y
+  la placa arrancaba con los valores por defecto. El campo de longitud es ahora de
+  16 bits (cabecera de slot 4 B → 6 B, datos 506 B → 504 B) y el magic del anillo
+  se incrementa para que un anillo antiguo se reformatee en vez de decodificarse
+  como basura. Esto afectaba a la rama flash-ring desde el principio — el bloque
+  del propio GML ya medía 292 B, también por encima del límite.
+- **Desbordamiento de pila al escribir el flash-ring.** Guardar los ajustes
+  necesita unos 1,4 KB de pila — `fr_write()` construye una imagen de slot de 512
+  bytes más una copia de verificación de 512 bytes, y `settings_store` añade un
+  bloque de ~324 B — pero la tarea CLI tenía 1 KB y la de control 1,5 KB. La tarea
+  CLI se desbordaba sobre su vecina y la placa imprimía la confirmación de guardado
+  y luego se colgaba con la pantalla congelada. Ambas pilas se amplían con margen
+  (CLI 1 KB → 3 KB, control 1,5 KB → 3,25 KB; 4 KB más de RAM de 128 KB). El riesgo
+  es anterior al trabajo de guardado automático — `ES` estaba igual de expuesto —
+  pero el guardado automático lo hizo fácil de alcanzar.
+- **`EW` informaba del sector de flash equivocado.** El anillo siempre ha estado en
+  el sector 7 (0x08060000, el último sector, para que el firmware conserve el
+  máximo espacio contiguo por debajo), pero el mensaje de `EW` llevaba fijo
+  «sector 6, 0x08040000» — el único sitio que mira un operador era el único que
+  mentía. El mensaje lee ahora la dirección de la implementación mediante las
+  nuevas funciones `flash_ring_sector_no()` / `flash_ring_base_addr()`, así que ya
+  no puede desviarse. Los documentos de puesta en marcha tenían las mismas cifras
+  obsoletas y se han corregido en los tres idiomas: el techo del firmware es
+  393216 B (384 KB), no 262144 B, y el rango de borrado con J-Link para limpiar el
+  anillo es 0x08060000-0x0807FFFF, no el rango del sector 6, que habría dejado el
+  anillo intacto.
+- **LC ya no descarta su propia convergencia.** El bucle de anulación de tasa
+  paraba tras tres intentos y, si aún no había entrado en la banda de aceptación,
+  recurría a `saved_pwm + offset` — que asume que el PWM guardado está en el punto
+  de enganche. Ejecutado antes de que el oscilador esté cerca de 10 MHz esa
+  suposición es muy falsa: una ejecución observada convergió -244, -57, -16 ns/s
+  (a un paso de la banda), lo descartó y muestreó a un PWM que corría a -244 ns/s,
+  donde la fase cruza toda la ventana del detector entre publicaciones. Cada
+  armado del picDIV caía en la saturación y la calibración abortaba. El bucle tiene
+  ahora seis intentos y, al agotarlos, conserva el PWM dirigido en vez de volver
+  al inicio.
+- **FA / FAD / FAL restaurados.** La ventana de promediado del término de
+  amortiguación por estado (y el término `damp_e_freq` que alimenta en el
+  algoritmo 10) existía en v0.97 pero no en la rama flash-ring, así que se perdió
+  en la fusión. Restaurada, y ahora guardada en el flash-ring en lugar de EEPROM.
+- **Los registros de ajustes verifican su longitud.** `settings_recall` y
+  `settings_save_partial` aceptaban cualquier registro de dos bytes o más en un
+  bloque de pila, así que un registro más corto que la estructura actual dejaba la
+  cola como basura de pila — y un guardado parcial la reescribía. Ambos ponen a
+  cero el bloque primero y exigen el tamaño exacto.
+- **settings_store.cpp ya compila.** Leía tres variables globales que no podía
+  ver — g_pressure_offset, g_altitude_offset (definidas en gpsdo_control.cpp, sin
+  cabecera propia) y g_qerr_enable (declarada en ubx_timtp.h, que no estaba
+  incluido). Se añadieron el include y los dos extern locales, siguiendo el patrón
+  que usa el resto del proyecto.
+- **Comando LT implementado.** La ayuda siempre documentó `LT 0|1` y las rutas de
+  pantalla e informes siempre leyeron g_show_local_time, pero el manejador del CLI
+  nunca se escribió, así que el verbo no hacía nada en silencio. Ahora conmuta e
+  informa UTC frente a hora local, tal como promete la ayuda.
+- **El dph del puerto serie coincide ahora con el panel.** La fila del TFT restaba
+  el sawtooth del receptor pero el informe serie no, así que el mismo instante se
+  leía distinto en cada uno — todo un sawtooth de diferencia (~±10 ns en un LEA-6T,
+  más en un M8T). La ruta serie también lo resta ahora, como su propio comentario
+  ya afirmaba.
+- **CR (reinicio en frío) ahora sí borra el ring.** persist_erase() llama al nuevo
+  flash_ring_wipe(), que borra y reformatea físicamente el sector del ring, de modo
+  que un reinicio en frío vuelve de verdad a los valores por defecto en lugar de
+  solo marcar el estado como obsoleto.
+
 ## [v0.95-rtos] — 2026-07-16
 
-- **Nuevo `tools/gpsdo_tuner.py` — GUI de ajuste en vivo y visualización de
-  fase.** En lugar de ajustar continuamente los valores por defecto para cada
-  OCXO y detector, esta herramienta pone los comandos de ajuste del firmware tras
-  controles directos. Lee cada parámetro del dispositivo (LL / LP / FA), escribe
-  en vivo (el PID de tres etapas LTIC, las ventanas FA, el PID algo 3-9 y la
-  calibración del detector), y confirma con ES o revierte con ER. Inspirado en
-  GPSDO_log.py de lucido y acreditado como tal. Requiere pyserial, pyqtgraph y
-  PySide6.
-- **OLED y LCD muestran ahora el estado del lazo de fase algo-10, incluido el
-  aviso LPOL?.** En el OLED una tercera página (C) se une a la rotación A/B
-  cuando GPSDO_LTIC está definido: estado del lazo, tensión del detector, fase
-  (con el mismo guardián de banda ovf que el TFT), qErr y las ventanas FA. En el
-  LCD 20x4 la línea 2 alternante gana un modo "St:LOCK +52ns" con P? cuando la
-  polaridad no está fijada. Ese aviso es el motivo: un usuario de pantalla
-  pequeña no tiene consola serie, así que sin él un LPOL sin fijar se vería como
-  un DISCIPLINED sano con el lazo retenido en silencio. Ambos bajo GPSDO_LTIC;
-  el TFT no se toca.
-- **`FA` / `FAD` / `FAL`: ventana de promediado conmutable del término de
-  amortiguación LTIC, por estado.** Las medidas de Dan Wiering contra rubidio
-  mostraron un ciclo límite de ~220 s en el algoritmo 10, mientras que el
-  algoritmo 7 en la misma referencia era limpio — lo que sitúa la causa en la
-  estructura de segundo orden del DPLL. DPLL y LOCK se ajustan por separado:
-  `FAD 10` solo en adquisición, `FAL 10` solo en estado estacionario, `FA 10`
-  ambos. Valores 10 / 100 / 1000 s; 100 por defecto reproduce el comportamiento
-  anterior bit a bit. Separar los estados permite que una medida de referencia
-  localice el ciclo. Ambas ventanas se guardan con `ES` (grupo LTIC).
-- **La barra de estado avisa cuando el lazo de fase LTIC no tiene polaridad.**
-  El lazo no dirige la fase hasta conocer el signo PWM→fase (`LPOL`); hasta
-  entonces retiene, y la fase puede quedar horas contra un tope. La barra añade
-  `LPOL?` (`P?` en la 320) tras el texto de estado cuando hay calibración pero
-  la polaridad sigue en cero.
-- **El tope superior del guardián de fuga sigue al detector, no un 3.28 V fijo.**
-  `railed_now` usa ahora el borde alto de la banda medida por LC
-  (`zero_offset + 0.55·span`), la misma frontera que valida la fase, en vez de un
-  3.28 V que un detector con Vsat más bajo nunca alcanza. El tope inferior sigue
-  en 0.02 V; una placa sin calibrar conserva el límite fijo anterior.
-- **`ES` puede guardar ahora un grupo a la vez.** `ES` solo escribe toda la
-  página; `ES <grupo>` escribe solo ese bloque y deja el resto en su valor
-  guardado. Grupos: `CORE`, `PID`, `TZ`, `LTIC`, `LCAL`, `CAL`, `MISC`. Guardar
-  un cambio de zona horaria ya no congela un PID a medio experimentar. Cada
-  guardado rellena el búfer desde flash, escribe la firma y su sección, y
-  vuelca; los bytes intactos conservan su valor. Solo un `ES` completo toma
-  instantánea del flash ring.
 ### Añadido
 - **Zonas horarias con horario de verano, en todo el mundo.** `TZ Adelaide`
   basta para que el reloj sea correcto, incluido su desfase de media hora y su
@@ -134,11 +263,8 @@ El sufijo de versión `-rtos` marca el linaje del port a FreeRTOS.
   algo 10.
 - **Cada columna tiene una línea de alineación derecha (480×320).** La izquierda
   termina donde «hPa» en la fila BMP, la derecha donde «ns» en la fila de fase.
-  `Vct`, `% rH`, la presión BMP y la corriente del INA se anclan ahora a esas
-  líneas. La presión estaba en la línea solo por aritmética (es la cadena de la
-  que se mide align_L); una temperatura bajo cero la habría desplazado. Las
-  líneas se miden con `textWidth()` en el primer uso en vez de fijarse como
-  constantes.
+  `Vct`, `% rH` y la corriente del INA se anclan ahora a esas líneas. Las líneas
+  se miden con `textWidth()` en el primer uso en vez de fijarse como constantes.
 - **Las filas de sensores se agrupan por columna (480×320).** BMP y AHT ocupan
   la columna izquierda y los campos eléctricos la derecha: la fase arriba y los
   raíles justo debajo. `AHT` y `Vph`/`dph` intercambian su sitio.

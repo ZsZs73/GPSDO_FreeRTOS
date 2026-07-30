@@ -1,46 +1,36 @@
 /* ======================================================================
- * flash_ring.cpp  —  STM32F411 HAL layer for the live-data ring buffer
+ * flash_ring.cpp  —  STM32F411 HAL layer for the live-data + settings ring
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  *
  * This is the ONLY part of the ring buffer that touches real flash. It
  * implements the three primitives the hardware-independent core needs
- * (read / program / erase) against sector 6 of the STM32F411CE, then
+ * (read / program / erase) against sector 7 of the STM32F411CE, then
  * exposes the small public API declared in flash_ring.h.
  *
  * SAFETY
  * ------
- *  - Enabled at runtime via g_flash_ring_enable (FR 0|1, saved in EEPROM).
- *    When disabled, no flash operation is issued and the API reports
- *    empty/disabled, so live_store no-ops. Always compiled — avoids the
- *    build_opt.h caching problems a compile flag would bring.
- *  - Sector 6 @ 0x08040000 (128 KB). Firmware currently ends mid-sector-5
- *    (~0x0803A918); the whole of sector 5 is reserved for growth so the ring
- *    can never overlap code. DO NOT move RING_SECTOR without re-checking the
- *    map ("Sketch uses NNNNN bytes" must stay < 0x08040000 - 0x08000000).
+ *  - Always enabled (no runtime toggle). Settings (ES) and live data both
+ *    share this ring, distinguished by record type (REC_LIVE / REC_SETTINGS).
+ *  - Sector 7 @ 0x08060000 (128 KB). Firmware ends in sector 5 (~0x0803A918);
+ *    sectors 0-5 are reserved for code, sector 6 is a growth buffer.
+ *    DO NOT move RING_SECTOR without re-checking the map.
  *  - Every write is verified by read-back in the core (fr_write), and every
  *    slot carries a CRC, so a mis-programmed or power-cut write is detected.
  *  - Erase/program run with interrupts kept enabled but are short; the
- *    control loop tolerates the occasional stall because live-data saves are
- *    rare (hysteresis in the caller).
+ *    control loop tolerates the occasional stall because saves are rare
+ *    (hysteresis in live_store; ES is user-initiated).
  * ====================================================================== */
 
 #include "flash_ring.h"
 #include "flash_ring_core.h"
 
-/* Always compiled now; enabled at runtime via g_flash_ring_enable (FR 0|1,
- * saved in EEPROM). When disabled, no flash operation is ever issued — the
- * public API returns "empty/disabled" and the caller (live_store) no-ops.
- * This avoids the notorious build_opt.h caching problems of a compile flag. */
 #include "stm32f4xx_hal.h"
 #include <string.h>
 
-/* runtime enable — declared in gpsdo_control.cpp, defaulted true, EEPROM 232 */
-extern volatile bool g_flash_ring_enable;
-
 /* ---- flash geometry (STM32F411CE) ---- */
-#define RING_SECTOR       FLASH_SECTOR_6
-#define RING_BASE_ADDR    0x08040000UL
+#define RING_SECTOR       FLASH_SECTOR_7
+#define RING_BASE_ADDR    0x08060000UL
 #define RING_SECTOR_LEN   0x00020000UL      /* 128 KB */
 #define RING_VOLTAGE      FLASH_VOLTAGE_RANGE_3   /* 2.7-3.6 V → word program */
 
@@ -102,28 +92,42 @@ static const fr_ops_t OPS = {
     hw_read, hw_program, hw_erase, RING_SECTOR_LEN
 };
 
-/* ---- public API (runtime-gated by g_flash_ring_enable) ---- */
+/* ---- public API ---- */
 
 bool flash_ring_begin(void)
 {
-    if (!g_flash_ring_enable) { s_ready = false; return false; }
     int r = fr_begin(&s_state, &OPS);
     s_ready = true;
     return (r == 1);
 }
 
-uint16_t flash_ring_read(uint8_t *out, uint16_t maxlen)
+uint32_t flash_ring_base_addr(void) { return RING_BASE_ADDR; }
+uint8_t  flash_ring_sector_no(void) { return (uint8_t)RING_SECTOR; }
+
+bool flash_ring_wipe(void)
 {
-    if (!s_ready || !g_flash_ring_enable) return 0;
-    return fr_read(&s_state, out, maxlen);
+    /* Cold-restart erase: physically erase the ring sector, then re-init so a
+     * fresh header is laid down. After this the ring reads as empty — the next
+     * boot (or the next settings_recall) finds no valid slot and falls back to
+     * compile-time defaults. Used by the CR command. Returns true on success. */
+    if (hw_erase() != 0) return false;
+    int r = fr_begin(&s_state, &OPS);   /* reformats the just-erased sector */
+    s_ready = true;
+    return (r == 1);
 }
 
-bool flash_ring_write(const uint8_t *data, uint16_t len)
+uint16_t flash_ring_read_newest(uint8_t type, uint8_t *out, uint16_t maxlen)
 {
-    if (!s_ready || !g_flash_ring_enable) return false;
-    return (fr_write(&s_state, data, len) == 0);
+    if (!s_ready) return 0;
+    return fr_read_newest(&s_state, type, out, maxlen);
 }
 
-uint32_t flash_ring_erase_count(void) { return (s_ready && g_flash_ring_enable) ? fr_erase_count(&s_state) : 0; }
-uint16_t flash_ring_slot_count(void)  { return (s_ready && g_flash_ring_enable) ? s_state.slot_count : 0; }
-uint16_t flash_ring_slots_used(void)  { return (s_ready && g_flash_ring_enable) ? s_state.used : 0; }
+bool flash_ring_write(uint8_t type, const uint8_t *data, uint16_t len)
+{
+    if (!s_ready) return false;
+    return (fr_write(&s_state, type, data, len) == 0);
+}
+
+uint32_t flash_ring_erase_count(void) { return s_ready ? fr_erase_count(&s_state) : 0; }
+uint16_t flash_ring_slot_count(void)  { return s_ready ? s_state.slot_count : 0; }
+uint16_t flash_ring_slots_used(void)  { return s_ready ? s_state.used : 0; }

@@ -1,7 +1,7 @@
 /**
  * GPSDO_algorithms.cpp — Control loop algorithm implementations
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -322,6 +322,28 @@ LticParams_t g_ltic = {
     /* centre_v*/ 0.0f,       /* 0 = use detected range middle  */
 };
 
+/* Algorithm 11 (LTIC-Lars) parameters. gain 0 = auto from CT calibration; a
+ * non-zero gain set with LG overrides the auto value with a manual scale. */
+LarsParams_t g_lars = {
+    /* gain         */ 0.0f,    /* 0 = auto from CT calibration; LG sets manual */
+    /* damping      */ 3.0f,    /* Lars' default                                */
+    /* time_const_s */ 60u,     /* ~ limit-cycle period / 6                      */
+    /* filter_div   */ 2u,      /* pre-filter = time_const / 2                   */
+    /* tic_offset   */ 2620u,   /* ~2.11 V at 3.3 V / 4096 (mid-band from log)   */
+    /* lock_ns_lim  */ 100u,    /* Lars' default phase window                    */
+    /* lock_factor  */ 5u,      /* Lars' default                                */
+    /* temp_coeff   */ 0,       /* off                                          */
+    /* temp_ref     */ 0u,      /* set from BMP at enable time                   */
+    /* flags        */ 0u,      /* temp comp disabled                           */
+    /* reserved     */ { 0, 0, 0, 0, 0, 0 },
+};
+
+/* Algo 11 live telemetry (see header). Published by ltic_lars_pi each cycle. */
+float g_lars_scale      = 0.0f;
+float g_lars_phase_filt = 0.0f;
+bool  g_lars_locked     = false;
+bool  g_lars_gain_auto  = true;
+
 /* ======================================================================
  * ALGORITHM 10 — LTIC three-stage PLL (ACQ → DPLL → LOCK)
  *
@@ -382,7 +404,7 @@ static double damp_e_freq(const FreqSnapshot_t *s, double e_freq_default,
     }
 }
 
-static double ltic_phase_error_ns(bool *valid)
+static double ltic_phase_error_ns(bool *valid, uint32_t ppscount)
 {
     float v = g_ltic_voltage;
     *valid = (v > 0.02f && v < 3.28f);          /* not railed low/high */
@@ -414,11 +436,15 @@ static double ltic_phase_error_ns(bool *valid)
     /* Sawtooth correction: the receiver's 1PPS lands on an internal clock
      * edge, off true GPS time by a known qErr (UBX-TIM-TP). Subtracting it
      * removes the receiver granularity sawtooth (LEA-6T: ~±10 ns) and leaves
-     * the OCXO's own phase error. Zero when SAW is off or no fresh qErr. Each
-     * phase reading is sampled on the ramp peak right after its PPS pulse, so
-     * it belongs to that one pulse and pairs with that pulse's qErr; the
-     * correction is a clean per-pulse subtraction. */
-    phase -= (double)ubx_timtp_correction_ns();
+     * the OCXO's own phase error. Zero when SAW is off or no fresh qErr.
+     *
+     * Pairing by ppscount (v0.95 audit fix): the correction is taken ONLY if
+     * the latest TIM-TP genuinely describes THIS pulse — accounting for the
+     * mode bit (next-pulse vs this-pulse). If TIM-TP hasn't arrived yet for
+     * this PPS (vGpsTask lagging) or arrived for a different one, the call
+     * returns 0 and the sample is treated as uncorrected, rather than
+     * subtracting a stale qErr off by one PPS. */
+    phase -= (double)ubx_timtp_correction_for_pps(ppscount);
     return phase;
 }
 
@@ -528,7 +554,7 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
      * LOCK→DPLL→ACQ bounce when it isn't. */
     if (prev_state == 0xFF && state != LTIC_ACQ) {
         bool boot_valid = false;
-        double boot_ph = ltic_phase_error_ns(&boot_valid);
+        double boot_ph = ltic_phase_error_ns(&boot_valid, ppscount);
         bool near_centre = boot_valid &&
                            fabs(boot_ph) <= (double)g_ltic.acq_threshold_ns;
         if (!near_centre) {
@@ -547,7 +573,11 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
      * never closed. LOCK uses lock_interval_s but capped so it can still track
      * a narrow detector; if that is set very large (legacy) we clamp to 5 s. */
     uint32_t lock_iv = g_ltic.lock_interval_s;
-    if (lock_iv < 1u || lock_iv > 30u) lock_iv = 5u;   /* sane bound for narrow detector */
+    /* Clamp to the nearest bound rather than snapping to a default: an
+     * out-of-range value used to jump to 5 s, so asking for a SLOWER loop
+     * silently gave you the fastest one. The field is uint16 and 600 fits. */
+    if (lock_iv < 1u)        lock_iv = 1u;
+    else if (lock_iv > 600u) lock_iv = 600u;
     uint32_t period = (state == LTIC_LOCK) ? lock_iv
                     : (state == LTIC_DPLL) ? 2u : 5u;
     if ((ppscount % period) != 0) return pwm;
@@ -562,20 +592,15 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
      * Fall back to avg10 only until the first 100 s window has filled. */
     double e_freq = s.have100 ? (s.avg100 - (double)BASE_FREQ)
                   : s.have10  ? (s.avg10  - (double)BASE_FREQ) : 0.0;
-    /* Damping-term frequency error, one per state. The DPLL and LOCK frequency
-     * terms can now read different averaging windows (FAD / FAL commands), so a
-     * shorter window can be tried in one state without disturbing the other —
-     * the way to find out whether the ~220 s limit cycle lives in acquisition
-     * or in steady state. Everything else (escape detection, self-learning,
-     * state transitions, the phase PI) stays on the smooth avg100 via e_freq.
-     * In LOCK the term keeps its gentle 0.1/0.3 weighting; the window only
-     * changes which average it reads. With both windows at 100 these are
-     * bit-for-bit e_freq, so the default behaviour is unchanged in both. */
+
+    /* Damping-term windows, per state (FAD / FAL). With both at the default 100
+     * these are bit-for-bit e_freq, so behaviour is unchanged unless the operator
+     * shortens a window to chase a limit cycle. */
     double e_freq_damp_dpll = damp_e_freq(&s, e_freq, g_freq_damp_win_dpll);
     double e_freq_damp_lock = damp_e_freq(&s, e_freq, g_freq_damp_win_lock);
 
     bool ph_valid = false;
-    double phase_ns = ltic_phase_error_ns(&ph_valid);
+    double phase_ns = ltic_phase_error_ns(&ph_valid, ppscount);
 
     /* drift = change in phase per second. Reject wrap-induced spikes: if the
      * phase appears to jump more than half the detector range in one step, it
@@ -782,22 +807,13 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
     static uint16_t start_pwm = 0;
     static bool     start_set = false;
     static bool     runaway_warned = false;
+    static double   prev_abs_ef = 0.0;   /* |e_freq| at the previous railed cycle */
+    static uint8_t  no_improve  = 0;     /* consecutive railed cycles with no gain */
     if (!start_set) { start_pwm = pwm; start_set = true; }
-    /* "Railed" means the detector is against a stop and its voltage no longer
-     * tracks phase — the state the runaway checks below need to recognise. A
-     * fixed 3.28 V upper bound assumes the ramp saturates near the 3.3 V ADC
-     * rail, which is only true for detectors whose Vsat happens to sit there.
-     * On one with Vsat ≈ 2.9 V the ramp plateaus well below 3.28, so the loop
-     * can be fully saturated while this test reads healthy, and the runaway
-     * guard never arms — the top rail is effectively invisible to it.
-     *
-     * Use the same band ltic_phase_error_ns() validates against: the swept
-     * region LC measured, centred on zero_offset. Past its high edge the
-     * detector is plateaued regardless of where that edge falls, which is the
-     * condition this actually wants. The low rail stays a fixed 0.02 V — the
-     * cap genuinely discharges to zero and there is no lower calibration point
-     * to key off. Falls back to the old fixed bound only when LC has not run,
-     * so an uncalibrated board behaves exactly as before. */
+
+    /* Rail threshold from the LC calibration where one exists: the detector band
+     * is zero_offset ± half the swept span, so a fixed 3.28 V only happens to be
+     * right for one board. */
     float rail_hi = 3.28f;
     if (g_ltic.range_ns > 1.0f && g_ltic.ns_per_volt > 1.0f) {
         float span_v = g_ltic.range_ns / g_ltic.ns_per_volt;
@@ -805,20 +821,87 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
     }
     bool railed_now = (g_ltic_voltage <= 0.02f || g_ltic_voltage >= rail_hi);
     int32_t pwm_excursion = (int32_t)pwm - (int32_t)start_pwm;
-    bool freq_escape = railed_now && fabs(e_freq) > 0.5;            /* Hz, direct */
-    bool lsb_backstop = railed_now && (pwm_excursion > 2000 || pwm_excursion < -2000);
+
+    /* A railed detector together with a large |e_freq| is NOT by itself a
+     * runaway — it is the normal state of a cold or far-off OCXO at the start of
+     * acquisition: the phase sweeps the whole range in seconds, so the cap sits
+     * against a stop while TIM2 still reports the true offset. Freezing there
+     * removes the only path back, because the frequency term is exactly what
+     * pulls the OCXO into the detector window.
+     *
+     * What actually distinguishes a runaway is that the correction does not
+     * work: with the polarity wrong the loop drives the wrong way and |e_freq|
+     * fails to shrink however long it runs. So track improvement across railed
+     * cycles and only freeze once the error has stalled for several of them. A
+     * healthy acquisition improves every cycle and never trips this; a genuine
+     * runaway trips after ~5 corrections. Without this both guards fired during
+     * perfectly healthy pull-ins — one observed run moved 3855 LSB while railed
+     * and was frozen mid-recovery. */
+    double abs_ef = fabs(e_freq);
+    if (railed_now) {
+        if (prev_abs_ef > 0.0 && abs_ef > prev_abs_ef * 0.98) {
+            if (no_improve < 255u) no_improve++;   /* stalled this cycle */
+        } else {
+            no_improve = 0;                        /* still converging */
+        }
+        prev_abs_ef = abs_ef;
+    } else {
+        no_improve  = 0;
+        prev_abs_ef = 0.0;
+    }
+    bool stalled      = (no_improve >= LTIC_RUNAWAY_STALL);
+    bool freq_escape  = railed_now && abs_ef > 0.5 && stalled;
+    bool lsb_backstop = railed_now && stalled &&
+                        (pwm_excursion > 2000 || pwm_excursion < -2000);
     if (freq_escape || lsb_backstop) {
         if (!runaway_warned) {
             OUT_SERIAL.print("LTIC: runaway (");
             OUT_SERIAL.print(e_freq, 2);
-            OUT_SERIAL.println(" Hz, phase railed) — freezing; check LPOL / re-centre.");
+            OUT_SERIAL.println(" Hz, phase railed, not converging) — freezing; check LPOL / re-centre.");
             runaway_warned = true;
         }
         u = 0.0;                        /* freeze; do not chase further */
         integ = (double)pwm;            /* and stop the integrator winding up */
     } else if (!railed_now && fabs(e_freq) < 0.25) {
         runaway_warned = false;         /* genuinely healthy: recovered */
+        no_improve     = 0;
         start_pwm = pwm;                /* re-baseline ONLY here */
+    }
+
+    /* ---- ACQ re-arm retry -------------------------------------------------
+     * The entry arm above fires once, on the TRANSITION into ACQ. If that sync
+     * does not land the phase inside the detector window — the flip-flop's
+     * ambiguous point, or the OCXO still far enough off that the phase sweeps
+     * straight back out — ACQ gets no second attempt: the state does not
+     * change, so the transition never repeats, the detector reads "ovf"
+     * indefinitely and only a manual AP recovers it. Reported from the field
+     * after a reboot (Dan Wiering).
+     *
+     * Mirrors algorithm 11's phase-capture bridge: once the frequency has
+     * settled but the phase is still railed, re-arm periodically. Gated on the
+     * frequency because arming while the OCXO is still far off is pointless —
+     * the phase would race out of the window again immediately — and held off
+     * afterwards so a failed capture retries about every 20 s rather than every
+     * cycle. */
+    static uint32_t acq_railed_cnt = 0;
+    static uint32_t acq_rearm_hold = 0;
+    if (state == LTIC_ACQ) {
+        if (acq_rearm_hold > 0) {
+            acq_rearm_hold--;
+            acq_railed_cnt = 0;
+        } else if (railed_now && fabs(e_freq) <= 0.05) {
+            if (acq_railed_cnt < 0xFFFFFFFFu) acq_railed_cnt++;
+            if (acq_railed_cnt >= 5u) {
+                ltic_arm_picdiv();
+                acq_railed_cnt = 0;
+                acq_rearm_hold = 15u;
+            }
+        } else {
+            acq_railed_cnt = 0;
+        }
+    } else {
+        acq_railed_cnt = 0;
+        acq_rearm_hold = 0;
     }
 
     uint16_t out = clamp_pwm((int32_t)pwm + (int32_t)u);
@@ -881,6 +964,270 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
 /* ======================================================================
  * ALGORITHM DISPATCHER
  * ====================================================================== */
+uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
+{
+    /* ppscount is unused: unlike algo 10, this loop updates every second with
+     * no period gate — the adaptive filter provides the smoothing instead. */
+    (void)ppscount;
+    /* Persistent loop state. */
+    static float    s_integ        = 0.0f;   /* dacValue: integral accumulator */
+    static float    s_i_remain      = 0.0f;   /* Lars' I_term_remain            */
+    static float    s_phase_filt    = 0.0f;   /* filtered phase [ns]            */
+    static uint32_t s_lock_cnt      = 0;      /* Lars' lockPPScounter           */
+    static bool     s_locked        = false;
+    static bool     s_init          = false;
+    static uint16_t s_tc_old        = 0;      /* detect timeConst change        */
+
+    /* Refuse to run without TIC calibration — phase has no scale otherwise. */
+    if (g_ltic.ns_per_volt == 0.0f || g_ltic.range_ns == 0.0f) {
+        set_trend(0);
+        return pwm;
+    }
+
+    /* One-time seed: start the integrator at the current PWM so we take over
+     * smoothly from whatever value the OCXO was already sitting at. */
+    if (!s_init) {
+        s_integ      = (float)pwm;
+        s_phase_filt = 0.0f;
+        s_i_remain   = 0.0f;
+        s_lock_cnt   = 0;
+        s_locked     = false;
+        s_tc_old     = g_lars.time_const_s;
+        s_init       = true;
+    }
+
+    /* ---- inputs, evaluated EVERY second (no period gate) ---- */
+    FreqSnapshot_t s;
+    take_freq_snapshot(&s);
+    double e_freq = s.have100 ? (s.avg100 - (double)BASE_FREQ)
+                  : s.have10  ? (s.avg10  - (double)BASE_FREQ) : 0.0;
+
+    bool   ph_valid = false;
+    double phase_ns = ltic_phase_error_ns(&ph_valid, ppscount);   /* 0 = on target       */
+    bool   railed   = !ph_valid;
+
+    /* ---- adaptive filter/time constants (Lars 261-263) ----
+     * filterConst = timeConst / filterDiv, forced to 1 while unlocked so the
+     * loop reacts fast during acquisition and smooths only once settled. */
+    uint16_t time_const = g_lars.time_const_s;
+    if (time_const < 1u) time_const = 1u;
+    uint32_t filt = (uint32_t)time_const / (g_lars.filter_div ? g_lars.filter_div : 1u);
+    if (filt < 1u) filt = 1u;
+    if (!s_locked) filt = 1u;
+
+    /* If timeConst changed under us, rescale the integrator so the output does
+     * not jump (Lars 266-268: dacValue scales with timeConst). Our integrator
+     * is in PWM units directly, so no rescale is needed here — but reset the
+     * remainder to avoid a stale fractional carry. */
+    if (time_const != s_tc_old) { s_i_remain = 0.0f; s_tc_old = time_const; }
+
+    /* ---- phase pre-filter (Lars 285), outlier-gated ----
+     * Exponential smoother with variable constant. Skip the update on a railed
+     * reading (no valid phase) so a rail excursion cannot poison the filter. */
+    if (!railed) {
+        s_phase_filt += ((float)phase_ns - s_phase_filt) / (float)filt;
+    }
+
+    /* ---- frequency-led assist when the phase is out of range ----
+     * railed → the phase detector is blind, so steer by TIM2 frequency alone,
+     * exactly the situation that used to freeze algo 10. e_freq is in Hz;
+     * multiply by gain-scaled term to pull PWM back toward the detector window.
+     * The sign convention matches the phase path (positive error → reduce PWM),
+     * with polarity honoured. */
+    double polarity = (g_ltic.polarity == -1) ? -1.0 : 1.0;
+
+    /* Effective frequency-branch scale. g_lars.gain == 0 means "auto": derive it
+     * from the CT calibration, exactly as algo 10 does. CT measures K (Hz per PWM
+     * LSB) and stores it as g_pid[7].Kp = 0.40/K, so lsb_per_hz = g_pid[7].Kp/0.40
+     * is LSB of PWM per Hz of frequency error — which is precisely what the
+     * frequency branch needs to convert e_freq into a PWM correction, with no
+     * hand-tuning and no board-specific constant. If the user has set a non-zero
+     * gain with LG, that takes priority and is used with the fixed 6553.6 scale
+     * as before. A light 0.5 factor on the auto path keeps the proportional term
+     * from being too hot on boards with a large lsb_per_hz. */
+    float freq_scale;      /* LSB per Hz  — used by the acquisition branch */
+    float phase_gain;      /* LSB per ns  — used by the phase branch        */
+    if (g_lars.gain > 0.0f) {
+        freq_scale  = g_lars.gain * 6553.6f;             /* manual: LG value */
+        phase_gain  = g_lars.gain;
+        g_lars_gain_auto = false;
+    } else {
+        double lsb_per_hz = (g_pid[7].Kp > 100.0)
+                          ? ((double)g_pid[7].Kp / 0.40)  /* from CT          */
+                          : 3000.0;                       /* fallback if no CT */
+        freq_scale = (float)(0.5 * lsb_per_hz);
+
+        /* The two branches need DIFFERENT units and both must be derived, or the
+         * loop half-works: an earlier version fed the auto value to the frequency
+         * branch only, leaving the phase branch multiplying by g_lars.gain — which
+         * is zero in auto mode. Acquisition then pulled in, the picDIV bridge
+         * delivered the phase to the window, and the phase PI did nothing at all.
+         *
+         * Phase gain is LSB per ns. Nulling a phase error P over the loop time
+         * constant needs a fractional frequency offset P/(tau*1e9), which at
+         * 10 MHz is P/(100*tau) Hz, so lsb_per_hz/(100*tau) LSB per ns. Half of
+         * that is used: the loop also has an integral term, so a proportional
+         * term sized to null the error inside one time constant on its own is too
+         * hot. The result lands within 15% of the hand-tuned 0.3 that produced a
+         * clean lock on the bench, and unlike a fixed number it follows both the
+         * measured VCO slope and whatever LTC is set to. */
+        phase_gain = (float)(0.5 * lsb_per_hz / (100.0 * (double)time_const));
+        g_lars_gain_auto = true;
+    }
+    g_lars_scale = freq_scale;
+
+    float p_term, i_term;
+    if (railed) {
+        /* Frequency pull-in as a proper PI, with the PROPORTIONAL term doing the
+         * work and the integrator contributing only a small trim. An earlier
+         * version fed the full frequency correction into the integrator; that
+         * integrator then carried momentum — it reached e_freq=0 with a pile of
+         * accumulated LSB, sailed past, and the loop oscillated ±2 Hz around the
+         * target with a ~150 s period, never settling into the phase window
+         * (seen on air). The fix mirrors Lars' own structure (strong P, integral
+         * = a fraction of P): P responds to the current e_freq and self-brakes as
+         * the frequency comes down, while a light integral removes any residual
+         * static offset without storing momentum.
+         *
+         * SIGN — from hardware, not assumed. A cold start showed the OCXO +8.4 Hz
+         * fast with PWM driven UP to 65535, making it faster: a runaway. So the
+         * frequency error needs the OPPOSITE sign from the phase branch (phase and
+         * frequency have opposite orientation on this wiring): +polarity*e_freq
+         * here vs -polarity below. Positive e_freq (fast) then lowers PWM. */
+        float freq_lsb = (float)(polarity) * (float)e_freq * freq_scale;
+
+        /* P dominates and self-brakes; I is a small fraction (Lars: I=P/damping,
+         * and here further reduced so acquisition cannot wind up momentum). */
+        p_term = freq_lsb;
+        i_term = freq_lsb / g_lars.damping / 10.0f + s_i_remain;
+
+        /* STEP CLAMP on the integral only. P is allowed its full self-limiting
+         * value (it shrinks with e_freq on its own); the integral is what could
+         * accumulate an overshoot, so cap its per-cycle contribution. The real
+         * VCO slope (Hz/LSB) is unknown and folded into gain, so a bounded walk
+         * is what keeps acquisition from leaping past the lock point. */
+        const float ACQ_MAX_ISTEP = 50.0f;
+        if (i_term >  ACQ_MAX_ISTEP) i_term =  ACQ_MAX_ISTEP;
+        if (i_term < -ACQ_MAX_ISTEP) i_term = -ACQ_MAX_ISTEP;
+
+        /* Also bound the total P excursion so a huge cold-start e_freq cannot
+         * slam PWM across the whole span in one cycle; large enough to move
+         * briskly, small enough not to overshoot a nearby lock point. */
+        const float ACQ_MAX_P = 2000.0f;
+        if (p_term >  ACQ_MAX_P) p_term =  ACQ_MAX_P;
+        if (p_term < -ACQ_MAX_P) p_term = -ACQ_MAX_P;
+
+        /* ANTI-WINDUP / runaway stop — safety net independent of sign. If PWM is
+         * at a rail and the integral would push further in, freeze it, so the
+         * loop can never sit pinned at 0 or 65535. */
+        bool at_hi = (s_integ >= 65534.0f);
+        bool at_lo = (s_integ <= 1.0f);
+        if ((at_hi && i_term > 0.0f) || (at_lo && i_term < 0.0f)) {
+            i_term     = 0.0f;
+            s_i_remain = 0.0f;
+        }
+    } else {
+        /* Lars' phase PI (292-293). ltic_phase_error_ns() already returns the
+         * phase relative to the calibrated band centre (zero_offset), so 0 IS
+         * the target and we drive the filtered phase to zero directly. gain is
+         * DAC bits per ns. NOTE: g_lars.tic_offset is stored and available but
+         * intentionally NOT summed in here — phase_ns is already centred on the
+         * LC-measured zero, and adding tic_offset as a second reference would
+         * fight it. tic_offset is reserved for an explicit target-shift feature
+         * (like algo 10's centre_v) once we decide how the two should compose. */
+        float phase_err = s_phase_filt;                 /* already relative to 0 */
+        p_term  = (float)(-polarity) * phase_err * phase_gain;
+        i_term  = p_term / g_lars.damping / (float)time_const + s_i_remain;
+    }
+
+    /* ---- integrate with remainder preserved (Lars 293-296) ---- */
+    long  i_whole = (long)i_term;
+    s_i_remain    = i_term - (float)i_whole;
+    s_integ      += (float)i_whole;
+
+    /* ---- optional temperature feed-forward (Lars 306) ----
+     * dacValue += (tempRef - tempFiltered) * tempCoeff. Off unless enabled. */
+    float temp_ff = 0.0f;
+    if (g_lars.flags & LARS_FLAG_TEMP_COMP) {
+        extern float g_bmp_temp;                         /* board temperature °C */
+        /* Map temperature to ADC-like counts the same way tempRef is stored:
+         * tempRef is in ADC counts, so we approximate the current temp in the
+         * same units. A dedicated temp-ADC channel can replace this later. */
+        float temp_now = g_bmp_temp * 100.0f;            /* 0.01 °C resolution */
+        temp_ff = ((float)g_lars.temp_ref - temp_now)
+                * (float)g_lars.temp_coeff / 10000.0f;
+    }
+
+    /* ---- output = integrator + proportional + temp (Lars 297, 306) ---- */
+    float out_f = s_integ + p_term + temp_ff;
+
+    /* clamp to valid PWM range */
+    if (out_f < 0.0f)     out_f = 0.0f;
+    if (out_f > 65535.0f) out_f = 65535.0f;
+    /* keep the integrator itself bounded so it cannot wind up past the rail */
+    if (s_integ < 0.0f)     s_integ = 0.0f;
+    if (s_integ > 65535.0f) s_integ = 65535.0f;
+
+    uint16_t out = (uint16_t)(out_f + 0.5f);
+
+    /* ---- lock detection (Lars 230-242): phase in window AND frequency in
+     * window, held for lock_factor * timeConst seconds ---- */
+    double phase_win_ns = (double)g_lars.lock_ns_lim;
+    bool   in_phase = ph_valid && fabs(s_phase_filt) <= phase_win_ns;
+    bool   in_freq  = fabs(e_freq) <= 0.02;             /* ~20 ppb, Lars' gate */
+    if (in_phase && in_freq) {
+        if (s_lock_cnt < 0xFFFFFFFFu) s_lock_cnt++;
+    } else {
+        s_lock_cnt = 0;
+    }
+    s_locked = (s_lock_cnt > (uint32_t)time_const * g_lars.lock_factor);
+
+    /* publish live state for the Learn telemetry line */
+    g_lars_locked     = s_locked;
+    g_lars_phase_filt = s_phase_filt;
+
+    /* ---- phase-capture bridge -------------------------------------------
+     * The frequency branch can drive e_freq to ~0 while the phase is still
+     * railed far outside the detector window (seen on air: e_freq ±0.03 Hz but
+     * dph stuck at ~1926 ns, trend ACQ forever). At zero frequency error the
+     * phase no longer moves, so it can never drift into range on its own — the
+     * loop is disciplined in frequency but stranded in phase. Algo 10 avoids
+     * this because entering ACQ re-arms the picDIV, which resyncs the divider to
+     * the 1PPS edge and snaps the phase to ~0; algo 11 never armed it at all.
+     * So: once the frequency is genuinely settled but the phase is still railed,
+     * re-arm the picDIV ONCE to bring the phase into the window, then let the
+     * phase branch take over. Guarded by a hold-off counter so it fires at most
+     * once per stranding, not every cycle. */
+    static uint32_t s_freqok_railed = 0;   /* cycles: freq settled yet railed  */
+    static uint32_t s_rearm_holdoff = 0;   /* cool-down after a re-arm         */
+    if (s_rearm_holdoff > 0) {
+        s_rearm_holdoff--;
+        s_freqok_railed = 0;
+    } else if (railed && fabs(e_freq) <= 0.05) {
+        /* frequency good, phase blind: count how long we have been stranded */
+        if (s_freqok_railed < 0xFFFFFFFFu) s_freqok_railed++;
+        /* wait a few seconds of steady frequency before disturbing the divider,
+         * so a brief frequency zero-crossing during acquisition does not trigger
+         * a needless re-arm */
+        if (s_freqok_railed >= 5u) {
+            ltic_arm_picdiv();
+            s_freqok_railed = 0;
+            s_rearm_holdoff = 15u;   /* let the phase settle before trying again */
+        }
+    } else {
+        s_freqok_railed = 0;
+    }
+
+    /* Trend string for telemetry/displays/tuner (4 chars). Uses the same
+     * ACQ/PLL/LOCK vocabulary as algo 10 so the displays read consistently;
+     * algo 11 says PLL where algo 10 says DPLL, which also keeps the two
+     * distinguishable in logs. */
+    set_trend(s_locked ? "LOCK" : (railed ? "ACQ " : "PLL "));
+
+    return out;
+}
+
+
 uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
 {
     switch (algo_no) {
@@ -896,6 +1243,7 @@ uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
         case 9:  return nn_mlp_ctl_loop   (prev_pwm, ppscount);
 #ifdef GPSDO_LTIC
         case 10: return ltic_three_stage  (prev_pwm, ppscount);
+        case 11: return ltic_lars_pi      (prev_pwm, ppscount);
 #endif
         default: return primitive_ctl_loop(prev_pwm, ppscount);
     }

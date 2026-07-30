@@ -1,7 +1,7 @@
 /**
  * gpsdo_config.h — Compile-time configuration
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -31,7 +31,7 @@ extern "C" {
 
 /* ── Version ─────────────────────────────────────────────────────────── */
 #define PROGRAM_NAME     "GPSDO"
-#define PROGRAM_VERSION  "v0.95-rtos"
+#define PROGRAM_VERSION  "v1.01-rtos"
 
 /* ---- Serial output macro ----
  * OUT_SERIAL routes user-facing output to Serial2 (Bluetooth) or Serial
@@ -110,14 +110,6 @@ extern "C" {
 /* #define GPSDO_TFT_ILI9341 */  /* ILI9341 240x320 SPI TFT */
 //#define GPSDO_TFT_ST7789         /* ST7789  240x320 SPI TFT */
 #define GPSDO_TFT_ILI9488   /* ILI9488 320x480 SPI TFT (480x320 landscape)
-                                  * — UNTESTED: no panel on hand yet. Layout is
-                                  * the 320x240 design scaled up ~1.5x. Set the
-                                  * matching driver + TFT_WIDTH 320 / TFT_HEIGHT
-                                  * 480 in TFT_eSPI User_Setup.h. ILI9488 over
-                                  * SPI is slow (18-bit colour, 480x320); expect
-                                  * a more visible repaint than on the small
-                                  * panels. */
-
 /* TFT control pins (documentation — actual config is in User_Setup.h) */
 #define PIN_TFT_SCK   PA5
 #define PIN_TFT_MOSI  PA7
@@ -136,6 +128,12 @@ extern "C" {
 #define GPSDO_BMP280_I2C
 #define GPSDO_INA219
 //#define GPSDO_BLUETOOTH
+/* GPSDO_BLUETOOTH_PARALLEL — USB + Bluetooth at the same time: telemetry, CLI
+ * and boot output mirror to BOTH ports, and commands are accepted from either.
+ * Needs the Serial2 wiring (PA2/PA3). This switch supersedes GPSDO_BLUETOOTH;
+ * leave that one off when using parallel mode. */
+#define GPSDO_BLUETOOTH_PARALLEL
+
 #define GPSDO_VCC
 #define GPSDO_VDD
 #define GPSDO_UBX_CONFIG
@@ -173,7 +171,8 @@ extern "C" {
 
 #define GPSDO_PICDIV
 #define GPSDO_LTIC           /* Lars' TIC: read Vphase on PA1, discharge 1nF capacitor */
-#define GPSDO_EEPROM
+/* GPSDO_EEPROM removed in v1.00: persistence is 100% flash ring
+ * (settings_store + live_store, sector 7). See doc/FLASH_RING_BRINGUP_*. */
 #define GPSDO_GEN_2kHz_PB5
 
 
@@ -330,12 +329,18 @@ extern "C" {
 #endif
 
 /* ── Derived macros (must come AFTER all feature switches) ────────────────
- * OUT_SERIAL depends on GPSDO_BLUETOOTH, so it has to be evaluated here —
- * after the switch is defined above — not near the top of the file. When
- * Bluetooth is enabled all user-facing output goes to Serial2; otherwise to
+ * OUT_SERIAL depends on the comms switches, so it is evaluated here — after
+ * they are defined above. In parallel mode all user-facing output goes to the
+ * tee (USB + Bluetooth); with plain Bluetooth it goes to Serial2; otherwise to
  * USB Serial (still available for low-level boot diagnostics regardless).
- * CLI_SERIAL and REPORT_SERIAL are defined locally in their .cpp files. */
-#ifdef GPSDO_BLUETOOTH
+ * CLI_SERIAL and REPORT_SERIAL follow the same pattern in their .cpp files. */
+#if defined(GPSDO_BLUETOOTH_PARALLEL)
+  /* g_tee is a TeeSerial (defined in TeeSerial.h). We must NOT include that
+   * header here — this file is inside an extern "C" block and TeeSerial.h pulls
+   * in Arduino.h with C++ templates, which are illegal under C linkage. Each
+   * .cpp that uses OUT_SERIAL includes TeeSerial.h itself, outside extern "C". */
+  #define OUT_SERIAL g_tee
+#elif defined(GPSDO_BLUETOOTH)
   #define OUT_SERIAL Serial2
 #else
   #define OUT_SERIAL Serial
@@ -351,12 +356,30 @@ extern "C" {
 #define PIN_PPS_CAPTURE  PB10
 #define PIN_TEST_2KHZ    PB5
 #define PIN_PICDIV_ARM   PB3
+#define PIN_BT_RX        PA3   /* Bluetooth UART (Serial2) RX — module TX  */
+#define PIN_BT_TX        PA2   /* Bluetooth UART (Serial2) TX — module RX  */
 
 /* ── LTIC (Lars TIC) ────────────────────────────────────────────────── */
 #ifdef GPSDO_LTIC
   #define PIN_LTIC_VPHASE   PA1   /* ADC input + open-drain output to discharge 1nF cap */
   #define LTIC_DISCHARGE_MS   1   /* ms to discharge 1nF capacitor via open-drain low   */
   #define LTIC_OVERSAMPLE    16   /* fast ADC reads per PPS, median taken (glitch-proof) */
+  /* How many consecutive railed cycles with no improvement in |e_freq| before
+   * the loop declares a runaway and freezes. A cold or far-off OCXO rails the
+   * detector while it is legitimately being pulled in, so the guard waits for
+   * evidence that the correction is NOT working rather than firing on a large
+   * error alone. ACQ corrects every 5 s, so 5 cycles is roughly 25 s of no
+   * progress. Raise it if a very sluggish OCXO gets frozen mid-acquisition. */
+  #define LTIC_RUNAWAY_STALL  5
+  /* Active discharge for the CURRENT-SOURCE ramp detector variant. Leave this
+   * commented out for the classic RC Kaashoek detector — that one self-clears
+   * through leakage and driving PA1 low would corrupt the measured charge. Only
+   * enable it if you have rebuilt the front end as a gated current integrator
+   * (diode-hold cap with no leakage path), where the cap must be actively zeroed
+   * after each read. LTIC_RESET_US is the low-pulse width; a few microseconds is
+   * plenty to sink the cap through PA1's drive. */
+  #define GPSDO_LTIC_ACTIVE_RESET   /* current-source variant only — see docs */
+  #define LTIC_RESET_US       5   /* PA1 low-pulse width to zero the hold cap (us)      */
   /* Legacy voltage→time calibration constant for the TIC ramp. The TIC charges
    * a 1 nF cap with a constant current during the GPS-1PPS → OCXO-1PPS interval,
    * so the latched voltage tracks the phase difference. This compile-time
@@ -375,16 +398,16 @@ extern "C" {
    * wraps every second and every sample rails — LC scales this offset down
    * automatically when it measures a fast drift, but the starting value is kept
    * small (60 LSB) so it is gentle by default. */
-  #define LTIC_CAL_PWM_OFFSET   70   /* LSB added to centre PWM during LC      */
-  #define LTIC_CAL_SECS        300u  /* seconds of ramp logging. Sized for a
-                                      * wide detector window: LVC74 @ 3.3 V
+  #define LTIC_CAL_PWM_OFFSET   70   /* LSB added to centre PWM during LC  */ 
+  #define LTIC_CAL_SECS        300u  /* seconds of ramp logging. Sized for a    
+                                      /* wide detector window: LVC74 @ 3.3 V
                                       * spans ~700+ ns, so at ~4 ns/s the sweep
                                       * needs ≥ ~180 s of clean ramp plus margin
                                       * for a railed start. 300 s covers ~1200
                                       * ns with room to spare. (HC74 @ 5 V was
                                       * narrower and fit in 180 s.)            */
-  #define LTIC_DET_PERIOD_NS  100.0  /* unambiguous range of the phase detector
-                                      * = one period of its clock. The xx74
+  #define LTIC_DET_PERIOD_NS  100.0  /* unambiguous range of the phase detector */
+                                      /* = one period of its clock. The xx74
                                       * flip-flop is clocked at 10 MHz here, so
                                       * 100 ns BY CONSTRUCTION — a physical
                                       * constant, not something to estimate.
@@ -469,13 +492,20 @@ extern "C" {
  *                                                          192 words = 768B
  * ─────────────────────────────────────────────────────────────────────── */
 #define STACK_ISR_RELAY  192
-#define STACK_CONTROL    384
+#define STACK_CONTROL    832   /* writes the ring too: CT auto-save, live_store */
 #define STACK_GPS        384
-#define STACK_CLI        256
+/* CLI and CONTROL both write the flash ring, and that path is stack-hungry:
+ * fr_write() builds a 512-byte slot image and a second 512-byte read-back copy
+ * on the stack, and settings_store adds a ~324-byte SettingsBlock_t on top —
+ * about 1.4 KB before any call frames. The old 1 KB CLI stack overflowed and
+ * corrupted its neighbour: the symptom was the board printing the save
+ * confirmation and then hanging, with the display frozen. Sized with ~1 KB of
+ * head-room over the measured worst case; check with SW after any change. */
+#define STACK_CLI        768
 #define STACK_SENSORS    384
 #ifdef GPSDO_TFT
-  #define STACK_DISPLAY  1024  /* TFT_eSPI font rendering + scaled fonts +
-                                * OLED clear loop need generous headroom;
+  #define STACK_DISPLAY  1024   /* TFT_eSPI font rendering + scaled fonts + */
+                                /* OLED clear loop need generous headroom;
                                 * 768 was marginal and caused intermittent
                                 * boot hangs (no stack-overflow hook). */
 #else
@@ -485,4 +515,14 @@ extern "C" {
 
 #ifdef __cplusplus
 }
+#endif
+
+/* g_tee declaration for parallel USB+Bluetooth. This sits AFTER the extern "C"
+ * block above, because TeeSerial.h pulls in Arduino.h (C++ templates), which is
+ * illegal under C linkage. Every .cpp includes this config header, so declaring
+ * g_tee here makes the OUT_SERIAL macro resolve everywhere without touching each
+ * file. The single definition lives in the .ino. */
+#if defined(__cplusplus) && defined(GPSDO_BLUETOOTH_PARALLEL)
+  #include "TeeSerial.h"
+  extern TeeSerial g_tee;
 #endif

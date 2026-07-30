@@ -1,6 +1,6 @@
 /* ======================================================================
  * live_store.cpp  —  live-data persistence over the flash ring buffer
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * See live_store.h for the design and payload layout.
  * ====================================================================== */
 
@@ -102,8 +102,8 @@ static void ls_apply(const uint8_t *buf)
 bool live_store_begin(void)
 {
     uint8_t buf[LS_PAYLOAD];
-    uint16_t n = flash_ring_read(buf, sizeof(buf));
-    if (n < LS_PAYLOAD) return false;      /* nothing stored / ring disabled */
+    uint16_t n = flash_ring_read_newest(REC_LIVE, buf, sizeof(buf));
+    if (n < LS_PAYLOAD) return false;      /* nothing stored yet */
     ls_apply(buf);
     return true;
 }
@@ -130,7 +130,7 @@ void live_store_tick(uint32_t now_ms)
 
     uint8_t buf[LS_PAYLOAD];
     ls_pack(buf);
-    if (flash_ring_write(buf, LS_PAYLOAD)) {
+    if (flash_ring_write(REC_LIVE, buf, LS_PAYLOAD)) {
         s_last_drift = g_lrn_drift;
         s_last_damp  = g_lrn_damp;
         s_last_ms    = now_ms;

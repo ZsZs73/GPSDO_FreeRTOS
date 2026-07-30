@@ -4,11 +4,12 @@
 
 📖 [Project home](../README.md) · [Manual](README_EN.md)
 
-The wear-levelled ring buffer stores "live" data (learned drift/damping, LC
-calibration, last PWM) in flash **sector 6** (0x08040000, 128 KB), separate
-from the firmware and from the settings EEPROM (sector 7). It is toggled at
-**runtime** with `FR 0|1` (saved by `ES`) — no compile flag, so there is no
-build-cache dance.
+The wear-levelled ring buffer stores both "live" data (learned drift/damping, LC
+calibration, last PWM) and the settings block in flash **sector 7**
+(0x08060000, 128 KB) — the last sector, chosen so firmware keeps the maximum
+contiguous space below it. Records are typed, so settings and live data share
+one ring without colliding. The ring is always on from v0.96; `FR` remains as a
+read-only status command and `EW` reports wear.
 
 The core logic is unit-tested (28 assertions on a PC). Bring the flash side
 up deliberately, with a backup, the first time.
@@ -26,18 +27,18 @@ JLinkExe -device STM32F411CE -if SWD -speed 4000
 
 To restore later: `loadbin backup_full.bin 0x08000000`.
 
-## 1. Confirm firmware fits below sector 6
+## 1. Confirm firmware fits below sector 7
 
 Check the compile size line: `Sketch uses NNNNNN bytes ...`
 
-`NNNNNN` must stay **below 262144** (0x08040000 - 0x08000000) — that is where
-sector 6 and the ring begin. v0.95 measures 216976 B (212 KB), leaving ~44 KB
-of head-room; v0.90 was ~170 KB, so it does grow. If a future build nears
-256 KB, move the ring or trim firmware **before** flashing.
+`NNNNNN` must stay **below 393216** (0x08060000 - 0x08000000) — that is where
+sector 7 and the ring begin. v0.95 measured 216976 B (212 KB); against the
+384 KB available that leaves ~176 KB of head-room. If a future build nears
+384 KB, move the ring or trim firmware **before** flashing.
 
-Ignore the percentage the IDE prints. It reports against the full 512 KB, so
-v0.95 shows as "41%" — but sectors 6 and 7 are spoken for (ring and EEPROM),
-and against the 256 KB that firmware may actually use the real figure is 83%.
+Ignore the percentage the IDE prints. It reports against the full 512 KB, so a
+212 KB build shows as "41%" — but sector 7 is spoken for by the ring, and
+against the 384 KB firmware may actually use, the real figure is ~57%.
 
 ## 2. Enable the ring, watch `EW`
 
@@ -51,7 +52,7 @@ ES
 Then `EW`. Expect on a virgin sector:
 
 ```
-Flash ring: erase cycles=1  slots used=0/4095  (sector 6, 0x08040000)
+Flash ring: erase cycles=1  slots used=0/255  (sector 7, 0x08060000)
 ```
 
 `erase cycles=1` is normal: the first `begin` finds no valid header, erases
@@ -74,10 +75,10 @@ restored. This proves the write survived a reboot — the whole point.
 
 ## 4. Garbage/erase safety (optional, thorough)
 
-Erase only sector 6 with the J-Link and reboot:
+Erase only sector 7 with the J-Link and reboot:
 
 ```
-> erase 0x08040000 0x0805FFFF
+> erase 0x08060000 0x0807FFFF
 ```
 
 On boot the firmware must detect the blank sector, re-init the ring (erase

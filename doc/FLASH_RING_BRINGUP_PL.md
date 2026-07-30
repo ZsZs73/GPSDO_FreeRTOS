@@ -5,8 +5,10 @@
 📖 [Strona projektu](../README.md) · [Instrukcja](README_PL.md)
 
 Bufor pierścieniowy z równoważeniem zużycia przechowuje dane „żywe” (nauczony
-dryf/tłumienie, kalibracja LC, ostatni PWM) w **sektorze 6** Flasha
-(0x08040000, 128 KB), osobno od firmware i EEPROM ustawień (sektor 7).
+dryf/tłumienie, kalibracja LC, ostatni PWM) w **sektorze 7** Flasha
+(0x08060000, 128 KB) — ostatni sektor, wybrany tak, by firmware zachowało
+maksymalną ciągłą przestrzeń poniżej. Rekordy są typowane, więc ustawienia i
+dane live dzielą jeden pierścień bez kolizji.
 Przełączany **w czasie pracy** komendą `FR 0|1` (zapis przez `ES`, domyślnie
 włączony) — bez flagi kompilacji, więc bez zabawy z cache buildu.
 
@@ -29,15 +31,15 @@ Przywrócenie później: `loadbin backup_full.bin 0x08000000`.
 
 Sprawdź linię rozmiaru: `Sketch uses NNNNNN bytes ...`
 
-`NNNNNN` musi pozostać **poniżej 262144** (0x08040000 − 0x08000000) — tam
-zaczyna się sektor 6 i ring. v0.95 mierzy 216976 B (212 KB), czyli ~44 KB
+`NNNNNN` musi pozostać **poniżej 393216** (0x08060000 − 0x08000000) — tam
+zaczyna się sektor 7 i ring. v0.95 mierzyło 216976 B (212 KB), czyli ~176 KB
 zapasu; v0.90 miało ~170 KB, więc rośnie.
 
 Nie sugeruj się procentem z IDE. Liczy on od pełnych 512 KB, więc v0.95
-pokazuje „41%" — ale sektory 6 i 7 są zajęte (ring i EEPROM), a względem
-256 KB, których firmware naprawdę może użyć, prawdziwa liczba to 83%.
+pokazuje „41%" — ale sektor 7 jest zajęty przez pierścień, a względem
+384 KB, których firmware naprawdę może użyć, prawdziwa liczba to 83%.
 
-Jeśli przyszły build zbliży się do 256 KB, przesuń
+Jeśli przyszły build zbliży się do 384 KB, przesuń
 pierścień lub odchudź firmware **przed** wgraniem.
 
 ## 2. Włącz pierścień, obserwuj `EW`
@@ -52,7 +54,7 @@ ES
 Następnie `EW`. Na dziewiczym sektorze spodziewaj się:
 
 ```
-Flash ring: erase cycles=1  slots used=0/4095  (sector 6, 0x08040000)
+Flash ring: erase cycles=1  slots used=0/255  (sector 7, 0x08060000)
 ```
 
 `erase cycles=1` jest normalne: pierwszy `begin` nie znajduje ważnego
@@ -75,10 +77,10 @@ odtworzone. To dowód, że zapis przeżył restart — o to właśnie chodzi.
 
 ## 4. Bezpieczeństwo śmieci/kasowania (opcjonalne, dokładne)
 
-Skasuj J-Linkiem tylko sektor 6 i zresetuj:
+Skasuj J-Linkiem tylko sektor 7 i zresetuj:
 
 ```
-> erase 0x08040000 0x0805FFFF
+> erase 0x08060000 0x0807FFFF
 ```
 
 Przy starcie firmware musi wykryć pusty sektor, re-inicjować pierścień
@@ -94,7 +96,7 @@ restarcie. Włącz ponownie w dowolnej chwili `FR 1` + `ES`.
 ## 6. Wgrywanie nowego firmware później (ważne)
 
 - **Bootloader / DFU / Arduino IDE** dotyka tylko sektorów firmware (0–5);
-  pierścień (6) i EEPROM ustawień (7) przetrwają.
+  pierścień w sektorze 7 przetrwa.
 - **Pełne kasowanie układu J-Link/ST-Link** czyści wszystko. By zachować
   kalibrację i uczenie, kasuj tylko sektory 0–5:
   ```

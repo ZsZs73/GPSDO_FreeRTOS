@@ -5,8 +5,10 @@
 📖 [Inicio del proyecto](../README.md) · [Manual](README_ES.md)
 
 El buffer circular con nivelación de desgaste guarda los datos «vivos»
-(deriva/amortiguación aprendida, calibración LC, último PWM) en el **sector 6**
-del Flash (0x08040000, 128 KB), separado del firmware y de la EEPROM de ajustes
+(deriva/amortiguación aprendida, calibración LC, último PWM) en el **sector 7**
+del Flash (0x08060000, 128 KB) — el último sector, elegido para que el firmware
+conserve el máximo espacio contiguo por debajo. Los registros llevan tipo, así que
+los ajustes y los datos live comparten un mismo anillo sin colisionar
 (sector 7). Se activa **en tiempo de ejecución** con `FR 0|1` (guardado con
 `ES`, activo por defecto) — sin flag de compilación, así que sin líos de caché
 de compilación.
@@ -26,20 +28,20 @@ JLinkExe -device STM32F411CE -if SWD -speed 4000
 
 Para restaurar después: `loadbin backup_full.bin 0x08000000`.
 
-## 1. Confirma que el firmware cabe por debajo del sector 6
+## 1. Confirma que el firmware cabe por debajo del sector 7
 
 Revisa la línea de tamaño: `Sketch uses NNNNNN bytes ...`
 
-`NNNNNN` debe quedar **por debajo de 262144** (0x08040000 − 0x08000000): ahí
-empiezan el sector 6 y el ring. v0.95 mide 216976 B (212 KB), con ~44 KB de
+`NNNNNN` debe quedar **por debajo de 393216** (0x08060000 − 0x08000000): ahí
+empiezan el sector 7 y el ring. v0.95 medía 216976 B (212 KB), con ~176 KB de
 margen; v0.90 eran ~170 KB, así que crece.
 
 Ignora el porcentaje que imprime el IDE: lo calcula sobre los 512 KB completos,
-así que v0.95 aparece como «41%» — pero los sectores 6 y 7 están ocupados (ring
-y EEPROM), y frente a los 256 KB que el firmware puede usar realmente, la cifra
+así que una compilación de 212 KB aparece como «41%» — pero el sector 7 está
+ocupado por el anillo, y frente a los 384 KB que el firmware puede usar, la cifra
 verdadera es 83%.
 
-Si un build futuro se acerca a 256 KB,
+Si un build futuro se acerca a 384 KB,
 mueve el anillo o reduce el firmware **antes** de programar.
 
 ## 2. Activa el anillo, observa `EW`
@@ -54,7 +56,7 @@ ES
 Luego `EW`. En un sector virgen espera:
 
 ```
-Flash ring: erase cycles=1  slots used=0/4095  (sector 6, 0x08040000)
+Flash ring: erase cycles=1  slots used=0/255  (sector 7, 0x08060000)
 ```
 
 `erase cycles=1` es normal: el primer `begin` no encuentra una cabecera válida,
@@ -78,10 +80,10 @@ sobrevivió a un reinicio — de eso se trata.
 
 ## 4. Seguridad ante basura/borrado (opcional, a fondo)
 
-Borra con el J-Link solo el sector 6 y reinicia:
+Borra con el J-Link solo el sector 7 y reinicia:
 
 ```
-> erase 0x08040000 0x0805FFFF
+> erase 0x08060000 0x0807FFFF
 ```
 
 Al arrancar, el firmware debe detectar el sector en blanco, reinicializar el
@@ -97,7 +99,7 @@ pierden al reiniciar. Reactiva en cualquier momento con `FR 1` + `ES`.
 ## 6. Reprogramar el firmware más tarde (importante)
 
 - **Bootloader / DFU / Arduino IDE** solo toca los sectores del firmware (0–5);
-  el anillo (6) y la EEPROM de ajustes (7) sobreviven.
+  el anillo del sector 7 sobrevive.
 - **Borrado total del chip con J-Link/ST-Link** borra todo. Para conservar la
   calibración y el aprendizaje, borra solo los sectores 0–5:
   ```

@@ -16,79 +16,177 @@ The version suffix `-rtos` marks the FreeRTOS port lineage.
 
 ---
 
+## [v1.01-rtos] — 2026-07-29
+
+> **Build with STM32duino core 2.12.0 or earlier.** Core 3.0.0 (23 July 2026)
+> deploys ArduinoCore-API, which removes `ltoa()` and turns `HardwareSerial`
+> into an abstract interface — both used here — and, more importantly, leaves
+> TFT_eSPI unable to initialise the panel (white screen, CLI unaffected). The
+> first two are small and could be made version-conditional; the third lives in
+> the library. See the README for detail.
+
+Milestone release: merges the flash-ring persistence branch with the algorithm 11
+(LTIC-Lars) branch. Algorithm 11 is based on the original continuous-PI GPSDO
+controller by the late **Lars Walenius**, shared with the time-nuts community; it
+is extended here with the auto-calibration and acquisition work below, in his
+memory.
+
+### Added
+- **Algorithm 11 "LTIC-Lars"** — a single continuous PI loop (no ACQ/DPLL/LOCK
+  state machine), disciplining the OCXO from the hardware TIC phase. Selectable
+  with `LA 11`; trend LFQ (freq-led) / LPH (phase) / LLK (locked). Tuned live
+  with LG/LD/LTC/LFD/LTO/LPL/LPF/LTK/LTR.
+- **CT auto-calibration for algorithm 11.** gain defaults to 0 = auto: the loop
+  derives its frequency scale from the CT-measured K (Hz per PWM LSB), the same
+  constant algo 10 uses, so one CT calibrates the Lars loop too. A non-zero LG
+  overrides with a manual scale.
+- **Frequency-led acquisition** with a dominant self-braking proportional term,
+  a step clamp and anti-windup, so a cold start pulls in without the runaway or
+  the ±2 Hz oscillation seen during development.
+- **picDIV phase-capture bridge**: once the frequency is settled but the phase is
+  still railed, the picDIV is re-armed once to bring the phase into the detector
+  window, where the phase branch completes the lock.
+- **Tuner: versioned and matched to the firmware.** The tools now carry a
+  TOOL_VERSION tracking the firmware release, and the tuner reads the board's own
+  version on connect: a mismatch is reported in the status bar and the monitor
+  rather than left to show up as fields that read oddly. The main window now opens
+  maximised with the splash over it, and on Windows the console spawned by
+  double-clicking the script is minimised to the taskbar (only when the tuner owns
+  it — a terminal the operator opened is left alone).
+- **Tuner: Help tab and boot splash.** The tuner gained a Help tab with the full
+  command reference grouped by topic, and a three-second splash animating two
+  phase-shifted sine waves converging into one — the same lock metaphor as the
+  firmware's TFT boot screen (click to skip). It also reads every parameter group
+  on connect (LTIC, FA, PID 3-9, Lars) instead of just two, and algorithm 11 has
+  its own tab beside algorithm 10.
+- **Flash-ring persistence for algorithm 11.** All g_lars parameters are stored
+  in the flash ring alongside the LTIC settings (SETTINGS_VER 2); `ES LTIC` saves
+  both. No EEPROM anywhere — persistence is 100% flash ring.
+
+### Changed
+- **`LC` warns when run before `CT`.** The two are not independent: `LC` needs the
+  Hz-per-LSB slope that `CT` measures, and without it falls back to a generic
+  value. The failure is quiet rather than obvious — one board reported
+  ns_per_volt 1592.8 before `CT` and 921.2 after, a factor of 1.7, with nothing in
+  the first run to suggest it was suspect. `LC` now says so up front and continues
+  anyway, and the README states the order explicitly.
+- **Every setting now says whether it was saved.** Preferences that do not touch
+  the control loop — timezone (`TZ`/`TO`/`LT`), sensor offsets (`PO`/`AO`) and the
+  boot/survey flags (`WU`/`SPL`/`SV`) — save themselves, and the reply names the
+  group that was written. Loop tuning stays manual, and its reply names the exact
+  command that would keep it, e.g. `[not saved — run 'ES LTIC' to keep it]`, so
+  the group never has to be guessed. `SET_FLAGS` carries `SAW` and `LRN` alongside
+  the boot flags, so an auto-save there commits them too; the message lists the
+  whole group rather than hiding it. A rejected value is reported as such —
+  `[not saved — value out of range; accepted range shown above]` — rather than
+  offering an `ES` command for a change that never happened.
+- **`LT` is now persistent.** The command was implemented but had no field in the
+  settings block, so the UTC/local choice did not survive a reboot. Added to the
+  timezone group (SETTINGS_VER 4).
+- **`CT` auto-saves its result.** Like `LC`, the three-minute calibration now
+  writes its coefficients to the flash ring on success instead of asking the
+  operator to remember `ES PID`. Only the PID group is written, so live loop
+  tuning in progress elsewhere is untouched.
+- **Algorithm 11 trend labels renamed** to ACQ / PLL / LOCK, matching algorithm
+  10's vocabulary so the displays, CLI and tuner read consistently. Algo 11 shows
+  PLL where algo 10 shows DPLL, which still tells the two apart in a log.
+- **Learn telemetry reports what actually steers each loop**: algo 11 shows gain
+  mode / scale / filtered phase, algo 10 shows its state machine, algos 3-9 keep
+  the LRN figures. qErr stays on every line (shared by both LTIC branches).
+- **CT message** now states it tunes algos 3-9 plus LTIC 10 & 11.
+- **Persistence wrappers renamed** eeprom_* → persist_* to reflect that storage
+  is the flash ring, not EEPROM; the names no longer mislead.
+
+### Fixed
+- **Survey-in never went to the background after a reset.** The patience timer
+  ran from the host's own boot, but a timing receiver keeps surveying across an
+  MCU reset — it has its own power and state, and reports its own elapsed time.
+  So every reflash restarted the clock and granted the survey another full cap in
+  the foreground, indefinitely. Observed on the bench: the receiver reporting
+  4450 s of survey against a host uptime of 7 minutes, with the timeout message
+  never printed once. The deadline now expires when EITHER clock passes the cap,
+  and the message says which one ran out.
+- **Algorithm 10 could freeze during a healthy pull-in.** The runaway guard fired
+  on a railed detector plus a large frequency error alone — but that is the normal
+  state of a cold or far-off OCXO at the start of acquisition, and freezing there
+  removes the only path back, since the frequency term is exactly what pulls the
+  oscillator into the detector window. One observed run travelled 3855 LSB during
+  a perfectly healthy DPLL pull-in and was frozen mid-recovery. Both guards now
+  additionally require the error to have stopped improving for several cycles
+  (LTIC_RUNAWAY_STALL), which a genuine wrong-polarity runaway trips and a healthy
+  acquisition never does. The rail threshold is also taken from the LC calibration
+  again instead of a fixed 3.28 V that only suited one board.
+- **`LIV` was capped at 30 s.** Both the CLI and the loop clamped the LOCK
+  correction interval to 30, and the loop snapped an out-of-range value to 5 s —
+  so asking for a slower loop silently gave you the fastest one. Restored to
+  1..600 s, clamping to the nearest bound. This mattered immediately: a tester
+  comparing LIV 30 against LIV 60 would have had the 60 rejected.
+- **Settings were never actually persisted.** The ring's slot header stored the
+  payload length in a single byte, so anything over 255 B wrapped: a 324-byte
+  settings block was recorded as 68. The data itself was written correctly and the
+  CRC covered it, so nothing looked wrong — but every read returned a truncated
+  length, leaving the tail of the recalled block as whatever was on the stack.
+  That is where the stray `temp_coeff=-1` came from, and once the length was
+  checked strictly the recall rejected the record outright and the board came up
+  on defaults. The length field is now 16-bit (slot header 4 B → 6 B, payload
+  506 B → 504 B) and the ring magic is bumped so an older ring reformats itself
+  instead of decoding as garbage. This affected the flash-ring branch from the
+  start — GML's own block was already 292 B, likewise over the limit.
+- **Stack overflow when writing the flash ring.** Saving settings needs about
+  1.4 KB of stack — `fr_write()` builds a 512-byte slot image plus a 512-byte
+  read-back copy, and `settings_store` adds a ~324-byte block on top — but the CLI
+  task had 1 KB and the control task 1.5 KB. The CLI task overflowed into its
+  neighbour, and the board printed its save confirmation and then hung with the
+  display frozen. Both stacks are raised with head-room (CLI 1 KB → 3 KB, control
+  1.5 KB → 3.25 KB; 4 KB more RAM out of 128 KB). The hazard predates the
+  auto-save work — `ES` was equally exposed — but auto-save made it easy to reach.
+- **`EW` reported the wrong flash sector.** The ring has always lived in sector 7
+  (0x08060000, the last sector, so firmware keeps the maximum contiguous space
+  below it), but the `EW` message hardcoded "sector 6, 0x08040000" — the one place
+  an operator looks was the one place that lied. The message now reads the address
+  from the implementation via new `flash_ring_sector_no()` / `flash_ring_base_addr()`
+  accessors, so it cannot drift again. The bring-up documents carried the same
+  stale figures and are corrected in all three languages: the firmware ceiling is
+  393216 B (384 KB), not 262144 B, and the J-Link erase range for wiping the ring
+  is 0x08060000-0x0807FFFF, not the sector-6 range that would have left the ring
+  untouched.
+- **LC no longer throws away its own convergence.** The rate-nulling loop stopped
+  after three tries and, if it had not yet landed in the acceptance band, fell
+  back to `saved_pwm + offset` — which assumes the saved PWM sits at the lock
+  point. Run before the oscillator is near 10 MHz that assumption is badly wrong:
+  an observed run converged -244, -57, -16 ns/s (one step from the band), then
+  discarded that and sampled at a PWM running at -244 ns/s, where the phase
+  crosses the whole detector window between publications. Every picDIV arm landed
+  on the rail and the calibration aborted. The loop now gets six tries, and when
+  it runs out it keeps the steered PWM instead of jumping back.
+- **FA / FAD / FAL restored.** The per-state damping-average window (and the
+  `damp_e_freq` term it feeds in algorithm 10) was present in v0.97 but absent
+  from the flash-ring branch, so it was lost in the merge. Restored, and now
+  stored in the flash ring rather than EEPROM.
+- **Settings records are length-checked.** `settings_recall` and
+  `settings_save_partial` accepted any record of two bytes or more into a
+  stack-allocated block, so a record shorter than the current struct left the
+  tail as stack garbage — and a partial save would write that garbage back. Both
+  now zero the block first and require the exact size.
+- **settings_store.cpp now compiles.** It read three globals it could not see —
+  g_pressure_offset, g_altitude_offset (defined in gpsdo_control.cpp, with no
+  header of their own) and g_qerr_enable (declared in ubx_timtp.h, which was not
+  included). Added the include and the two local externs, following the pattern
+  the rest of the project uses.
+- **LT command implemented.** The help had always documented `LT 0|1` and the
+  display and report paths had always read g_show_local_time, but the CLI handler
+  was never written, so the verb silently did nothing. It now toggles and reports
+  UTC vs local time as documented.
+- **Serial dph now matches the panel.** The TFT row subtracted the receiver
+  sawtooth but the serial report did not, so the same instant read differently on
+  the two — a whole sawtooth apart (~±10 ns on a LEA-6T, more on an M8T). The
+  serial path now subtracts it as well, as its own comment already claimed.
+- **CR (cold restart) now really erases the ring.** persist_erase() calls the new
+  flash_ring_wipe(), which physically erases and reformats the ring sector, so a
+  cold restart genuinely returns to defaults instead of merely marking state stale.
+
 ## [v0.95-rtos] — 2026-07-16
 
-- **New `tools/gpsdo_tuner.py` — a live tuning and phase-visualisation GUI.**
-  Rather than keep adjusting compile-time defaults to suit every builder's OCXO
-  and phase detector — a moving target across different EFC gains, detector Vsat
-  values and references — this puts the firmware's tuning commands behind direct
-  controls. It reads each parameter back from the device (LL / LP / FA), writes
-  live (the LTIC three-stage PID, the FA windows, the algo 3-9 PID and the
-  detector calibration), and commits with ES or reverts with ER. Live plots show
-  phase, detector voltage with Vsat band guides, and frequency error. Inspired by
-  lucido's GPSDO_log.py and credited as such; the tuning panels and phase
-  visualiser are new. Requires pyserial, pyqtgraph and PySide6.
-- **OLED and LCD now surface the algo-10 phase-loop state, including the LPOL?
-  warning.** The big TFT gained a lot of LTIC detail this session; the small
-  displays get the part that actually matters when something is wrong. On the
-  OLED a third page (C) joins the A/B rotation when GPSDO_LTIC is defined,
-  showing loop state, detector voltage, phase (with the same ovf band guard as
-  the TFT), sawtooth qErr and the FA windows. On the 20x4 LCD the alternating
-  line 2 gains a mode showing "St:LOCK +52ns" with P? in the last two columns
-  when polarity is unset. That polarity warning is the point: a small-display
-  user has no serial console, so without it an unset LPOL would show as a healthy
-  DISCIPLINED while the loop sat silently held — exactly the two-hour surprise a
-  second builder hit. Both are gated on GPSDO_LTIC and leave the TFT untouched.
-- **`FA` / `FAD` / `FAL`: per-state switchable averaging window for the LTIC
-  damping term.** Dan Wiering's rubidium-referenced measurements showed a ~220 s
-  limit cycle in algorithm 10 — a clean 1.7 µs phase sine dominating the ADEV —
-  while algorithm 7 on the same reference was clean, which pins the cause to the
-  DPLL's second-order structure rather than the shared avg100. The frequency
-  (damping) term now reads a switchable window, and DPLL and LOCK can be set
-  independently: `FAD 10` shortens it only during acquisition, `FAL 10` only in
-  steady state, `FA 10` both. Values are 10 / 100 / 1000 s; 100 is the default
-  in each and reproduces the previous behaviour bit-for-bit. Splitting the two
-  states is what lets a reference measurement locate the cycle — if `FAD`
-  changes it the cycle is in acquisition, if only `FAL` does it is in steady
-  state, if neither it is in the phase branch, not the frequency term. Only that
-  term is affected; escape detection, self-learning, the state machine and the
-  phase PI all stay on avg100. Both windows saved with `ES` (LTIC group).
-- **The status bar warns when the LTIC phase loop has no polarity set.** The
-  three-stage loop will not steer the phase until its PWM→phase sign is known
-  (`LPOL`), and until then it holds: the frequency locks but the phase can sit
-  parked on a rail for hours. A two-hour capture from a second builder showed
-  exactly that — a steady display, a correct 10 MHz frequency, and a loop
-  quietly stuck, the only symptom a serial reminder printed every ten seconds
-  that nobody was watching. The bar now appends `LPOL?` (`P?` on the 320) after
-  the status text whenever a calibration exists but the polarity is still zero,
-  so the one missing setup step is visible without a serial console.
-- **The runaway guard's upper rail follows the detector, not a fixed 3.28 V.**
-  `railed_now` decides the phase is against a stop — the condition the escape and
-  backstop checks need — and its high bound was a hard 3.28 V, which assumes the
-  ramp saturates near the 3.3 V ADC rail. A detector whose Vsat sits lower
-  plateaus well below that, so the loop could be fully saturated while the guard
-  read healthy and never armed. It now uses the high edge of the band LC
-  measured (`zero_offset + 0.55·span`), the same bound `ltic_phase_error_ns()`
-  already validates phase against, so "railed" and "phase invalid" agree. The
-  low rail stays 0.02 V, and an uncalibrated board keeps the old fixed bound.
-- **`ES` can now save one group at a time.** `ES` on its own still writes the
-  whole page; `ES <group>` writes only that block and leaves every other setting
-  on the page at its stored value. The groups are `CORE` (PWM, active
-  algorithm), `PID` (algo 3-9 gains, blend, NN step), `TZ` (timezone), `LTIC`
-  (algo 10 loop tuning and thresholds), `LCAL` (algo 10 ramp calibration),
-  `CAL` (pressure/altitude offsets) and `MISC` (survey, warmup, splash, ring,
-  saw, learn). `ES XYZ` with an unknown name lists them rather than guessing.
-
-  The point is that a full `ES` commits whatever happens to be live — so saving
-  a timezone change after an afternoon of PID experiments would have frozen the
-  experiments too. A grouped save touches only what you name.
-
-  Mechanically each save now fills the emulation buffer from flash, writes the
-  signature plus the requested section, and flushes; the untouched bytes keep
-  their on-flash values. The signature is written on every path. Boot now primes
-  that buffer even when the page is blank, so a first-ever grouped save cannot
-  flush uninitialised bytes over the groups it was not asked to write. A grouped
-  save does not snapshot the flash ring — only a full `ES` does, as before.
 ### Added
 - **Timezones with DST, anywhere in the world.** `TZ Adelaide` is now enough to
   get the clock right, including its half-hour offset and its
@@ -203,15 +301,11 @@ The version suffix `-rtos` marks the FreeRTOS port lineage.
   the number cannot be checked after the fact.
 - **Each column has one right-hand alignment line (480×320).** The left column
   ends where "hPa" does on the BMP row, the right where "ns" does on the phase
-  row — those being the widest, most stable strings in each. `Vct`, `% rH`, the
-  BMP pressure and the INA current are now anchored to those lines instead of
-  each stopping wherever its own text ran out, which left the column edges as
-  several near-misses a few pixels apart. `PWM:`, `INA:` and `BMP:` keep their
-  labels at the column's left edge, so those rows had to become two fields rather
-  than one string. The pressure was a quiet case: being the string align_L is
-  measured from, it sat on the line by arithmetic while its width happened to
-  match the sample — but a sub-zero temperature adds a sign and a character and
-  would have carried the unit off the line with it.
+  row — those being the widest, most stable strings in each. `Vct`, `% rH` and
+  the INA current are now anchored to those lines instead of each stopping
+  wherever its own text ran out, which left the column edges as three near-misses
+  a few pixels apart. `PWM:` and `INA:` keep their labels at the column's left
+  edge, so both rows had to become two fields rather than one string.
 
   The lines are measured with `textWidth()` on first use rather than written in
   as constants: every value in these rows is fixed-width, so each edge is a

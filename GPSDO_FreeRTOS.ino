@@ -1,7 +1,7 @@
 /**
  * GPSDO_FreeRTOS.ino — Main entry point — hardware init and FreeRTOS scheduler start
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -42,7 +42,7 @@
 #include "gpsdo_state.h"
 #include <Arduino.h>
 #include <Wire.h>
-#include <EEPROM.h>
+/* EEPROM library removed in v0.96 — persistence via flash_ring (sector 7). */
 
 /* ---- Forward declarations for task entry points ----------------------- */
 void vFreqRelayTask (void *);
@@ -65,10 +65,11 @@ extern SemaphoreHandle_t xTwoHzSemaphore;
 extern void gpsdo_gps_init(void);
 
 /* declared in gpsdo_state.cpp */
-extern bool eeprom_check_on_boot(void);
-extern void eeprom_recall(void);
+extern bool persist_check_on_boot(void);
+extern void persist_recall(void);
 #include "flash_ring.h"
 #include "live_store.h"
+#include "settings_store.h"
 
 /* declared in gpsdo_cli.cpp — single byte, safe to read without mutex */
 extern int16_t g_time_offset_min;
@@ -84,8 +85,15 @@ static void pinModeAF(int ulPin, uint32_t Alternate)
     LL_GPIO_SetPinMode(get_GPIO_Port(STM_PORT(pn)), STM_LL_GPIO_PIN(pn), LL_GPIO_MODE_ALTERNATE);
 }
 
-#ifdef GPSDO_BLUETOOTH
+#if defined(GPSDO_BLUETOOTH) || defined(GPSDO_BLUETOOTH_PARALLEL)
 HardwareSerial Serial2(PA3, PA2);
+#endif
+
+#if defined(GPSDO_BLUETOOTH_PARALLEL)
+#include "TeeSerial.h"
+/* g_tee mirrors USB Serial and the Bluetooth UART. The extern in the config
+ * headers points here; both ports are begin()-run in setup() below. */
+TeeSerial g_tee(Serial, Serial2);
 #endif
 
 /* ====================================================================== */
@@ -129,7 +137,7 @@ void setup()
     { uint32_t t0 = millis(); while (!Serial && (millis() - t0) < 3000) delay(10); }
     delay(200);   /* let USB host stabilise before first print */
 
-#ifdef GPSDO_BLUETOOTH
+#if defined(GPSDO_BLUETOOTH) || defined(GPSDO_BLUETOOTH_PARALLEL)
     Serial2.begin(57600);
 #endif
 
@@ -139,6 +147,7 @@ void setup()
     OUT_SERIAL.println("https://github.com/jmnlabs/GPSDO_FreeRTOS");
     OUT_SERIAL.println("Inspired by GPSDO v0.06c by " AUTHOR_NAME);
     OUT_SERIAL.println("https://github.com/AndrewBCN/STM32-GPSDO");
+    OUT_SERIAL.println("Algo 11 (LTIC-Lars) after Lars Walenius' PI loop");
     OUT_SERIAL.println("Type H = help  SW = stack diagnostics");
     OUT_SERIAL.println("================================================\r\n");
 
@@ -177,48 +186,41 @@ void setup()
     strcpy(gCtrl.trendstr, " ___");
     g_time_offset_min = 0;
 
-    /* ---- EEPROM boot recall -------------------------------------------
+    /* ---- flash ring boot (settings + live data) -----------------------
      *
-     * eeprom_recall() is safe before vTaskStartScheduler:
-     *   - It calls xTaskGetSchedulerState() to detect pre-scheduler context
-     *   - Skips mutex acquire when scheduler is not running
-     *   - Applies analogWrite(PIN_VCTL_PWM, pwm) immediately
-     *   - Restores gCtrl.pwm_output, gCtrl.active_algo, timezone
+     * Order matters: flash_ring_begin() validates the sector header and
+     * scans slots (any record type). Then settings_recall() applies the
+     * newest REC_SETTINGS slot (PWM, algo, TZ, PID, LTIC params, flags).
+     * Finally live_store_begin() applies the newest REC_LIVE slot, which
+     * OVERRIDES PWM and LRN/LTIC calibration with fresher values.
      *
-     * If EEPROM is blank or erased, eeprom_recall() prints a message and
-     * returns without changing gCtrl — defaults set above stay in effect.
+     * All three are safe before vTaskStartScheduler (no mutex use). If the
+     * sector is blank/foreign, flash_ring_begin() reformats it and the two
+     * recalls return false — compile-time defaults stay in effect and the
+     * user re-runs CT/LC/TZ/ES.
      * ------------------------------------------------------------------ */
-#ifdef GPSDO_EEPROM
-    g_eeprom_valid = eeprom_check_on_boot();
-    if (g_eeprom_valid) {
-        OUT_SERIAL.println("EEPROM: valid signature found — recalling parameters");
-        eeprom_recall();   /* sets pwm_output, active_algo, timezone */
-    } else {
-        OUT_SERIAL.println("EEPROM: blank or erased — using compile-time defaults");
-        /* Prime the emulation buffer from flash even though there is nothing to
-         * recall. A later selective ES fills the buffer itself, but doing it
-         * here too keeps the invariant simple: after boot the buffer always
-         * mirrors flash, so no save path can ever flush uninitialised bytes over
-         * a group it was not asked to touch. eeprom_check_on_boot() already
-         * filled it; this is just making that guarantee explicit and not
-         * dependent on that call's internals. */
-        eeprom_buffer_fill();
-        analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
-    }
-#else
-    analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
-#endif
-
-    /* ---- live-data flash ring buffer (wear-levelled; opt-in via
-     * FR 0|1, saved in EEPROM). Returns false when disabled. ---- */
     if (flash_ring_begin())
-        OUT_SERIAL.println("Flash ring: live data recalled");
+        OUT_SERIAL.println("Flash ring: sector 7 ready");
     else
-        OUT_SERIAL.println("Flash ring: no live data (fresh or disabled)");
+        OUT_SERIAL.println("Flash ring: sector 7 blank/formatted (defaults)");
+
+    /* recall user settings (PID, TZ, flags, LTIC params) */
+    if (settings_recall()) {
+        g_persist_valid = true;   /* legacy flag: "settings loaded" */
+        OUT_SERIAL.println("Settings: recalled from flash ring");
+    } else {
+        OUT_SERIAL.println("Settings: none stored (compile-time defaults)");
+    }
+    analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
 
     /* recall learned/calibration values from the ring (if present) */
     if (live_store_begin())
         OUT_SERIAL.println("Live store: LRN + LC applied from flash ring");
+
+    /* Re-apply PWM: live_store may have overridden the settings value with a
+     * fresher one. The OCXO should not sit at the stale PWM until the loop's
+     * first cycle; apply the final value now. */
+    analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
 
     OUT_SERIAL.print("Initial PWM=");    OUT_SERIAL.print(gCtrl.pwm_output);
     OUT_SERIAL.print(" algo=");          OUT_SERIAL.print(gCtrl.active_algo);
@@ -269,7 +271,7 @@ void setup()
     /* Request calibration only when EEPROM was blank/erased.
      * When EEPROM was valid, the recalled PWM is already close to optimal
      * and calibration would temporarily disturb the OCXO. */
-    if (!g_eeprom_valid)
+    if (!g_persist_valid)
         xEventGroupSetBits(xSysEvents, EVT_NEED_CALIBRATION);
 
     /* ====================================================================

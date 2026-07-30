@@ -1,7 +1,7 @@
 /**
  * gpsdo_gps.cpp — vGpsTask — GPS NMEA parsing and UBX configuration
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -27,7 +27,9 @@
 static TinyGPSPlus gps;
 
 /* Serial port for echo / messages */
-#ifdef GPSDO_BLUETOOTH
+#if defined(GPSDO_BLUETOOTH_PARALLEL)
+  #define CLI_SER g_tee
+#elif defined(GPSDO_BLUETOOTH)
   #define CLI_SER Serial2
 #else
   #define CLI_SER Serial
@@ -413,15 +415,14 @@ static void ubx_poll_svin_step(void)
 {
     static uint32_t svin_deadline = 0;
     static uint8_t  no_reply = 0;
-    if (svin_deadline == 0) {
-        /* Safety backstop tied to the configured minimum: 3 × SVIN_MIN, but
-         * never less than 600 s, so a slow-converging survey (weak signal /
-         * small antenna) is given a fair chance before we give up and run
-         * with whatever fix the module has. */
-        uint32_t cap = GPSDO_SVIN_MIN_SECS * 3u;
-        if (cap < 600u) cap = 600u;
-        svin_deadline = millis() + cap * 1000u;
-    }
+    static uint32_t svin_dur_last = 0;   /* receiver's own elapsed survey time */
+    /* Safety backstop tied to the configured minimum: 3 × SVIN_MIN, but never
+     * less than 600 s, so a slow-converging survey (weak signal / small
+     * antenna) is given a fair chance before we give up and run with whatever
+     * fix the module has. */
+    uint32_t svin_cap = GPSDO_SVIN_MIN_SECS * 3u;
+    if (svin_cap < 600u) svin_cap = 600u;
+    if (svin_deadline == 0) svin_deadline = millis() + svin_cap * 1000u;
 
     uint32_t dur=0, acc=0; bool valid=false, active=false;
     static bool ever_replied = false;
@@ -435,6 +436,7 @@ static void ubx_poll_svin_step(void)
         ever_replied = true;
         g_svin_dur   = (uint16_t)dur;
         g_svin_acc_m = (uint16_t)(acc / 1000u);   /* mm → m for display */
+        svin_dur_last = dur;
         OUT_SERIAL.print("LEA-T: svin dur="); OUT_SERIAL.print(dur);
         OUT_SERIAL.print("s acc=");             OUT_SERIAL.print(acc);
         OUT_SERIAL.print("mm valid=");          OUT_SERIAL.print(valid);
@@ -469,8 +471,21 @@ static void ubx_poll_svin_step(void)
             return;
         }
     }
-    if (millis() > svin_deadline) {
-        OUT_SERIAL.println("LEA-T: survey-in safety timeout — continuing anyway");
+    /* Two clocks, and the receiver's is the one that matters. A timing module
+     * keeps surveying across a host reset — it has its own power and its own
+     * state — and reports its own elapsed time in dur. Measuring patience from
+     * OUR boot therefore restarts the clock on every reflash: a survey that has
+     * already run for an hour would still hold the foreground for another
+     * svin_cap seconds, over and over. Seen on the bench, dur=4450 s against a
+     * host uptime of 7 minutes, with the timeout message never printed. So give
+     * up when EITHER clock passes the cap. */
+    bool host_expired = (millis() > svin_deadline);
+    bool svin_expired = (svin_dur_last > svin_cap);
+    if (host_expired || svin_expired) {
+        OUT_SERIAL.print("LEA-T: survey-in safety timeout (");
+        OUT_SERIAL.print(svin_expired ? "receiver has surveyed " : "waited ");
+        OUT_SERIAL.print(svin_expired ? svin_dur_last : (millis() / 1000u));
+        OUT_SERIAL.println("s) — continuing anyway");
         /* We stop polling, but the receiver does NOT stop surveying. Flag it so
          * the display can keep a quiet indicator up until Time Mode arrives —
          * only mark it if the survey was actually replying, otherwise there is

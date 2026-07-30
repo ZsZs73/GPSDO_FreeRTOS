@@ -1,7 +1,7 @@
 /**
  * gpsdo_control.cpp — vControlTask — OCXO control loop
  *
- * Part of GPSDO FreeRTOS v0.95
+ * Part of GPSDO FreeRTOS v1.01
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -21,6 +21,7 @@
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
 #include "live_store.h"
+#include "settings_store.h"
 #include "GPSDO_algorithms.h"
 #include <Arduino.h>
 #include <string.h>
@@ -46,9 +47,8 @@ volatile bool     g_calib_active    = false;
 volatile uint8_t  g_calib_kind      = CALIB_NONE;
 volatile uint16_t g_calib_remaining = 0;
 volatile bool     g_warmup_active    = false;
-volatile bool     g_warmup_enable    = true;   /* WU 0/1, saved in EEPROM */
-volatile bool     g_splash_enable    = true;   /* SPL 0/1, saved in EEPROM */
-volatile bool     g_flash_ring_enable = true;   /* FR 0/1, saved in EEPROM */
+volatile bool     g_warmup_enable    = true;   /* WU 0/1, saved via ES FLAGS */
+volatile bool     g_splash_enable    = true;   /* SPL 0/1, saved via ES FLAGS */
 volatile uint16_t g_warmup_remaining = 0;
 volatile bool     g_svin_active = false;
 /* A survey-in that outlived our monitoring window. The receiver keeps
@@ -401,7 +401,16 @@ static void do_calibrate_tune(void)
     g_calib_active = false;
     g_calib_kind   = CALIB_NONE;
     g_calib_remaining = 0;
-    OUT_SERIAL.println("CT: done. Review values, then 'ES' to save to EEPROM.");
+    /* Auto-save, like LC does. CT is a three-minute measurement of a hardware
+     * fact (K, the Hz-per-LSB slope) from which every PID set is derived; losing
+     * it to a power cut because nobody typed ES is a poor trade. Only the PID
+     * group is written, so live loop tuning the operator may be experimenting
+     * with elsewhere is left alone. */
+    if (settings_save_partial(SET_PID)) {
+        OUT_SERIAL.println("CT: done — coefficients auto-saved to flash ring.");
+    } else {
+        OUT_SERIAL.println("CT: done, but the auto-save FAILED — run 'ES PID' manually.");
+    }
 }
 
 #ifdef GPSDO_LTIC
@@ -550,7 +559,12 @@ static void do_ltic_calibrate(void)
         double   r        = 0.0;
         bool     r_ok     = false;
 
-        for (int iter = 0; iter < 3; iter++) {
+        /* Six tries, not three. The steer is proportional, so the rate closes on
+         * the target geometrically — an observed run went -244, -57, -16 ns/s and
+         * was one step from the band when the old three-iteration limit stopped
+         * it. Each try costs 110 s, but a calibration that gives up just short of
+         * success costs the whole run. */
+        for (int iter = 0; iter < 6; iter++) {
             OUT_SERIAL.print("LC: measuring phase rate at PWM ");
             OUT_SERIAL.print((int)meas_pwm);
             OUT_SERIAL.println(" (110 s, constant)...");
@@ -592,14 +606,33 @@ static void do_ltic_calibrate(void)
             phase_rate    = r;
             rate_measured = true;
             ramp_pwm      = meas_pwm;
+        } else if (r_ok) {
+            /* Ran out of tries but we DID measure, and meas_pwm already holds the
+             * steered estimate for the target rate. Use it.
+             *
+             * The old code fell back to saved_pwm + cmd_off here, which assumes
+             * saved_pwm sits at the lock point (rate ~0) so a fixed LSB offset
+             * buys a known rate. That assumption fails whenever LC is run before
+             * the oscillator is anywhere near 10 MHz: an observed run had
+             * saved_pwm at -244 ns/s, converged the sweep to -16 ns/s at PWM
+             * 40341, then threw that away and sampled at 32967 — back at -244
+             * ns/s, where the phase crosses the whole detector window between
+             * publications. Every arm attempt then landed on the rail and the
+             * calibration aborted. Keeping the steered PWM preserves the work. */
+            ramp_pwm   = meas_pwm;
+            phase_rate = RATE_TARGET;      /* steered for, not verified */
+            OUT_SERIAL.print("LC: rate not verified in band (last ");
+            OUT_SERIAL.print(r, 2);
+            OUT_SERIAL.print(" ns/s) — proceeding at the steered PWM, assuming ");
+            OUT_SERIAL.print(phase_rate, 2); OUT_SERIAL.println(" ns/s");
         } else {
-            /* could not land in the band — fall back to the commanded offset
-             * from the saved operating point, and say so plainly */
+            /* No usable measurement at all — fall back to the commanded offset
+             * from the saved operating point, and say so plainly. */
             int32_t rp6 = (int32_t)saved_pwm + cmd_off;
             if (rp6 > 65535) rp6 = 65535; if (rp6 < 1) rp6 = 1;
             ramp_pwm   = (uint16_t)rp6;
             phase_rate = (double)cmd_off / lsbhz0 * 100.0;
-            OUT_SERIAL.print("LC: could not reach a usable rate — using commanded ");
+            OUT_SERIAL.print("LC: no rate measurement — using commanded ");
             OUT_SERIAL.print(phase_rate, 2); OUT_SERIAL.println(" ns/s");
         }
 
@@ -941,7 +974,7 @@ void vControlTask(void *pvParameters)
         xEventGroupSetBits(xSysEvents, EVT_OCXO_WARM);
 
     /* ---- Calibration (skip if EEPROM had a stored value) ---- */
-    if (!g_eeprom_valid)
+    if (!g_persist_valid)
         xEventGroupSetBits(xSysEvents, EVT_NEED_CALIBRATION);
 
     for (;;)
