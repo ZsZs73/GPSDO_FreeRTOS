@@ -52,13 +52,15 @@ float  g_bmp_temp = 0.0f, g_bmp_pres = 0.0f, g_bmp_alti = 0.0f;
 float  g_aht_temp = 0.0f, g_aht_humi = 0.0f;
 float  g_ina_volt = 0.0f, g_ina_curr = 0.0f;
 
+/* ---- Frequency-error damping configuration ---------------------------- */
+uint16_t      g_freq_damp_win_dpll = 100; /* FAD: DPLL damping average window */
+uint16_t      g_freq_damp_win_lock = 100; /* FAL: LOCK damping average window */
+
 /* ---- LTIC globals (Lars TIC) ------------------------------------------ */
 #ifdef GPSDO_LTIC
 volatile bool g_ltic_must_read = false;
 int16_t       g_ltic_adc_raw   = 0;
 int16_t       g_ltic_adc_avg   = 0;
-uint16_t      g_freq_damp_win_dpll = 100; /* FAD: DPLL damping average window */
-uint16_t      g_freq_damp_win_lock = 100; /* FAL: LOCK damping average window */
 float         g_ltic_voltage   = 0.0f;
 
 /* ltic_read_fast — read PA1 (the TIC ramp) ~50 µs after the PPS edge, from

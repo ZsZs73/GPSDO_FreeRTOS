@@ -959,7 +959,6 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
     set_trend(trend);
     return out;
 }
-#endif /* GPSDO_LTIC */
 
 /* ======================================================================
  * ALGORITHM DISPATCHER
@@ -1226,7 +1225,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
 
     return out;
 }
-
+#endif /* GPSDO_LTIC */
 
 uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
 {
