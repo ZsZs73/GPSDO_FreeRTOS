@@ -1,7 +1,7 @@
 /* ======================================================================
  * live_store.h  —  live-data persistence (LRN + LC + PWM) over the ring
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  *
  * Sits between the volatile "live" values (learned drift/damping, LC
  * calibration, last PWM) and the wear-levelled flash ring buffer. It packs

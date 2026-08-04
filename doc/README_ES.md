@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v1.01
+# GPSDO FreeRTOS v1.03
 
 [English](README_EN.md) | [Polski](README_PL.md) | **Español**
 
@@ -109,8 +109,6 @@ LCD y TM1637 **no pueden** funcionar simultáneamente (conflicto de bus).
 
 ---
 
----
-
 ## Arquitectura de software
 
 El firmware se ejecuta bajo FreeRTOS con siete tareas en niveles de prioridad
@@ -134,8 +132,6 @@ estrictamente definidos:
 - `xUptimeMutex` — tiempo de actividad (`gUptime`)
 - `xWireMutex` — bus I2C (compartido por sensores y pantallas)
 - `xSerialMutex` — puerto serie / Bluetooth
-
----
 
 ---
 
@@ -182,8 +178,6 @@ Los algoritmos 3–9 tienen parámetros PID ajustables en tiempo de ejecución
 
 ---
 
----
-
 ## Diseño de la pantalla OLED (128×64 px, 16 caracteres × 8 filas)
 
 Durante 2 segundos tras el arranque, la fila 0 muestra la versión del
@@ -214,8 +208,6 @@ perdida).
 
 ---
 
----
-
 ## Diseño de la pantalla LCD 20×4
 
 Pantalla de versión durante 2 segundos, luego:
@@ -239,8 +231,6 @@ La línea 2 rota cada `LCD_LINE2_SWITCH_SECS` segundos:
 | 5 | BMP280 | `BMP:23.4C 1013.2hPa` |
 
 Holdover en la línea 3: `[H]` (manual) o `[A]` (automático) — parpadeo 500 ms.
-
----
 
 ---
 
@@ -328,7 +318,7 @@ El panel grande mueve además 2,4 veces más píxeles por redibujado, así que
 
 ```
 ┌────────────────────────────────────────────┐
-│ v1.01-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
+│ v1.03-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
 ├────────────────────────────────────────────┤
 │                                            │
 │        10000000.0000 Hz                    │ ← frequency (large, colour-coded)
@@ -502,8 +492,6 @@ pines en `User_Setup.h` (SPI1: SCK=PA5, MOSI=PA7); cualquier panel de
 
 ---
 
----
-
 ## Pantallas de reloj (HT16K33 y TM1637)
 
 Se admiten dos módulos pequeños de 7 segmentos. Ambos muestran la hora, respetan
@@ -562,8 +550,6 @@ pares.
 
 ---
 
----
-
 ## Sincronización picDIV
 
 El picDIV opcional (familia PD11/PD13/PD17 de Tom Van Baak, leapsecond.com)
@@ -603,8 +589,6 @@ de fase de inmediato.
 
 ---
 
----
-
 ## Holdover automático
 
 Cuando el GPS pierde la señal durante la operación normal (p. ej. antena
@@ -618,8 +602,6 @@ desconectada):
 
 El comando manual `MH` activa el holdover de forma independiente (indicado
 como `H`). `MD` desactiva el holdover (tanto manual como automático).
-
----
 
 ---
 
@@ -646,6 +628,7 @@ funciona cualquier combinación de mayúsculas/minúsculas.
 | `RP` | Pausar el flujo de datos serie/BT |
 | `RR` | Reanudar el flujo de datos serie/BT |
 | `SW` | Marcas de agua de pila de las tareas FreeRTOS (diagnóstico) |
+| `CS` | Estadísticas de corrección: cuánto trabaja el lazo, y en df/f tras `CT` |
 
 ### Control
 
@@ -852,8 +835,6 @@ ese mismo segundo.
 
 ---
 
----
-
 ## Notas del hardware TIC — integrador de rampa con puerta (Kaashoek)
 
 El detector de fase es el **TIC de 1 ns de Erik Kaashoek** (como en el STM32
@@ -953,8 +934,6 @@ los parámetros vivos.)
 
 ---
 
----
-
 ## Almacenamiento de ajustes (flash-ring)
 
 Los ajustes viven en un anillo con nivelado de desgaste en el **sector 7** del
@@ -1019,8 +998,6 @@ respaldo.
   `erase 0x08000000 0x0803FFFF`, luego `loadbin firmware.bin 0x08000000`.
 - Si el anillo se borra, el firmware reaprende/recalibra desde los valores por
   defecto — nada se rompe, solo se pierde el ajuste acumulado.
-
----
 
 ---
 
@@ -1096,8 +1073,6 @@ estacionario existente sin cambios.
 
 ---
 
----
-
 ## Autoajuste (comando `CT`)
 
 `CT` mide la ganancia de planta del oscilador y deriva de ella los
@@ -1125,8 +1100,6 @@ derivar las ganancias directamente de una K medida es más rápido y más seguro
 
 ---
 
----
-
 ## Zona horaria automática (`TO A`)
 
 La hora local puede seguir la posición GPS automáticamente. En modo automático
@@ -1143,8 +1116,6 @@ latitud/longitud y la fecha:
 
 `TO <n>` vuelve a un desfase manual fijo. El modo y el desfase se guardan con
 `ES` y se restauran en el arranque.
-
----
 
 ---
 
@@ -1168,6 +1139,76 @@ Un dispositivo ausente informa `not found` y el firmware continúa sin él.
 
 ---
 
+## Autoevaluación sin referencia — `CS`
+
+El algoritmo 11 se validó contra un patrón de rubidio en el banco de otra persona.
+Casi nadie que construya esto tendrá uno, y sin él quedan la palabra del autor y
+un rectángulo verde. `CS` ofrece algo mejor.
+
+La corrección que aplica el lazo es el error que acaba de observar, así que el
+tamaño de esas correcciones dice si la disciplina funciona — y la referencia es el
+GPS, de modo que no existe nada mejor con lo que comparar la frecuencia. El
+firmware ya calculaba todos estos números y los descartaba. La idea es de Alan
+(MIS42N en EEVblog), cuyo propio diseño se apoya justamente en esto y por eso no
+necesita un patrón secundario.
+
+`CS` informa del RMS de la corrección sobre las últimas 100, 1 000, 10 000 y
+100 000 correcciones, en cuentas de DAC y — una vez que `CT` ha medido la
+pendiente del oscilador — en frecuencia fraccional, directamente comparable con
+una cifra de ADEV. También informa del sesgo constante, no nulo cuando el lazo
+sigue una deriva real en lugar de ruido.
+
+**Las ventanas cuentan correcciones, no segundos**, porque el ritmo de corrección
+depende del algoritmo: el algoritmo 11 corrige una vez por segundo, el 10 una vez
+por `LIV`. Etiquetarlas en minutos habría significado una cosa con un algoritmo y
+sesenta veces eso con el otro. `CS` mide el intervalo real e imprime lo que
+abarcan las ventanas en tiempo de reloj, para que el lector no tenga que
+calcularlo — a una corrección por segundo, 100 000 cubre unas 28 horas.
+
+Son pesos exponenciales, no ventanas duras: alrededor del 63% del peso cae dentro
+de N correcciones y el 95% dentro de 3N, así que los datos antiguos se desvanecen
+en vez de desaparecer de golpe. Eso cuesta cuatro multiplicaciones-suma por
+corrección y nada de memoria, mientras que un búfer de 100 000 muestras ocuparía
+la mayor parte de la RAM disponible para responder lo mismo sin mejorarlo.
+
+**Se cuenta solo con el lazo enganchado y sin calibración en curso.** La rampa de
+adquisición, los tres saltos que `CT` da al medir la pendiente del VCO y el
+barrido de `LC` son órdenes, no correcciones; uno solo dominaría la media horaria
+mucho después de haber terminado. Los algoritmos 0-9 no tienen estado de enganche
+sobre el que basar la compuerta, así que quedan excluidos y `CS` lo dice en lugar
+de informar de un número sin significado definido.
+
+> **Lo que no te dice.** Mide si el LAZO ESTÁ ASENTADO, no si la SALIDA ES BUENA,
+> y ambas cosas coinciden únicamente mientras el detector de fase sea fiable. Un
+> detector ruidoso hace que el lazo persiga ruido: las correcciones crecen, `CS`
+> las informa fielmente, y el oscilador estaba bien hasta que el lazo lo empeoró.
+> Nada medido desde dentro del lazo puede ver eso. Lee una cifra pequeña como «no
+> está peleando con nada» — necesario, no suficiente. La señal útil es una cifra
+> creciente.
+
+---
+
+## DAC SPI externo — planeado, no implementado
+
+`GPSDO_DAC_EXT` cambia la tensión de control del PWM de 16 bits a un DAC SPI
+externo. Activarlo hoy da un error de compilación deliberado: `dac_ext.cpp` es un
+esqueleto sin dispositivo elegido.
+
+El PWM da unos 50 µV por paso a 3,3 V, cerca de 2,7e-11 fraccional en un oscilador
+de 5,3 Hz/V. Un integrado de 18 bits con una referencia diseñada para el trabajo
+alcanza unos 17 µV, cerca de 9e-12, sin retardo de filtro dentro del lazo.
+
+No hace falta SPI por hardware, ni está disponible — SPI1 pertenece al TFT y todos
+los pines de SPI2 de este encapsulado están ocupados. No importa: el DAC se escribe
+una vez por segundo, así que moverlo por software cuesta del orden de un
+microsegundo. Los pines sugeridos son PB0, PB2 y PB4, elegidos para evitar PB6/PB7,
+que parecen libres pero son los pines por defecto de I2C1 que reclama
+`Wire.begin()`.
+
+Los 23 sitios que antes escribían el PWM pasan ahora por `gpsdo_dac_write16()`, de
+modo que añadir un dispositivo significa rellenar una función en lugar de editar 23
+llamadas.
+
 ---
 
 ## Oscilador (OCXO)
@@ -1188,8 +1229,6 @@ seguro para cualquier unidad con EFC de 0–4 V.
 Esto reemplaza las tablas de coeficientes por oscilador anteriores — una sola
 calibración adapta el lazo a cualquier cristal instalado, incluida la
 variación entre unidades de dos piezas nominalmente idénticas.
-
----
 
 ---
 
@@ -1237,8 +1276,6 @@ automáticamente; no hay nada que activar.
 
 ---
 
----
-
 ## Asignación de pines
 
 | Pin | Función |
@@ -1258,8 +1295,6 @@ automáticamente; no hay nada que activar.
 | PB6/PB7 | I2C1 SCL/SDA — OLED, LCD, sensores |
 | PA5/PA7 | SPI1 SCK/MOSI — pantalla TFT |
 | PB12/PB13/PB15 | TFT D/C, CS, RES |
-
----
 
 ---
 
@@ -1347,8 +1382,6 @@ necesita 3.0.0, quedarse en 2.12.0 no cuesta nada.
 > Conviene saberlo al buscar: la mayoría del material sobre «Arduino core 3.0.0»
 > en la red trata del core **ESP32**, un proyecto distinto cuya guía de migración
 > a 3.0 no aplica a STM32.
-
----
 
 ---
 

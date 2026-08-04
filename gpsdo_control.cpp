@@ -1,7 +1,7 @@
 /**
  * gpsdo_control.cpp — vControlTask — OCXO control loop
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -19,6 +19,8 @@
 
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
+#include "gpsdo_dac.h"
+#include "gpsdo_health.h"
 #include "gpsdo_state.h"
 #include "live_store.h"
 #include "settings_store.h"
@@ -191,7 +193,7 @@ static void do_calibration(void)
     g_calib_remaining = 2u * OCXO_CALIB_SECS + 5u;   /* real total for displays */
 
     /* Set Vctl=1.5V */
-    analogWrite(PIN_VCTL_PWM, 30720);
+    gpsdo_dac_write16(30720);
     OUT_SERIAL.print("Vctl=1.5V, waiting "); OUT_SERIAL.print(OCXO_CALIB_SECS); OUT_SERIAL.println("s");
     wait_secs_pwm(OCXO_CALIB_SECS, 30720);
 
@@ -205,7 +207,7 @@ static void do_calibration(void)
     OUT_SERIAL.print("f1="); OUT_SERIAL.println(f1, 2);
 
     /* Set Vctl=2.5V */
-    analogWrite(PIN_VCTL_PWM, 51200);
+    gpsdo_dac_write16(51200);
     OUT_SERIAL.print("Vctl=2.5V, waiting "); OUT_SERIAL.print(OCXO_CALIB_SECS); OUT_SERIAL.println("s");
     wait_secs_pwm(OCXO_CALIB_SECS, 51200);
 
@@ -228,7 +230,7 @@ static void do_calibration(void)
     }
     OUT_SERIAL.print("Calibrated PWM="); OUT_SERIAL.println(new_pwm);
 
-    analogWrite(PIN_VCTL_PWM, new_pwm);
+    gpsdo_dac_write16(new_pwm);
 
     if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         gCtrl.pwm_output = new_pwm;
@@ -289,7 +291,7 @@ static void do_calibrate_tune(void)
 
     double f[3]; const uint16_t pwm[3] = { PWM_A, PWM_B, PWM_C };
     for (int i = 0; i < 3; i++) {
-        analogWrite(PIN_VCTL_PWM, pwm[i]);
+        gpsdo_dac_write16(pwm[i]);
         OUT_SERIAL.print("CT: PWM="); OUT_SERIAL.print(pwm[i]);
         OUT_SERIAL.print(" settle "); OUT_SERIAL.print(OCXO_CALIB_SECS);
         OUT_SERIAL.println("s");
@@ -314,7 +316,7 @@ static void do_calibrate_tune(void)
     double denom = 3.0 * sxx - sx * sx;
     if (denom == 0.0) {
         OUT_SERIAL.println("CT: ERROR singular fit — aborting, params unchanged");
-        analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+        gpsdo_dac_write16(gCtrl.pwm_output);
         xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
         g_calib_active = false;
         g_calib_kind   = CALIB_NONE;
@@ -336,7 +338,7 @@ static void do_calibrate_tune(void)
         OUT_SERIAL.print("CT: ERROR K out of range (");
         OUT_SERIAL.print(K * 1000.0, 4);
         OUT_SERIAL.println(" mHz/LSB) — check GPS fix. Params unchanged.");
-        analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+        gpsdo_dac_write16(gCtrl.pwm_output);
         xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
         g_calib_active = false;
         g_calib_kind   = CALIB_NONE;
@@ -387,7 +389,7 @@ static void do_calibrate_tune(void)
     OUT_SERIAL.print("  NN max_step=");   OUT_SERIAL.println(g_nn_max_step, 0);
 
     /* Apply centred PWM */
-    analogWrite(PIN_VCTL_PWM, new_pwm);
+    gpsdo_dac_write16(new_pwm);
     if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         gCtrl.pwm_output = new_pwm;
         xSemaphoreGive(xCtrlMutex);
@@ -407,6 +409,7 @@ static void do_calibrate_tune(void)
      * group is written, so live loop tuning the operator may be experimenting
      * with elsewhere is left alone. */
     if (settings_save_partial(SET_PID)) {
+    health_reset();   /* the step after calibration is a jump, not a correction */
         OUT_SERIAL.println("CT: done — coefficients auto-saved to flash ring.");
     } else {
         OUT_SERIAL.println("CT: done, but the auto-save FAILED — run 'ES PID' manually.");
@@ -569,7 +572,7 @@ static void do_ltic_calibrate(void)
             OUT_SERIAL.print((int)meas_pwm);
             OUT_SERIAL.println(" (110 s, constant)...");
             g_calib_remaining += 112u;
-            analogWrite(PIN_VCTL_PWM, meas_pwm);
+            gpsdo_dac_write16(meas_pwm);
             wait_secs_pwm(110, meas_pwm);
 
             r_ok = false;
@@ -639,7 +642,7 @@ static void do_ltic_calibrate(void)
         OUT_SERIAL.print("LC: sampling ramp at PWM "); OUT_SERIAL.print((int)ramp_pwm);
         OUT_SERIAL.print(", rate "); OUT_SERIAL.print(phase_rate, 2);
         OUT_SERIAL.println(rate_measured ? " ns/s (measured)" : " ns/s (commanded)");
-        analogWrite(PIN_VCTL_PWM, ramp_pwm);
+        gpsdo_dac_write16(ramp_pwm);
 #ifdef GPSDO_PICDIV
         /* ARM LOTTERY. The picDIV sync parks the phase within ~±100 ns of the
          * GPS edge, but on a RANDOM side (edge race at sync). The flip-flop
@@ -666,7 +669,7 @@ static void do_ltic_calibrate(void)
             }
             if (!on_ramp) {
                 OUT_SERIAL.println("LC: ERROR could not land on the ramp after 6 arms — check picARM / pulse path; aborting.");
-                analogWrite(PIN_VCTL_PWM, saved_pwm);
+                gpsdo_dac_write16(saved_pwm);
                 xEventGroupClearBits(xSysEvents, EVT_NEED_LTIC_CAL);
                 g_calib_active = false; g_calib_kind = CALIB_NONE; g_calib_remaining = 0;
                 return;
@@ -755,7 +758,7 @@ static void do_ltic_calibrate(void)
 
     if (cnt < LTIC_CAL_MIN_POINTS) {
         OUT_SERIAL.println("LC: ERROR too few points — aborting, params unchanged");
-        analogWrite(PIN_VCTL_PWM, saved_pwm);
+        gpsdo_dac_write16(saved_pwm);
         xEventGroupClearBits(xSysEvents, EVT_NEED_LTIC_CAL);
         g_calib_active = false; g_calib_kind = CALIB_NONE; g_calib_remaining = 0;
         return;
@@ -891,7 +894,7 @@ static void do_ltic_calibrate(void)
         OUT_SERIAL.println("  (range/span average)");
     }
 
-    analogWrite(PIN_VCTL_PWM, saved_pwm);
+    gpsdo_dac_write16(saved_pwm);
     if (xSemaphoreTake(xFreqMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         gFreq.flush_requested = true;
         xSemaphoreGive(xFreqMutex);
@@ -1161,7 +1164,7 @@ void vControlTask(void *pvParameters)
             if (adjust && !holdover && !g_calib_active) {
                 uint16_t new_pwm = adjustVctlPWM(old_pwm, pps, algo);
                 if (new_pwm != old_pwm) {
-                    analogWrite(PIN_VCTL_PWM, new_pwm);
+                    gpsdo_dac_write16(new_pwm);
                     if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         gCtrl.pwm_output = new_pwm;
                         /* trendstr is updated inside adjustVctlPWM via extern */
@@ -1178,7 +1181,7 @@ void vControlTask(void *pvParameters)
                 if (dp != 0) {
                     int32_t np = (int32_t)old_pwm + dp;
                     if (np < 0) np = 0; if (np > 65535) np = 65535;
-                    analogWrite(PIN_VCTL_PWM, (uint16_t)np);
+                    gpsdo_dac_write16((uint16_t)np);
                     if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         gCtrl.pwm_output = (uint16_t)np;
                         xSemaphoreGive(xCtrlMutex);

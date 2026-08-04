@@ -14,12 +14,112 @@ por Scrachi (foro EEVBlog).
 
 El sufijo de versión `-rtos` marca el linaje del port a FreeRTOS.
 
-> **Nota sobre la traducción.** Esta es la versión en español del registro de
-> cambios. Las entradas más recientes se mantienen al día; para el máximo
-> detalle histórico consúltense también las versiones en inglés
-> (`CHANGELOG.md`) y polaco (`CHANGELOG_PL.md`).
+> **Nota sobre la traducción.** Las entradas desde v0.95 en adelante están
+> íntegramente en español y se mantienen al día. Las anteriores están traducidas
+> en su mayor parte, pero conservan pasajes en inglés: son párrafos técnicos
+> detallados sobre defectos ya corregidos, y traducirlos mecánicamente produciría
+> un texto peor que el original. Se dejan como están antes que estropearlos.
+>
+> Si algún pasaje antiguo resulta poco claro, la versión inglesa
+> (`CHANGELOG_EN.md`) es la referencia completa.
 
 ---
+
+## [v1.03-rtos] — 2026-08-01
+
+Construido sobre v1.01. Los experimentos de v1.02 — un DAC delta-sigma en PB5 y
+el soporte del core STM32duino 3.0.0 — no se trasladan: el primero se midió y no
+entregaba lo prometido, el segundo colgaba la placa en hardware real. v1.01 sigue
+siendo la base probada, con dos añadidos.
+
+### Corregido
+- **Un reinicio en caliente ya no reinicia un survey-in terminado.** El receptor
+  conserva su propia alimentación y su propio estado a través de `RB`, así que un
+  survey completado antes del reinicio sigue siendo válido: la posición que
+  estableció no se ha movido. El firmware ordenaba antes un survey nuevo de todos
+  modos, descartando un resultado que costó minutos y sacando al módulo del Time
+  Mode mientras repetía trabajo ya hecho. `gpsdo_gps_init()` consulta ahora primero
+  TIM-SVIN y omite el arranque cuando el receptor informa valid=1 con active=0 —
+  Time Mode con un survey terminado detrás. Se informa como *already in Time Mode
+  from an earlier survey*.
+
+  Esto exigió hacer `ubx_poll_svin()` seguro de llamar antes del planificador:
+  cedía con `vTaskDelay()` sin condición, lo que cuelga el sistema cuando no hay
+  planificador en marcha. Ahora usa `delay()` en ese caso, el mismo patrón que ya
+  empleaba el lector de ACK.
+- **La placa no arrancaba: sin LED, sin consola, nada.** `setup()` escribe el DAC
+  tres veces — el 127 inicial, el PWM recuperado y el valor por defecto — antes de
+  que se ejecute `xEventGroupCreate()`. Las nuevas estadísticas de corrección
+  cuelgan de la ruta de escritura del DAC, y su compuerta leía `xSysEvents`, que
+  en ese punto seguía siendo NULL. Pasar NULL a `xEventGroupGetBits()` dispara
+  `configASSERT` y detiene el procesador, así que el fallo ocurría antes del primer
+  parpadeo y no dejaba nada en la consola que lo explicara. La compuerta comprueba
+  ahora NULL primero; esas escrituras tempranas son órdenes, no correcciones, así
+  que excluirlas es correcto además de seguro.
+
+### Añadido
+- **`CS` — estadísticas de corrección, el lazo evaluándose a sí mismo.** El
+  algoritmo 11 se validó contra un patrón de rubidio en el banco de otra persona;
+  casi nadie que construya esto tiene uno, y sin él quedan la palabra del autor y
+  un indicador de enganche. La corrección que aplica el lazo es el error que acaba
+  de observar, así que el tamaño de esas correcciones dice si la disciplina
+  funciona — y la referencia es el GPS, de modo que no existe nada mejor con lo que
+  comparar la frecuencia. El firmware ya calculaba estos números y los descartaba.
+
+  Informa del RMS de la corrección sobre las últimas **100, 1 000, 10 000 y
+  100 000 correcciones**, en cuentas de DAC y — una vez que `CT` ha medido la
+  pendiente del oscilador — en frecuencia fraccional, directamente comparable con
+  una cifra de ADEV. También el sesgo constante, no nulo cuando el lazo sigue una
+  deriva real y no ruido.
+
+  Las ventanas cuentan correcciones y no segundos porque el ritmo de corrección
+  depende del algoritmo: el algoritmo 11 corrige una vez por segundo, el 10 una vez
+  por `LIV`. Etiquetarlas en minutos habría significado una cosa con un algoritmo y
+  sesenta veces eso con el otro — el mismo número describiendo dos periodos
+  distintos. `CS` mide el intervalo real e imprime lo que abarcan las ventanas en
+  tiempo de reloj, para que el lector no tenga que calcularlo. A una corrección por
+  segundo, 100 000 cubre unas 28 horas.
+
+  Son pesos exponenciales, no ventanas duras: alrededor del 63% del peso cae dentro
+  de N correcciones y el 95% dentro de 3N. Eso cuesta cuatro multiplicaciones-suma
+  por corrección y nada de memoria, mientras que un búfer de 100 000 muestras
+  ocuparía la mayor parte de la RAM para responder lo mismo sin mejorarlo.
+
+  Se cuenta solo con el lazo enganchado y sin calibración en curso: la rampa de
+  adquisición, los tres saltos de `CT` y el barrido de `LC` son órdenes, no
+  correcciones, y uno solo dominaría la media horaria mucho después de terminar.
+  Los algoritmos 0-9 no tienen estado de enganche sobre el que basar la compuerta y
+  quedan excluidos, cosa que `CS` dice en lugar de informar de un número sin
+  significado definido.
+
+  **La advertencia está en la salida, en la cabecera y en el README:** mide si el
+  LAZO ESTÁ ASENTADO, no si la SALIDA ES BUENA. Un detector ruidoso hace que el
+  lazo persiga ruido; las correcciones crecen, `CS` las informa fielmente, y el
+  oscilador estaba bien hasta que el lazo lo empeoró. Nada medido desde dentro del
+  lazo puede ver eso.
+
+  La idea es de Alan (MIS42N en EEVblog), cuyo propio diseño se apoya justamente en
+  esto y por eso no necesita un patrón secundario.
+- **`GPSDO_DAC_EXT` — DAC SPI externo, planeado, no implementado.** Activarlo da un
+  error de compilación deliberado: `dac_ext.cpp` es un esqueleto sin dispositivo
+  elegido. El PWM de 16 bits da unos 50 µV por paso a 3,3 V, cerca de 2,7e-11
+  fraccional en un oscilador de 5,3 Hz/V; un integrado de 18 bits con una
+  referencia diseñada para el trabajo alcanza unos 17 µV, cerca de 9e-12, sin
+  retardo de filtro dentro del lazo.
+
+  No hace falta SPI por hardware, ni está disponible — SPI1 pertenece al TFT y
+  todos los pines de SPI2 de este encapsulado están ocupados — pero el DAC se
+  escribe una vez por segundo, así que moverlo por software cuesta microsegundos.
+  Pines propuestos: PB0, PB2 y PB4, elegidos para evitar PB6/PB7, que parecen
+  libres pero son los pines por defecto de I2C1 que reclama `Wire.begin()`; un DAC
+  ahí rompería los sensores y la pantalla de reloj.
+
+### Cambiado
+- **Las 23 llamadas a `analogWrite(PIN_VCTL_PWM, ...)` pasan ahora por
+  `gpsdo_dac_write16()`.** Añadir una segunda ruta de salida editando cada una
+  habría invitado a olvidar alguna, y una llamada olvidada es el peor tipo de fallo
+  aquí: el lazo dirigiría bien casi siempre y daría un salto cada vez que se tomara
+  la ruta antigua. Añadir un DAC significa ahora rellenar una función.
 
 ## [v1.01-rtos] — 2026-07-29
 

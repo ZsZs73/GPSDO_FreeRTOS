@@ -16,6 +16,98 @@ The version suffix `-rtos` marks the FreeRTOS port lineage.
 
 ---
 
+## [v1.03-rtos] — 2026-08-01
+
+Built on v1.01. The v1.02 experiments — a sigma-delta DAC on PB5 and support for
+STM32duino core 3.0.0 — are not carried forward: the first was measured and found
+not to deliver what it promised, the second locked the board up on hardware.
+v1.01 remains the tested base, with two additions.
+
+### Fixed
+- **A warm reboot no longer restarts a finished survey-in.** The receiver keeps
+  its own power and its own state across `RB`, so a survey completed before the
+  reset is still valid: the position it established has not moved. The firmware
+  previously commanded a fresh survey regardless, discarding a result that took
+  minutes to reach and dropping the module out of Time Mode while it repeated work
+  already done. `gpsdo_gps_init()` now polls TIM-SVIN first and skips the start
+  when the receiver reports valid=1 with active=0 — Time Mode with a finished
+  survey behind it. Reported as *already in Time Mode from an earlier survey*.
+
+  This required making `ubx_poll_svin()` safe to call before the scheduler: it
+  yielded with `vTaskDelay()` unconditionally, which hangs the system when no
+  scheduler is running. It now uses `delay()` in that case, the same pattern the
+  ACK reader already used.
+
+- **The board would not start: no LED, no console, nothing.** `setup()` writes the
+  DAC three times — the initial 127, the recalled PWM and the default — before
+  `xEventGroupCreate()` has run. The new correction statistics hang off the DAC
+  write path, and their gate read `xSysEvents`, which was still NULL at that
+  point. Passing NULL to `xEventGroupGetBits()` trips `configASSERT` and halts the
+  processor, so the failure happened before the first blink and left nothing on
+  the console to explain it. The gate now checks for NULL first; those early
+  writes are commands rather than corrections, so excluding them is correct as
+  well as safe.
+
+### Added
+- **`CS` — correction statistics, the loop assessing itself.** Algorithm 11 was
+  validated against a rubidium standard on someone else's bench; almost nobody who
+  builds this has one, and without it there is the author's word and a lock
+  indicator. The correction the loop applies is the error it just observed, so the
+  size of those corrections says whether the discipline is working — and GPS is
+  the reference, so nothing better exists to compare frequency against. The
+  firmware already computed these numbers and threw them away.
+
+  Reports RMS correction over the last **100, 1 000, 10 000 and 100 000
+  corrections**, in DAC counts and — once `CT` has measured the oscillator slope —
+  in fractional frequency, directly comparable to an ADEV figure. Also the steady
+  bias, non-zero when the loop is tracking real drift rather than noise.
+
+  The windows count corrections rather than seconds because the correction rate
+  depends on the algorithm: algorithm 11 steers once a second, algorithm 10 once
+  per `LIV`. Labelling them in minutes would have meant one thing under one
+  algorithm and sixty times that under the other — the same number describing two
+  different spans. `CS` measures the actual interval and prints what the windows
+  currently cover in wall-clock time, so the reader does not have to work it out.
+  At one correction per second, 100 000 spans about 28 hours.
+
+  These are exponential weights, not hard windows: roughly 63% of the weight falls
+  inside N corrections and 95% inside 3N. That costs four multiply-adds per
+  correction and no memory, where a buffer holding 100 000 samples would take most
+  of the RAM budget to answer the same question no better.
+
+  Counted only while locked and with no calibration running: the acquisition ramp,
+  the three jumps `CT` makes and the `LC` sweep are commands, not corrections, and
+  one of them would dominate the hour-long average long after it ended.
+  Algorithms 0-9 have no lock state to gate on and are excluded, which `CS` says
+  rather than reporting a number with no defined meaning.
+
+  **The caveat is in the output, the header and the README:** it measures whether
+  the LOOP IS SETTLED, not whether the OUTPUT IS GOOD. A noisy detector makes the
+  loop chase noise; the corrections grow, `CS` reports them faithfully, and the
+  oscillator was fine until the loop made it worse. Nothing measured from inside
+  the loop can see that.
+
+  The idea is Alan's (MIS42N on EEVblog), whose own design relies on exactly this
+  and therefore needs no secondary standard.
+- **`GPSDO_DAC_EXT` — external SPI DAC, planned, not implemented.** Enabling it is
+  a compile error by design: `dac_ext.cpp` is a stub with no device chosen. The
+  16-bit PWM gives about 50 uV per step at 3.3 V, near 2.7e-11 fractional on a
+  5.3 Hz/V oscillator; an 18-bit part with a reference designed for the job reaches
+  roughly 17 uV, near 9e-12, with no filter delay in the loop.
+
+  No hardware SPI is needed or available — SPI1 belongs to the TFT and every SPI2
+  pin on this package is taken — but the DAC is written once per second, so
+  bit-banging costs microseconds. Suggested pins PB0, PB2, PB4, chosen to avoid
+  PB6/PB7: those look free but are the default I2C1 pins that `Wire.begin()`
+  claims, and a DAC there would break the sensors and the clock display.
+
+### Changed
+- **All 23 `analogWrite(PIN_VCTL_PWM, ...)` call sites now go through
+  `gpsdo_dac_write16()`.** Adding a second output path by editing each of them
+  would have invited a missed one, and a missed call site is the worst kind of bug
+  here: the loop would steer correctly almost always and jump whenever the stale
+  path was taken. Adding a DAC now means filling in one function.
+
 ## [v1.01-rtos] — 2026-07-29
 
 > **Build with STM32duino core 2.12.0 or earlier.** Core 3.0.0 (23 July 2026)

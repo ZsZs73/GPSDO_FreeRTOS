@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v1.01
+# GPSDO FreeRTOS v1.03
 
 [English](README_EN.md) | **Polski** | [Español](README_ES.md)
 
@@ -311,7 +311,7 @@ połączeniach poniżej.
 
 ```
 ┌────────────────────────────────────────────┐
-│ v1.01-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
+│ v1.03-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
 ├────────────────────────────────────────────┤
 │                                            │
 │        10000000.0000 Hz                    │ ← frequency (large, colour-coded)
@@ -624,6 +624,7 @@ liter** (`LA`, `la` i `La` są równoważne), więc działa dowolna wielkość l
 | `RP` | Wstrzymaj strumień danych serial/BT |
 | `RR` | Wznów strumień danych serial/BT |
 | `SW` | Diagnostyka stosów zadań FreeRTOS |
+| `CS` | Statystyki korekcji: jak ciężko pracuje pętla, a po `CT` także w df/f |
 
 ### Sterowanie
 
@@ -1123,6 +1124,76 @@ HW: TM1637 clock display  enabled (GPIO PA8/PB4, write-only - not verifiable)
 ```
 
 Brakujące urządzenie zgłasza `not found`, a firmware działa dalej bez niego.
+
+---
+
+## Samoocena bez wzorca — `CS`
+
+Algorytm 11 został zweryfikowany względem wzorca rubidowego na cudzym stanowisku.
+Prawie nikt, kto zbuduje to urządzenie, takiego nie ma — a bez niego zostaje słowo
+autora i zielony prostokąt. `CS` daje coś lepszego.
+
+Korekcja, którą stosuje pętla, jest błędem, który przed chwilą zaobserwowała, więc
+wielkość tych korekcji mówi, czy dyscyplinowanie działa — a odniesieniem jest GPS,
+więc nie ma nic lepszego do porównania częstotliwości. Firmware i tak liczyło
+wszystkie te wartości i je wyrzucało. Pomysł jest Alana (MIS42N z forum EEVblog),
+którego własna konstrukcja opiera się dokładnie na tym i dlatego nie potrzebuje
+wzorca wtórnego.
+
+`CS` podaje RMS korekcji na oknach ostatnich 100, 1 000, 10 000 i 100 000
+korekcji — w jednostkach DAC oraz, gdy `CT` zmierzyło nachylenie oscylatora, we
+względnej częstotliwości, co da się wprost porównać z liczbą z ADEV. Podaje też
+stałe odchylenie, niezerowe wtedy, gdy pętla nadąża za rzeczywistym dryfem, a nie
+za szumem.
+
+**Okna liczą korekcje, nie sekundy**, bo tempo korekcji zależy od algorytmu:
+algorytm 11 steruje raz na sekundę, algorytm 10 raz na `LIV`. Oznaczenie ich w
+minutach znaczyłoby co innego przy jednym algorytmie i sześćdziesiąt razy tyle
+przy drugim. `CS` mierzy rzeczywisty odstęp i wypisuje, ile okna obejmują w
+czasie rzeczywistym, żeby czytelnik nie musiał tego przeliczać — przy jednej
+korekcji na sekundę 100 000 pokrywa około 28 godzin.
+
+To wagi wykładnicze, nie ostre okna: około 63% wagi mieści się w N korekcjach, a
+95% w 3N, więc stare dane blakną, zamiast wypadać. Kosztuje to cztery mnożenia z
+dodawaniem na korekcję i zero pamięci, podczas gdy bufor na 100 000 próbek zająłby
+większość dostępnego RAM-u, odpowiadając na to samo pytanie nie lepiej.
+
+**Liczone wyłącznie, gdy pętla jest zalockowana i nie trwa kalibracja.** Rampa
+akwizycji, trzy skoki, które `CT` wykonuje mierząc nachylenie VCO, oraz
+przemiatanie `LC` to komendy, nie korekcje; jedna taka zdominowałaby średnią
+godzinną długo po tym, jak się skończyła. Algorytmy 0-9 nie mają stanu locka, na
+którym dałoby się oprzeć bramkę, więc są wykluczone, a `CS` mówi o tym wprost
+zamiast podawać liczbę bez określonego znaczenia.
+
+> **Czego to nie mówi.** Mierzy, czy PĘTLA JEST USTALONA, a nie czy WYJŚCIE JEST
+> DOBRE — a to jest to samo tylko wtedy, gdy detektor fazy jest wiarygodny.
+> Zaszumiony detektor sprawia, że pętla goni szum: korekcje rosną, `CS` wiernie je
+> raportuje, a oscylator był w porządku, dopóki pętla go nie popsuła. Nic
+> mierzonego wewnątrz pętli tego nie zobaczy. Małą wartość czytaj jako „pętla z
+> niczym nie walczy" — konieczne, ale niewystarczające. Sygnałem użytecznym jest
+> wartość rosnąca.
+
+---
+
+## Zewnętrzny przetwornik SPI — planowany, niezaimplementowany
+
+`GPSDO_DAC_EXT` przełącza napięcie sterujące z 16-bitowego PWM na zewnętrzny
+przetwornik SPI. Włączenie tego dzisiaj daje celowo błąd kompilacji:
+`dac_ext.cpp` jest zaślepką bez wybranego układu.
+
+PWM daje około 50 µV na krok przy 3,3 V, blisko 2,7×10⁻¹¹ względnie na
+oscylatorze 5,3 Hz/V. Układ 18-bitowy z odniesieniem zaprojektowanym do tego
+zadania osiąga mniej więcej 17 µV, blisko 9×10⁻¹², bez opóźnienia filtru w pętli.
+
+Sprzętowe SPI nie jest potrzebne ani dostępne — SPI1 należy do TFT, a wszystkie
+piny SPI2 w tej obudowie są zajęte. To nie przeszkadza: DAC zapisuje się raz na
+sekundę, więc programowe kluczowanie kosztuje rzędu mikrosekundy. Proponowane piny
+to PB0, PB2 i PB4, dobrane tak, by ominąć PB6/PB7 — te wyglądają na wolne, ale są
+domyślnymi pinami I2C1, które zajmuje `Wire.begin()`.
+
+Wszystkie 23 miejsca, które dawniej zapisywały PWM, przechodzą teraz przez
+`gpsdo_dac_write16()`, więc dodanie układu oznacza wypełnienie jednej funkcji, a
+nie edycję 23 wywołań.
 
 ---
 

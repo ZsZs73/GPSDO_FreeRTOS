@@ -1,7 +1,7 @@
 /**
  * gpsdo_cli.cpp — vCliTask — Serial / Bluetooth command line interface
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -18,6 +18,8 @@
 
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
+#include "gpsdo_dac.h"
+#include "gpsdo_health.h"
 #include "gpsdo_state.h"
 #include "GPSDO_algorithms.h"
 #include "flash_ring.h"
@@ -244,6 +246,7 @@ static void print_help(void)
     cli_putln("  ES [obj]    Save settings to flash ring (obj: TZ/PID/LTIC/FLAGS/ALGO/PO)");
     cli_putln("  ER          Recall settings (flash ring)");
     cli_putln("  EE          Erase settings (reset to defaults)");
+    cli_putln("  CS           Correction statistics over 100/1k/10k/100k corrections");
     cli_putln("  EW          Flash wear stats (ring buffer erase cycles)");
     cli_putln("  FR 0|1      Flash ring buffer on/off (saved with ES)");
     cli_putln("  SAW 0|1     Sawtooth qErr correction on/off (algo 10; saved with ES)");
@@ -491,7 +494,7 @@ static void dispatch(char *line)
     if (cli_ieq(verb, "up1")) {
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (gCtrl.pwm_output < 65535) gCtrl.pwm_output++;
-            analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+            gpsdo_dac_write16(gCtrl.pwm_output);
             xSemaphoreGive(xCtrlMutex);
         }
         cli_puts("PWM+1: "); cli_putint(gCtrl.pwm_output);
@@ -500,7 +503,7 @@ static void dispatch(char *line)
     if (cli_ieq(verb, "up10")) {
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (gCtrl.pwm_output <= 65525) gCtrl.pwm_output += 10;
-            analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+            gpsdo_dac_write16(gCtrl.pwm_output);
             xSemaphoreGive(xCtrlMutex);
         }
         cli_puts("PWM+10: "); cli_putint(gCtrl.pwm_output);
@@ -509,7 +512,7 @@ static void dispatch(char *line)
     if (cli_ieq(verb, "dp1")) {
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (gCtrl.pwm_output > 1) gCtrl.pwm_output--;
-            analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+            gpsdo_dac_write16(gCtrl.pwm_output);
             xSemaphoreGive(xCtrlMutex);
         }
         cli_puts("PWM-1: "); cli_putint(gCtrl.pwm_output);
@@ -518,7 +521,7 @@ static void dispatch(char *line)
     if (cli_ieq(verb, "dp10")) {
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             if (gCtrl.pwm_output >= 11) gCtrl.pwm_output -= 10;
-            analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+            gpsdo_dac_write16(gCtrl.pwm_output);
             xSemaphoreGive(xCtrlMutex);
         }
         cli_puts("PWM-10: "); cli_putint(gCtrl.pwm_output);
@@ -532,7 +535,7 @@ static void dispatch(char *line)
             cli_putint(DEFAULT_PWM_OUTPUT);
             if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 gCtrl.pwm_output = DEFAULT_PWM_OUTPUT;
-                analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+                gpsdo_dac_write16(gCtrl.pwm_output);
                 xSemaphoreGive(xCtrlMutex);
             }
         } else {
@@ -540,7 +543,7 @@ static void dispatch(char *line)
             if (v >= 1 && v <= 65535) {
                 if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     gCtrl.pwm_output = (uint16_t)v;
-                    analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+                    gpsdo_dac_write16(gCtrl.pwm_output);
                     xSemaphoreGive(xCtrlMutex);
                 }
                 cli_puts("PWM set: "); cli_putint((int)v);
@@ -1193,6 +1196,64 @@ static void dispatch(char *line)
         cli_putln("Erasing settings (will reset to defaults on next boot if sector wiped)...");
         persist_erase();
         cli_putln("Done.");
+        return;
+    }
+    if (cli_ieq(verb, "CS")) {
+        /* Correction statistics - the loop assessing itself, so a builder with no
+         * reference standard has something better than a lock indicator to go on.
+         * The idea is Alan's (MIS42N on EEVblog), whose own design relies on
+         * exactly this and therefore needs no secondary standard.
+         *
+         * See gpsdo_health.h for the caveat that matters: this says whether the
+         * loop is SETTLED, not whether the output is GOOD, and the two part
+         * company precisely when the phase detector is noisy. */
+        health_stats_t h;
+        health_get(&h);
+        char line[120];
+
+        if (!h.counting) {
+            cli_putln("Corrections: NOT COUNTING - loop not locked, calibrating,");
+            cli_putln("  or running an algorithm below 10 (no lock state to gate on).");
+        }
+        snprintf(line, sizeof(line),
+                 "Corrections: %lu counted, %lu skipped, peak %u LSB",
+                 (unsigned long)h.updates, (unsigned long)h.gated,
+                 (unsigned)h.peak);
+        cli_putln(line);
+        snprintf(line, sizeof(line),
+                 "  RMS  100=%.2f  1k=%.2f  10k=%.2f  100k=%.2f LSB",
+                 h.rms_100, h.rms_1k, h.rms_10k, h.rms_100k);
+        cli_putln(line);
+
+        /* Windows are counted in corrections, not seconds, because the rate
+         * depends on the algorithm and on LIV. Print what they currently mean in
+         * wall-clock time so the reader does not have to work it out. */
+        if (h.secs_per_corr > 0.0) {
+            double w100k = 100000.0 * h.secs_per_corr / 3600.0;
+            snprintf(line, sizeof(line),
+                     "  (corrections, %.1f s apart: 100 = %.1f min, 100k = %.1f h)",
+                     h.secs_per_corr, 100.0 * h.secs_per_corr / 60.0, w100k);
+            cli_putln(line);
+        }
+
+        if (h.have_k) {
+            double f = h.k_hz_per_lsb / 10.0e6;
+            snprintf(line, sizeof(line),
+                     "  as df/f: 100=%.2e  1k=%.2e  10k=%.2e  100k=%.2e",
+                     h.rms_100 * f, h.rms_1k * f, h.rms_10k * f, h.rms_100k * f);
+            cli_putln(line);
+            snprintf(line, sizeof(line), "  steady bias: %+.2f LSB = %+.2e df/f per correction",
+                     h.bias_100k, h.bias_100k * f);
+            cli_putln(line);
+        } else {
+            cli_putln("  (run CT to express these in fractional frequency)");
+        }
+
+        cli_putln("  Counted only while locked and not calibrating: the CT and LC");
+        cli_putln("  sweeps and the acquisition ramp are commands, not corrections.");
+        cli_putln("  Small and steady = the loop is not fighting anything.");
+        cli_putln("  Growing = something is wrong. Cannot distinguish a bad");
+        cli_putln("  oscillator from a noisy detector - see H CS.");
         return;
     }
     if (cli_ieq(verb, "EW")) {

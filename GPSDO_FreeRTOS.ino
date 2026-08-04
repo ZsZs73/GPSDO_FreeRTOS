@@ -1,7 +1,7 @@
 /**
  * GPSDO_FreeRTOS.ino — Main entry point — hardware init and FreeRTOS scheduler start
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -39,6 +39,7 @@
  */
 
 #include "gpsdo_config.h"
+#include "gpsdo_dac.h"
 #include "gpsdo_state.h"
 #include <Arduino.h>
 #include <Wire.h>
@@ -175,7 +176,12 @@ void setup()
 
     /* ---- 16-bit PWM DAC on PB9 (TIM4 CH4) ---- */
     analogReadResolution(12);
-    analogWrite(PIN_VCTL_PWM, 127);
+    /* Output stage first: under GPSDO_DAC_EXT this brings the DAC up, and the
+     * first command must not arrive before it is ready. */
+    if (!gpsdo_dac_begin()) {
+        OUT_SERIAL.println("HW: control-voltage DAC failed to start");
+    }
+    gpsdo_dac_write16(127);
     analogWriteFrequency(2000);
     analogWriteResolution(16);
 
@@ -211,7 +217,7 @@ void setup()
     } else {
         OUT_SERIAL.println("Settings: none stored (compile-time defaults)");
     }
-    analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+    gpsdo_dac_write16(gCtrl.pwm_output);
 
     /* recall learned/calibration values from the ring (if present) */
     if (live_store_begin())
@@ -220,7 +226,7 @@ void setup()
     /* Re-apply PWM: live_store may have overridden the settings value with a
      * fresher one. The OCXO should not sit at the stale PWM until the loop's
      * first cycle; apply the final value now. */
-    analogWrite(PIN_VCTL_PWM, gCtrl.pwm_output);
+    gpsdo_dac_write16(gCtrl.pwm_output);
 
     OUT_SERIAL.print("Initial PWM=");    OUT_SERIAL.print(gCtrl.pwm_output);
     OUT_SERIAL.print(" algo=");          OUT_SERIAL.print(gCtrl.active_algo);

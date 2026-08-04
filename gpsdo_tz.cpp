@@ -1,7 +1,7 @@
 /**
  * gpsdo_tz.cpp — Timezone resolution: POSIX TZ rules, named zones, EU auto
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  *

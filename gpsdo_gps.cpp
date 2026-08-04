@@ -1,7 +1,7 @@
 /**
  * gpsdo_gps.cpp — vGpsTask — GPS NMEA parsing and UBX configuration
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -334,7 +334,14 @@ static bool ubx_poll_svin(uint32_t *dur, uint32_t *acc_mm,
                    if (n >= sizeof(buf)) goto done; }
         }
         if (n >= 28) break;                 /* full payload already in */
-        vTaskDelay(pdMS_TO_TICKS(10));      /* yield — does NOT starve displays */
+        /* Before vTaskStartScheduler() this must not be vTaskDelay(): calling it
+         * with no scheduler hangs the system. gpsdo_gps_init() now polls once, to
+         * see whether the receiver is already in Time Mode, so this path is
+         * genuinely reached both before and after the scheduler starts. */
+        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+            vTaskDelay(pdMS_TO_TICKS(10));  /* yield — does NOT starve displays */
+        else
+            delay(10);
     }
 done:
     if (n < 28) return false;
@@ -1073,10 +1080,41 @@ void gpsdo_gps_init(void)
     if (!g_svin_enabled) {
         OUT_SERIAL.println("LEA-T: survey-in DISABLED (SV 0) — staying in nav mode");
     } else {
-        OUT_SERIAL.println("LEA-T: starting survey-in (Time Mode)");
-        if (ubx_start_survey_in()) {
+        /* Ask first, command second. After a warm reboot (RB) the receiver keeps
+         * its own power and its own state, so a survey completed before the reset
+         * is still valid — the position it established has not moved. Starting a
+         * fresh one there discards a result that took minutes to reach and drops
+         * the module out of Time Mode while it repeats work already done.
+         *
+         * TIM-SVIN reports valid=1 with active=0 exactly when the receiver is in
+         * Time Mode with a finished survey behind it, which is the condition worth
+         * skipping for. This runs before the scheduler, which is why ubx_poll_svin()
+         * had to stop calling vTaskDelay() unconditionally. */
+        bool already_timing = false;
+        {
+            uint32_t d0 = 0, a0 = 0;
+            bool v0 = false, act0 = false;
+            bool got = ubx_poll_svin(&d0, &a0, &v0, &act0);
+            if (!got) got = ubx_poll_svin_nav(&d0, &a0, &v0, &act0);
+            if (got && v0 && !act0) {
+                already_timing = true;
+                OUT_SERIAL.print("LEA-T: already in Time Mode from an earlier survey (");
+                OUT_SERIAL.print(d0);
+                OUT_SERIAL.print("s, ");
+                OUT_SERIAL.print(a0 / 1000u);
+                OUT_SERIAL.println("m) - not restarting it");
+                g_svin_active  = false;
+                g_svin_pending = false;
+                g_svin_dur     = (uint16_t)((d0 > 65535u) ? 65535u : d0);
+                g_svin_acc_m   = (uint16_t)(a0 / 1000u);
+            }
+        }
+
+        if (!already_timing) {
+            OUT_SERIAL.println("LEA-T: starting survey-in (Time Mode)");
+            if (ubx_start_survey_in()) {
             OUT_SERIAL.println("LEA-T: survey-in command accepted");
-        } else {
+            } else {
             /* No variant ACKed. The module is usually ALREADY in Time Mode
              * (its survey config was stored in flash, e.g. via u-center), so
              * a fresh command is rejected — but it is still timing. Monitor
@@ -1085,11 +1123,12 @@ void gpsdo_gps_init(void)
              * the monitor stops itself. */
             OUT_SERIAL.println("LEA-T: no start command ACKed — module may already be timing");
             OUT_SERIAL.println("LEA-T: monitoring via TIM-SVIN");
-        }
-        /* Ask vGpsTask to poll TIM-SVIN once the scheduler runs. */
-        g_svin_active = true;
-        g_svin_pending = true;
-        g_svin_dur = 0; g_svin_acc_m = 0;
+            }
+            /* Ask vGpsTask to poll TIM-SVIN once the scheduler runs. */
+            g_svin_active = true;
+            g_svin_pending = true;
+            g_svin_dur = 0; g_svin_acc_m = 0;
+        }   /* if (!already_timing) */
     }
 #endif
 

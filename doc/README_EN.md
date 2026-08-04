@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v1.01
+# GPSDO FreeRTOS v1.03
 
 **English** | [Polski](README_PL.md) | [Español](README_ES.md)
 
@@ -318,7 +318,7 @@ not be reduced below 40 MHz on it — see the wiring notes below.
 
 ```
 ┌────────────────────────────────────────────┐
-│ v1.01-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
+│ v1.03-rt      GPSDO      LMT 14:32:45 Thu   │ ← header bar (navy)
 ├────────────────────────────────────────────┤
 │                                            │
 │        10000000.0000 Hz                    │ ← frequency (large, colour-coded)
@@ -635,6 +635,7 @@ Commands terminated by `\r\n` or `\n`. Command names are **case-insensitive**
 | `RP` | Pause serial/BT data stream |
 | `RR` | Resume serial/BT data stream |
 | `SW` | FreeRTOS task stack watermarks (diagnostics) |
+| `CS` | Correction statistics: how hard the loop is working, and in df/f after `CT` |
 
 ### Control
 
@@ -1160,6 +1161,76 @@ HW: TM1637 clock display  enabled (GPIO PA8/PB4, write-only - not verifiable)
 A missing device reports `not found` and the firmware continues without it.
 
 ---
+
+---
+
+## Self-assessment without a reference — `CS`
+
+Algorithm 11 was validated against a rubidium standard on someone else's bench.
+Almost nobody who builds this will have one, and without it there is the author's
+word and a green rectangle. `CS` gives something better.
+
+The correction the loop applies is the error it just observed, so the size of
+those corrections says whether the discipline is working — and GPS is the
+reference, so nothing better exists to compare frequency against. The firmware
+already computed every one of these numbers and threw them away. The idea is
+Alan's (MIS42N on EEVblog), whose own design relies on exactly this, which is why
+it needs no secondary standard.
+
+`CS` reports RMS correction over the last 100, 1 000, 10 000 and 100 000
+corrections, in DAC counts and — once `CT` has measured the oscillator's slope —
+in fractional frequency, directly comparable to an ADEV figure. It also reports
+the steady bias, non-zero when the loop is tracking real drift rather than noise.
+
+**The windows count corrections, not seconds**, because the correction rate
+depends on the algorithm: algorithm 11 steers once a second, algorithm 10 once
+per `LIV`. Labelling them in minutes would have meant one thing under one
+algorithm and sixty times that under the other. `CS` measures the actual interval
+and prints what the windows currently span in wall-clock time, so the reader does
+not have to work it out — at one correction per second, 100 000 covers about 28
+hours.
+
+These are exponential weights rather than hard windows: about 63% of the weight
+falls inside N corrections and 95% inside 3N, so old data fades rather than
+dropping out. That costs four multiply-adds per correction and no memory, where a
+buffer holding 100 000 samples would be most of the RAM budget to answer the same
+question no better.
+
+**Counted only while the loop is locked and no calibration is running.** The
+acquisition ramp, the three jumps `CT` makes while measuring the VCO slope and
+the sweep `LC` uses are commands, not corrections; one of them would dominate the
+hour-long average long after it ended. Algorithms 0-9 have no lock state to gate
+on, so they are excluded and `CS` says so rather than reporting a number with no
+defined meaning.
+
+> **What it does not tell you.** It measures whether the LOOP IS SETTLED, not
+> whether the OUTPUT IS GOOD, and those are the same thing only while the phase
+> detector is trustworthy. A noisy detector makes the loop chase noise: the
+> corrections grow, this reports them faithfully, and the oscillator was fine
+> until the loop made it worse. Nothing measured from inside the loop can see
+> that. Read a small figure as "not fighting anything" — necessary, not
+> sufficient. A growing figure is the useful signal.
+
+---
+
+## External SPI DAC — planned, not implemented
+
+`GPSDO_DAC_EXT` switches the control voltage from the 16-bit PWM to an external
+SPI DAC. Enabling it today is a compile error by design: `dac_ext.cpp` is a stub
+with no device chosen.
+
+The PWM gives about 50 uV per step at 3.3 V, near 2.7e-11 fractional on a
+5.3 Hz/V oscillator. An 18-bit part with a reference designed for the job reaches
+roughly 17 uV, near 9e-12, with no filter delay inside the loop.
+
+No hardware SPI is needed or available — SPI1 belongs to the TFT and every SPI2
+pin on this package is taken. It does not matter: the DAC is written once per
+second, so bit-banging the word costs on the order of a microsecond. Suggested
+pins are PB0, PB2 and PB4, chosen to avoid PB6/PB7, which look free but are the
+default I2C1 pins that `Wire.begin()` claims.
+
+All 23 places that used to write the PWM now go through `gpsdo_dac_write16()`, so
+adding a device means filling in one function rather than editing 23 call sites.
 
 ---
 

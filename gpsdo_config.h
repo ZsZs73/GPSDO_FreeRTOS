@@ -1,7 +1,7 @@
 /**
  * gpsdo_config.h — Compile-time configuration
  *
- * Part of GPSDO FreeRTOS v1.01
+ * Part of GPSDO FreeRTOS v1.03
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -31,7 +31,7 @@ extern "C" {
 
 /* ── Version ─────────────────────────────────────────────────────────── */
 #define PROGRAM_NAME     "GPSDO"
-#define PROGRAM_VERSION  "v1.01-rtos"
+#define PROGRAM_VERSION  "v1.03-rtos"
 
 /* ---- Serial output macro ----
  * OUT_SERIAL routes user-facing output to Serial2 (Bluetooth) or Serial
@@ -173,6 +173,19 @@ extern "C" {
 #define GPSDO_LTIC           /* Lars' TIC: read Vphase on PA1, discharge 1nF capacitor */
 /* GPSDO_EEPROM removed in v1.00: persistence is 100% flash ring
  * (settings_store + live_store, sector 7). See doc/FLASH_RING_BRINGUP_*. */
+/* ---- Control-voltage output --------------------------------------------
+ * Default is the 16-bit PWM on PIN_VCTL_PWM: about 50 uV per step at 3.3 V,
+ * near 2.7e-11 fractional on a 5.3 Hz/V oscillator.
+ *
+ * GPSDO_DAC_EXT switches to an external SPI DAC. NOT IMPLEMENTED - dac_ext.cpp
+ * is a stub that refuses to compile until a device is chosen, so enabling this
+ * is a compile error by design. An 18-bit part with a reference designed for the
+ * job reaches about 17 uV per step, near 9e-12, with no filter delay in the loop.
+ *
+ * No hardware SPI is needed: the DAC is written once per second, so bit-banging
+ * costs microseconds. See dac_ext.h for the pin proposal and the reasoning. */
+//#define GPSDO_DAC_EXT
+
 #define GPSDO_GEN_2kHz_PB5
 
 

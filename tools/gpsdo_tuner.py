@@ -47,7 +47,7 @@ import math
 # against newer firmware silently mis-parses telemetry and writes commands the
 # board no longer understands, which is a confusing way to lose an evening.
 # Bump this whenever the firmware version changes, even if nothing here moved.
-TOOL_VERSION = "1.01"
+TOOL_VERSION = "1.03"
 from collections import deque, defaultdict
 
 # Force pyqtgraph to use the same Qt binding as the rest of this file (PySide6).
@@ -673,6 +673,17 @@ class GpsdoTuner(QMainWindow):
                 ("RP / RR",     "Report pause / resume"),
                 ("F",           "Flush the frequency ring buffers"),
                 ("T [baud]",    "GPS tunnel on USB for u-center (300 s)"),
+                ("CS",          "Correction statistics: RMS of the loop's own"),
+                ("",            "  corrections over the last 100 / 1k / 10k / 100k"),
+                ("",            "  CORRECTIONS - not seconds, because the rate"),
+                ("",            "  depends on the algorithm (algo 11 steers once a"),
+                ("",            "  second, algo 10 once per LIV). CS measures the"),
+                ("",            "  interval and prints what the windows span."),
+                ("",            "  Also in fractional frequency once CT has run."),
+                ("",            "  Counted only while locked and not calibrating."),
+                ("",            "  Says whether the LOOP IS SETTLED, not whether"),
+                ("",            "  the OUTPUT IS GOOD - a noisy detector makes the"),
+                ("",            "  loop chase noise and this reports it faithfully."),
             ]),
             ("Discipline mode", [
                 ("MH / MD",     "Mode holdover / mode disciplined"),

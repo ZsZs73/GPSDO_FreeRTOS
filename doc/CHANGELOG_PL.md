@@ -16,6 +16,100 @@ Sufiks `-rtos` oznacza linię portu na FreeRTOS.
 
 ---
 
+## [v1.03-rtos] — 2026-08-01
+
+Zbudowane na v1.01. Eksperymenty z v1.02 — przetwornik delta-sigma na PB5 oraz
+obsługa rdzenia STM32duino 3.0.0 — nie zostały przeniesione: pierwszy został
+zmierzony i nie dawał tego, co obiecywał, drugi zawieszał płytkę na sprzęcie.
+v1.01 pozostaje sprawdzoną bazą, z dwoma dodatkami.
+
+### Naprawione
+- **Ciepły restart nie uruchamia już od nowa ukończonego survey-in.** Odbiornik
+  zachowuje przez `RB` własne zasilanie i własny stan, więc survey ukończony przed
+  resetem jest nadal ważny: pozycja, którą ustalił, się nie zmieniła. Firmware
+  wcześniej i tak zlecało nowy survey, odrzucając wynik, który powstawał minutami,
+  i wypychając moduł z Time Mode na czas powtarzania wykonanej już pracy.
+  `gpsdo_gps_init()` odpytuje teraz najpierw TIM-SVIN i pomija start, gdy
+  odbiornik zgłasza valid=1 przy active=0 — czyli Time Mode z ukończonym survey za
+  sobą. Zgłaszane jako *already in Time Mode from an earlier survey*.
+
+  Wymagało to uczynienia `ubx_poll_svin()` bezpiecznym do wywołania przed
+  schedulerem: funkcja oddawała procesor przez `vTaskDelay()` bezwarunkowo, co
+  zawiesza system, gdy scheduler jeszcze nie działa. Teraz w takim przypadku używa
+  `delay()` — tego samego wzorca, który stosował już czytnik ACK.
+- **Płytka nie startowała: brak LED, brak konsoli, nic.** `setup()` zapisuje DAC
+  trzy razy — początkowe 127, odczytany PWM i wartość domyślną — zanim wykona się
+  `xEventGroupCreate()`. Nowe statystyki korekcji wiszą na ścieżce zapisu DAC, a
+  ich bramka czytała `xSysEvents`, które w tym momencie było jeszcze NULL. Podanie
+  NULL do `xEventGroupGetBits()` wyzwala `configASSERT` i zatrzymuje procesor,
+  więc awaria następowała przed pierwszym mignięciem i nie zostawiała na konsoli
+  żadnego śladu. Bramka sprawdza teraz najpierw NULL; te wczesne zapisy to
+  komendy, nie korekcje, więc ich wykluczenie jest zarazem bezpieczne i poprawne.
+
+### Dodane
+- **`CS` — statystyki korekcji, czyli pętla oceniająca samą siebie.** Algorytm 11
+  został zweryfikowany względem wzorca rubidowego na cudzym stanowisku; prawie
+  nikt, kto to zbuduje, takiego nie ma, a bez niego zostaje słowo autora i
+  wskaźnik locka. Korekcja, którą stosuje pętla, jest błędem, który przed chwilą
+  zaobserwowała, więc wielkość tych korekcji mówi, czy dyscyplinowanie działa — a
+  odniesieniem jest GPS, więc nie ma nic lepszego do porównania częstotliwości.
+  Firmware i tak liczyło te wartości i je wyrzucało.
+
+  Podaje RMS korekcji na oknach ostatnich **100, 1 000, 10 000 i 100 000
+  korekcji** — w jednostkach DAC oraz, gdy `CT` zmierzyło nachylenie oscylatora,
+  we względnej częstotliwości, wprost porównywalnej z liczbą z ADEV. Także stałe
+  odchylenie, niezerowe wtedy, gdy pętla nadąża za rzeczywistym dryfem, a nie za
+  szumem.
+
+  Okna liczą korekcje, a nie sekundy, bo tempo korekcji zależy od algorytmu:
+  algorytm 11 steruje raz na sekundę, algorytm 10 raz na `LIV`. Oznaczenie ich w
+  minutach znaczyłoby co innego przy jednym algorytmie i sześćdziesiąt razy tyle
+  przy drugim — ta sama liczba opisywałaby dwa różne przedziały. `CS` mierzy
+  rzeczywisty odstęp i wypisuje, ile okna aktualnie obejmują w czasie
+  rzeczywistym, żeby czytelnik nie musiał tego przeliczać. Przy jednej korekcji na
+  sekundę 100 000 pokrywa około 28 godzin.
+
+  To wagi wykładnicze, nie ostre okna: mniej więcej 63% wagi mieści się w N
+  korekcjach, a 95% w 3N. Kosztuje to cztery mnożenia z dodawaniem na korekcję i
+  zero pamięci, podczas gdy bufor na 100 000 próbek zająłby większość dostępnego
+  RAM-u, odpowiadając na to samo pytanie nie lepiej.
+
+  Liczone wyłącznie przy zalockowanej pętli i bez trwającej kalibracji: rampa
+  akwizycji, trzy skoki `CT` i przemiatanie `LC` to komendy, nie korekcje, a jedna
+  taka zdominowałaby średnią godzinną długo po tym, jak się skończyła. Algorytmy
+  0-9 nie mają stanu locka, na którym dałoby się oprzeć bramkę, więc są wykluczone
+  — i `CS` mówi to wprost, zamiast podawać liczbę bez określonego znaczenia.
+
+  **Zastrzeżenie jest w wyjściu, w nagłówku i w README:** mierzy, czy PĘTLA JEST
+  USTALONA, a nie czy WYJŚCIE JEST DOBRE. Zaszumiony detektor sprawia, że pętla
+  goni szum; korekcje rosną, `CS` wiernie je raportuje, a oscylator był w
+  porządku, dopóki pętla go nie popsuła. Nic mierzonego wewnątrz pętli tego nie
+  zobaczy.
+
+  Pomysł jest Alana (MIS42N z forum EEVblog), którego własna konstrukcja opiera
+  się dokładnie na tym i dlatego nie potrzebuje wzorca wtórnego.
+- **`GPSDO_DAC_EXT` — zewnętrzny przetwornik SPI, planowany, niezaimplementowany.**
+  Włączenie go daje celowo błąd kompilacji: `dac_ext.cpp` jest zaślepką bez
+  wybranego układu. 16-bitowe PWM daje około 50 µV na krok przy 3,3 V, blisko
+  2,7×10⁻¹¹ względnie na oscylatorze 5,3 Hz/V; układ 18-bitowy z odniesieniem
+  zaprojektowanym do tego zadania osiąga mniej więcej 17 µV, blisko 9×10⁻¹², bez
+  opóźnienia filtru w pętli.
+
+  Sprzętowe SPI nie jest potrzebne ani dostępne — SPI1 należy do TFT, a wszystkie
+  piny SPI2 w tej obudowie są zajęte — ale DAC zapisuje się raz na sekundę, więc
+  programowe kluczowanie kosztuje mikrosekundy. Proponowane piny PB0, PB2, PB4,
+  dobrane tak, by ominąć PB6/PB7: te wyglądają na wolne, ale są domyślnymi pinami
+  I2C1, które zajmuje `Wire.begin()`, a przetwornik tam rozwaliłby czujniki i
+  wyświetlacz zegarowy.
+
+### Zmienione
+- **Wszystkie 23 wywołania `analogWrite(PIN_VCTL_PWM, ...)` przechodzą teraz przez
+  `gpsdo_dac_write16()`.** Dodanie drugiej ścieżki wyjściowej przez edycję każdego
+  z osobna prosiłoby się o przeoczenie jednego, a przeoczone miejsce to najgorszy
+  rodzaj błędu tutaj: pętla sterowałaby poprawnie prawie zawsze i przeskakiwała
+  przy każdym trafieniu w starą ścieżkę. Dodanie przetwornika sprowadza się teraz
+  do wypełnienia jednej funkcji.
+
 ## [v1.01-rtos] — 2026-07-29
 
 > **Buduj rdzeniem STM32duino 2.12.0 lub starszym.** Rdzeń 3.0.0 (23 lipca 2026)
