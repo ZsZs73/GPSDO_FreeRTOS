@@ -2,7 +2,7 @@
  * gpsdo_health.cpp — correction statistics. See the header for what these
  * numbers mean and, more importantly, what they cannot mean.
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * Exponentially weighted rather than buffered: three time constants cost three
  * multiply-adds per second and no memory, where a ring buffer covering an hour

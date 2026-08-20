@@ -16,6 +16,538 @@ The version suffix `-rtos` marks the FreeRTOS port lineage.
 
 ---
 
+## [v1.05-rtos] — 2026-08-20
+
+Algorithm 12 made to work. It was shipped in v1.04 with the arithmetic right and
+five separate faults in the machinery around it, each of which hid the next. The
+loop now holds phase to 5–8 ns RMS over a 23-hour run with a single picDIV
+re-arm, against 10–23 ns for the best previous reference — and every fix below
+was simulated before it was flashed, because the two changes in this project that
+went out on reasoning alone were both wrong.
+
+### Fixed
+- **The noise estimator could only ever fall.** The outlier gate was
+  `dp_lim = 5*sigma`, read from the estimate it was feeding: once sigma was
+  small, every difference large enough to raise it was rejected as an outlier.
+  Measured on 14.08 — `sig` read exactly 2 ns for all 1020 samples of a run,
+  and with the per-level limits derived from it the hierarchy pinned at the
+  100-unit floor: 79 of 80 corrections fired at level 0. A multi-level
+  accumulator that never leaves level 0 is not one. The gate is now absolute
+  (300 ns), and the genuine outliers it existed to catch — differences taken
+  across a NOPH/SYNC/re-arm gap — are excluded structurally by a contiguity flag
+  instead of statistically. Sigma is floored at 5 ns, below which this detector
+  cannot honestly resolve.
+- **The frequency term had the wrong sign.** It carried `+polarity`, copied from
+  algorithm 11's frequency branch — but that branch reads TIM2, and this
+  firmware's own algo-11 comment records the hardware finding that TIM2 and the
+  LTIC detector have opposite orientation on this wiring. The slope `f_nss` is
+  not a TIM2 reading: it is the derivative of the same accumulator values that
+  produce the phase term, from the same sensor. A quantity and its own time
+  derivative, measured by one sensor, cannot need opposite feedback signs.
+  Alan's `cvPWM` agrees — it pushes phase and slope through one conversion and
+  adds them. With the plant measured rather than assumed (+319.5 µHz/LSB, from
+  regressing the 100 s mean of PWM against the printed 100 s frequency average,
+  correlation 0.999 at zero lag) the old sign worked out to `d(phase_rate) =
+  +0.4*f_ns`. That is positive feedback.
+- **`s_mla_wait` was never reset.** It appeared exactly twice in the file, at its
+  declaration and at the `++` in the give-up test, and never went back to zero.
+  So about five minutes into any run it passed 300 and the give-up test fired on
+  the same second the flag was raised — which killed both things that flag gates:
+  the zero-crossing correction and the suppression of new corrections while a
+  slew is still walking the phase home. The run that found it: `zc` = 7 in 76
+  minutes, all inside the first five, and 1072 of 1174 corrections exactly two
+  seconds apart, which is the bare level-0 cadence with nothing holding it back.
+  The zero-crossing mechanism had therefore never worked beyond the opening
+  minutes of any run since it was introduced.
+- **The FLL rescue was a bang-bang loop and could not have been anything else.**
+  Its step was `-f*lsb_per_hz*0.10` clamped to ±64, which saturates at
+  |f| = 0.256 Hz, while the gate below it only opened at 0.3 Hz — so the
+  proportional part could never act. Driven once a second from a 100 s average,
+  about 50 s of lag, that gives 64 LSB/s × 50 s = 3200 LSB of travel before the
+  measurement responds: 1.0 Hz of overshoot. Both numbers are in the logs
+  (462 of 655 consecutive steps exactly ±64; PWM sweeping 12 845 LSB; f100
+  swinging −1.29 to +1.55 Hz). It now applies the whole computed correction once
+  and holds off for as long as the average it came from needs to refresh, at two
+  speeds: the 10 s average while the error is large, the 100 s average once it is
+  small, with the hold-off always matching the window in use. The gate moved from
+  0.3 Hz to 0.05 Hz, because above 0.147 Hz the phase crosses the whole ±940 ns
+  detector band inside one 64 s horizon — the old gate left a dead zone from
+  0.147 to 0.3 Hz in which the phase loop could not get a long enough look and
+  the FLL considered its work done.
+- **`instant_offset` wrapped.** `FREQ_LOWER`/`FREQ_UPPER` admit ±500 Hz and the
+  field was `int8_t`, so anything past ±127 fed garbage to every gate that read
+  it. Now `int16_t`, in all three files that touch it — the struct, the cast that
+  fills it, and the snapshot that copies it. Fixing only one would have compiled
+  cleanly and left the wrap in place.
+- **The frequency and FLL branches took their sign from a hardcoded minus.**
+  Correct only because `LPOL` is −1 on this board; positive feedback on an
+  `LPOL +1` board. Both now take the board's `polarity`, which evaluates
+  identically here and correctly elsewhere.
+- **The dither wrote only one of its two DMA tables.** Double buffering
+  alternates every pass, so the other table — still holding the previous code —
+  replayed until the next write, and the output flipped between old and new code
+  at about 3 Hz (one pass is 2^(24−N) carrier periods = 167.8 ms however N is
+  chosen). A 0.8 Hz two-pole filter attenuates 3 Hz by only 14×. Both tables are
+  now filled, under a mutex, because `pwm24_write()` is reached from both
+  ControlTask and CliTask and two concurrent fills of one table interleave into a
+  torn 168 ms replay. Writing the table the DMA is reading is safe by overtaking:
+  the fill writes an entry every few microseconds where the DMA consumes one
+  every 81.9 µs.
+- **`PO` and `AO` could not be set to zero.** The range check was
+  `v >= −3000 && v <= 3000 && v != 0.0f`, so the one value a user is most likely
+  to want was the one value rejected. Ranges corrected to ±5000 Pa and ±3000 m,
+  and both now carry their units in the help and in the echo.
+
+- **The board did not always come up from cold, and the 3.3 V rail was never the
+  reason.** `ubx_poll_svin_nav()` called `vTaskDelay()` unconditionally. Its
+  sibling `ubx_poll_svin()` carries the guard and the comment explaining it —
+  *"before vTaskStartScheduler() this must not be vTaskDelay(): calling it with
+  no scheduler hangs the system"* — and the fix went into one of the two and not
+  the other.
+
+  Before the scheduler exists, `vTaskDelay()` writes through `pxCurrentTCB`,
+  which is still NULL, so the board takes a hard fault and the default handler
+  spins with interrupts off: no output, no watchdog, nothing but the reset
+  button. The FreeRTOS failure hooks added in v1.04 cannot catch it — they need
+  a running kernel.
+
+  It hid behind the call order in `gpsdo_gps_init()`: NAV-SVIN is polled only
+  when TIM-SVIN did not answer inside its 500 ms window. A receiver that is
+  already running answers, and the board boots — which is the case after a
+  reset, because the receiver keeps its own power. One still starting up does
+  not, and the board stops dead. That is the cold power-on case, and that
+  asymmetry is why this looked for a long time like a supply sagging as the rail
+  came up.
+
+  Found in a log with four consecutive boots, each ending after
+  `UBX: CFG-NAV5 ACK` and before `LEA-T: starting survey-in`, with the reset
+  cause reading `PIN/NRST` every time — the operator's button. The decoder
+  prints `POWER-ON/BROWN-OUT` and a "check the 3V3 rail" line when the supply is
+  at fault, and it never appeared once. A supply fault does not stop at the same
+  source line four times.
+- **The frequency digits did not follow algorithm 12's lock.** The colour logic
+  has an authoritative branch for loops that publish a live state, and algorithm
+  12 was not in the list — so it fell through to the frequency-average branch,
+  which is precisely what the comment above that branch says green must not be.
+
+  Measured over a 2.99 h run: the loop and the colour disagreed on **15.0%** of
+  samples, and every one of those was the loop LOCKED with the digits WHITE,
+  never the reverse. The loop reached LOCK at 108 s and the digits went green at
+  1041 s — fifteen minutes of a disciplined oscillator looking undisciplined, on
+  every run, because until the 1000 s average fills there is nothing for that
+  branch to judge by and `locked` is false by construction.
+
+  Algorithm 12 now takes its colour from its own trend, like 10 and 11. `CORR`
+  and `ZC` count as locked: they are one-second states meaning the loop is doing
+  its job, the same reasoning that keeps them from resetting `s_mla_quiet`.
+  Without that the digits would blink white once per correction — sixteen times
+  in the three hours measured. Agreement is now 100%.
+- **The stale-echo guard was set to half a count.** It withdraws a long-average
+  lock when the 10 s average has drifted, and the threshold was ±50 mHz. But the
+  10 s average is a cycle count over ten seconds, so its granularity is 0.1 Hz:
+  across three hours it took exactly three values — −100, 0 and +100 mHz — and
+  nothing between. A 50 mHz threshold therefore did not mean "within 50 mHz", it
+  meant "the counter must read exactly 10 000 000", and one count either way
+  killed the green. That is 8.3% of settled samples and 46% of the disagreement
+  above. Now ±0.15 Hz: one full count plus half a count of margin, so a
+  single-count wobble passes and a real loss of discipline — many counts, which
+  is what the guard exists for — still fails it. Algorithms 0-9 carry the same
+  guard and get the same fix.
+
+### Added
+- **A level gate on the frequency term.** The slope's own noise is
+  `sd(f_nss) = sigma * 2^((1−3L)/2)`, so at level 0 it is 1.41·sigma of pure
+  noise scaled by 12.5 LSB per ns/s, against the phase term's 0.39 LSB per ns —
+  a 32:1 noise-to-signal advantage for the wrong quantity. The log showed what it
+  bought: 46% of corrections slammed into the ±470 clamp, one of them with the
+  phase reading exactly 0 ns and the correction at full scale. The term is now
+  used from level 3 upward, where the same estimate is averaged over 16 s pairs
+  and is a measurement again.
+- **A TIM2 frequency trim.** When the 100 s average shows more than 0.03 Hz, the
+  correction's frequency component is taken from that measurement instead of the
+  accumulator slope. It is dormant in steady state — in a 10 h simulation it
+  never fired — and that is the point: it catches the frequency excursions that
+  would otherwise ramp the phase out of the detector band, so the loop never has
+  to re-acquire. The 23 h run that established the numbers above recorded a
+  single picDIV re-arm, against 121 for the same settings without it.
+- **`configUSE_MUTEXES` and `INCLUDE_xTaskGetSchedulerState`**, set explicitly.
+  The dither lock needs both, neither was set by this project, and whether the
+  library default enables them is not a thing to leave to chance: one missing
+  macro is a build error rather than a runtime surprise.
+- **The dither's low 8 bits now reach the loop.** v1.04 shipped the 24-bit
+  output and said, in this changelog, that it did not yet give the loop finer
+  steps: every algorithm called `gpsdo_dac_write16()`, which left-shifted into
+  the top 16 bits so existing settings kept their voltage, and the low byte was
+  always zero. It is not any more.
+
+  The fraction is owned by `gpsdo_dac.cpp`, not by the control loop, and that is
+  the whole design. The control value is written from 21 places — the `CT` and
+  `LC` sweeps, the acquisition ramps, holdover steering, `SP`, and the loop
+  itself — and twenty of them are deliberately coarse: a sweep that lands on
+  30720.4 instead of 30720 is not a better sweep, it is one whose reference point
+  nobody can state. Every coarse write clears the fraction as a side effect of
+  arriving at `gpsdo_dac_write16()`, so no caller has to remember to. Keeping the
+  fraction in the loop instead would have meant twenty places that each had to
+  know to reset it, which is the same class of bug the single write point was
+  introduced to prevent.
+
+  What it buys, on the plant measured here: one 16-bit step is about 320 µHz,
+  which is 3.2e-11 of 10 MHz — coarser than the 4e-12 the loop was measured
+  holding over 10 000 s. It reached that by dithering between adjacent codes from
+  one correction to the next, which works but leaves the control voltage hunting.
+  With the fraction kept, a correction smaller than one step is applied instead
+  of being truncated away, and the step becomes 1.25e-13.
+
+  The truncation it removes was also biased: `(int32_t)` rounds toward zero, so
+  every correction lost part of itself in the same direction — which reads to the
+  loop as a gain error of up to a sixth at the 6-LSB corrections seen in normal
+  operation.
+
+  Nothing above the DAC layer changed. `gpsdo_dac_last16()` still returns a plain
+  `uint16_t`, so the displays, the telemetry line and the flash ring see exactly
+  what they saw before, and the settings block still stores 16 bits: a restore
+  starts with a zero fraction and gives up at most 1.25e-13, which is below
+  anything this hardware can show.
+- **`DAC` — a command that says what the control voltage actually is.** The
+  output path, and for the dither its carrier frequency and table RAM; the code
+  in three views — 24-bit, the rounded 16-bit the displays and the flash ring
+  use, and the exact fractional value with its difference from the rounded one;
+  the measured Vctl; and the step size at both widths, in µHz and as a fraction
+  of 10 MHz. A 24-bit code that is not a multiple of 256 is the proof that the
+  fine path is driving the pin, which is why all three views are printed rather
+  than one, and the command says in as many words whether the fine path is
+  active or the output is rounding it away.
+
+  The step figures need the plant gain, which only `CT` can supply. Without it
+  the command says so, rather than printing a number derived from a default.
+  Listed in the tuner's Help tab as well.
+
+- **`MF` and `MFT` — the per-level limits get their own source, chosen
+  independently of the gain.** The two shared one `if`, so `MG 0` meant "gain
+  from CT **and** limits from the noise formula" and `MG > 0` meant "gain by
+  hand **and** limits by hand". There is no reason they should be welded: the
+  gain belongs to the OSCILLATOR — it is LSB per ns, and a different OCXO has a
+  different Vctl sensitivity — while the limits belong to the PHASE NOISE the
+  board sees, which is a property of the site and the receiver. "Measured gain,
+  hand-set limits", which is what a noisy installation wants, could not be
+  expressed at all.
+
+  `MF 0` follows `MG` as before and is the default, so nothing moves until
+  someone asks. `MF 1` holds the stored table, `MF 2` the noise formula, `MF 3`
+  the measured table below. Both settings live in three padding bytes the
+  algo-12 block already had, so the layout, the size and `SETTINGS_VER` are all
+  unchanged and an older stored block still loads — reading back as 0/0, which
+  is exactly the behaviour that build had.
+- **`MF 3` — per-level limits measured instead of extrapolated.** The formula is
+  `thr[L] = 8·σ·√(2^L)·√10`, and `√(2^L)` says the phase is WHITE, so that
+  averaging 2^L samples reduces the test by 2^(L/2). Measured on two boards of
+  this design — same PCB, same OCXO, different rooms — the exponent is **0.95
+  and 1.03**, not 0.50. Averaging buys almost nothing here, because what matters
+  is a slow wander (autocorrelation 0.96 at 60 s, 0.64 at 300 s) and not
+  sample-to-sample noise. The error compounds with level: the formula understates
+  the real spread about 5x at level 0 and over 100x at level 10, so its table
+  falls 32x across the hierarchy where the phase itself falls by 1.3x.
+
+  So the exponent is measured. Each level keeps the mean square of its own test
+  statistic, a least-squares fit of log2(sd) against level gives amplitude and
+  exponent together, and the table is built from the fit. Fitting ACROSS levels
+  rather than trusting each alone is what makes it usable early — level 8 is
+  evaluated once every 512 s and would need half a day to have a variance of its
+  own, but the low levels populate in minutes and the fit extrapolates.
+
+  Five hard-coded numbers leave with it: the 0.5 exponent, the `8.0` multiplier
+  (now the normal quantile for the false-fire rate `MFT` states, which is the job
+  the 8 was doing by hand — the hierarchy tests level 0 a thousand times more
+  often than level 10), the `√10` white-noise propagation, the 5 ns σ floor —
+  a property of this detector, not of the arithmetic — and the 100-unit floor.
+  What is left is one number with a physical meaning: how long between
+  corrections that noise alone triggered.
+
+  The exponent is clamped to [0.5, 1.0] and that is physics rather than taste.
+  Below 0.5 would mean averaging removes more than white noise allows; above 1.0
+  the spread is growing faster than flat-in-ns, which is a phase RAMP and not a
+  noisier board — and letting a ramp raise the threshold is the failure already
+  recorded in this file, where sigma climbed 165 → 746 ns and the loop froze.
+
+  Verified by replaying the firmware's own arithmetic over both boards' records:
+  the workshop table comes out at 74 ns falling to 14, which is where that board
+  was set by hand after auto proved unstable, and the home board reproduces its
+  own settled behaviour. On a three-hour run the home board fitted **α = 1.00**
+  and corrected at levels 5 to 9 — the first time this hierarchy has used more
+  than one or two of its levels.
+
+  **It is not automatically better.** On the home board, where the formula's
+  much tighter table happened to suit a quiet site, the measured table doubles
+  the phase RMS (11.6 ns median against 5.5 ns over the same window length)
+  because it corrects a third as often. The two tables ask different questions —
+  the formula asks whether a deviation is above the measurement noise, the
+  measured table whether it is unusual for this board — and which one is right
+  depends on the site. That is what `MF` is for.
+
+### Changed
+- `LOCK` in the trend field now means the hierarchy is quiet **and** the TIM2
+  frequency is within 0.05 Hz, counted on consecutive quiet seconds rather than
+  on `s_mla_count`, which resets at every correction and was a poor proxy for
+  "how long since anything happened".
+- **`GPSDO_PWM_DITHER` is on in the shipped configuration.** It went out in
+  v1.04 switched off, while the output path was still being proven; with the
+  fine path closed and a 23-hour run behind it, off is no longer the honest
+  default. Commenting it out still falls back to the plain 16-bit PWM, and the
+  pin, filter and wiring are the same either way.
+- **The 320×240 panel's field arrangement now matches the 480×320's.** This
+  manual has said since v0.93 that the operating screen is authored once and
+  scaled, and that was true of the geometry and not of the content: the two
+  panels had drifted apart field by field. qErr moved up to the Alt row, beside
+  the fix data it belongs to; AHT and the phase field swapped columns, so the
+  environmental sensors share the left column and the electrical ones the right;
+  Vcc and Vdd now share the row that freed up. The small panel shows everything
+  the large one does.
+
+  Every field that combined a label with a varying-width value was split in two.
+  A single right-anchored string pins the unit and drags the label sideways as
+  the digits change width — visible on qErr as a label that moved once a second.
+  Label and value are now separate slots with separate padding: the label holds
+  the column's left edge, the value keeps the right-hand anchor, and only the gap
+  between them changes. Same for `dph` and for the INA current.
+- **Font 2 is proportional, and this layout had been arithmetic'd at 8 px per
+  character.** Checked against the library's own width table, that overstates the
+  small panel's strings by about a fifth — `Vph:1.951V` measures 70 px, not 80.
+  The error was not academic: it is what had cost the `dph` label, and what had
+  kept Vcc at two decimals where the 480 shows three. Both are back. The
+  right-hand fields now share one alignment line at x=314 — the one Vdd was
+  already anchored to — so qErr, dph, the INA current and Vdd form a column
+  instead of four near-misses. Each field's padding is now the measured width of
+  its own widest form rather than of today's reading, and the paddings in a row
+  tile it exactly, so no background fill can erase a neighbour's edge.
+
+### Credits
+- **Alan Cashin** (MIS42N on the EEVBlog forum) is now credited where the work is
+  his: in `V`, in the help header, on the tuner's About screen, and in the
+  credits table of all three manuals. Algorithm 12, the zero-crossing
+  correction, the dithered PWM and the `CS` self-assessment idea all come from
+  his Budget GPSDO. He had been thanked for "dither / DAC discussion", which
+  understated it considerably.
+
+### Measured
+Twenty-three hours, automatic thresholds, `MR 9`, dither at 13 bits:
+
+| | this run | best previous |
+|---|---|---|
+| phase RMS, settled | **5–8 ns** | 10–23 ns |
+| \|phase\| < 10 ns | **86.7%** of samples | — |
+| picDIV re-arms | **1** | 121 |
+| correction levels reached | **5–6 typical, up to 8** | 0 |
+| 10 000 s frequency | **4e-12** | 1.4e-11 |
+| interval between corrections | 254 s | 130 s |
+
+`NOPH` three times in 82 572 samples; `FLL` once. Ambient pressure fell 4 hPa
+across the run and the loop did not react.
+
+---
+
+## [v1.04-rtos] — 2026-08-11
+
+### Added
+- **`GPSDO_PWM_DITHER` — 24-bit control voltage from a dithered short PWM.**
+  Idea from Alan Cashin (MIS42N): run the PWM at fewer bits than you need and
+  vary the duty from period to period so the average carries the rest.
+
+  The gain is the CARRIER, not the extra bits. Ripple has to be filtered below one
+  output step, and how hard that is depends on the gap between carrier and filter
+  corner: the 16-bit PWM at 2 kHz allows a 0.7 Hz corner and a 230 ms time
+  constant, while 13-bit dithering at 12.2 kHz allows 4.2 Hz and 38 ms. Filter
+  delay goes straight into the loop as phase lag, so a six-fold shorter filter is
+  worth more than the resolution.
+
+  Alan dithers in a timer interrupt because a PIC has no DMA. That would be 12 000
+  interrupts a second here, competing with the 1PPS capture — the one interrupt
+  that must not be delayed. But the pattern for a constant value is periodic, so
+  it is computed once into a table and replayed by DMA into the compare register:
+  0.012% CPU at 13 bits, and none of it in an interrupt. The average is exact by
+  construction — the table holds exactly Y entries of X+1 among 2^(24-N).
+
+  Same pin as before (PB9, TIM4 CH4), so the existing filter and wiring are
+  unchanged. TIM4_UP drives DMA1 Stream 6 Channel 2; the 2 Hz tick is on TIM9 and
+  the 1PPS chain on TIM2/TIM3, so nothing else is disturbed. Two buffers in
+  hardware double-buffer mode mean a value change never glitches the pin.
+
+  Off by default. Costs 8 KB of RAM at 13 bits, 16 KB at 12.
+
+  **What this does not yet do** is give the loop finer steps: every algorithm
+  calls `gpsdo_dac_write16()`, which left-shifts into the top 16 bits so existing
+  settings keep their voltage. The low 8 bits wait for a loop that calls
+  `gpsdo_dac_write24()`.
+- **Zero-crossing correction, from Alan's flowchart.** After a limit correction
+  changes the frequency, the phase keeps moving in the direction it was already
+  going: it sweeps through zero, out the other side, and usually fails the limit
+  again — so the loop corrects, overshoots, corrects back, and settles slowly.
+
+  The instant the phase crosses zero is special. The phase error is nil, but the
+  frequency error that carried it there is still present; cancelling the frequency
+  error exactly then leaves the oscillator with the right frequency AND no phase
+  error, rather than a state the loop has to iterate towards.
+
+  Measured against Alan's own logs from the same design: his loop corrects every
+  506 seconds where this one corrected every 130. Most of that gap is this test,
+  which he describes as essential and which was missing here.
+
+  Reported as `zc=` in telemetry, trend shows `ZC` at the moment it fires.
+- **FreeRTOS failure hooks and a project-local `STM32FreeRTOSConfig.h`.**
+  `configCHECK_FOR_STACK_OVERFLOW` and `configUSE_MALLOC_FAILED_HOOK` both
+  default to 0, so a blown task stack silently corrupts a neighbour and
+  `configASSERT` traps in a `for(;;)` with interrupts off — a dead white panel
+  with nothing on the console. That is exactly how the last three faults
+  presented: a CLI stack too small for the flash ring write, a NULL event group
+  read before the scheduler started, and a struct declared in a dead branch that
+  still grew the display task's frame.
+
+  The override turns both hooks on and redefines `configASSERT` to print the file
+  and line before trapping. The hooks name the offending task on the USB console
+  and blink the LED, so the next one identifies itself in seconds rather than
+  hours. Bare `Serial`, not `OUT_SERIAL`: a hook must not touch a mutex or a
+  Bluetooth stream that may itself be the thing that failed.
+
+  Credit to GLM-5.2 for writing this while the white-screen fault was being
+  chased; it is adopted here essentially as written.
+- **Algorithm 12 — multi-level accumulator.** After Alan Cashin's (MIS42N on
+  EEVblog) Budget GPSDO. Every other loop here has one time constant, and that is
+  a compromise nobody wins: measured against a rubidium reference, `LTC 60` is up
+  to 1.58x better past 800 s while `LTC 240` is up to 1.44x better between 10 and
+  400 s. This one does not choose. Readings accumulate into levels — level n
+  covering 2^n seconds — and a correction fires at the **lowest** level whose
+  error exceeds its limit, so a large error acts within two seconds and a small
+  one waits for a longer average. There is no `LTC` to set.
+
+  The levels come out of the bit pattern of the seconds counter rather than an
+  array of buffers: eleven levels, 2 s to 2048 s, for 22 bytes.
+
+  **Input is phase in nanoseconds from the LTIC detector.** The first attempt fed
+  the TIM2 count error in whole hertz and was blind — a disciplined oscillator
+  sits far below 1 Hz, so the field read zero in 83% and 95% of samples across two
+  runs and nothing ever accumulated. Phase integrates where a one-second frequency
+  count does not. Alan asked why 100 ns had been quoted when a TIC resolves 1 ns;
+  he was right, that was the counter's resolution, not the detector's. Boards with
+  no detector integrate the count into a phase estimate themselves.
+
+  **The frequency test is gone**, on Alan's own advice: *"It was an experiment...
+  what we want is a stable system where the tests always pass. So the frequency
+  test is unnecessary."*
+
+  New commands `MG`, `MR`, `MLP` and `ML`, saved with `ES ALGO12`. The per-level
+  limits are runtime-editable and persisted because only **one** was ever derived
+  — 125 ns at 128 s, from the original 10 MHz ±0.01 Hz specification. Alan calls
+  the rest arbitrary, so there is nothing to reproduce faithfully beyond that
+  anchor, and every board will want its own.
+- **Reset-cause reporting at boot.** `RCC->CSR` is read and decoded before
+  anything else runs, so an intermittent restart no longer looks identical whether
+  it came from a brown-out, the reset pin or a software reset. Added after a board
+  rebooted repeatedly at the same point in GPS configuration with no way to tell
+  which.
+
+### Fixed
+- **Algorithm 12's thresholds are now measured, not inherited.** They were taken
+  from Alan's design and scaled by the ratio of counter step sizes, which is the
+  wrong quantity: what a threshold must clear is the NOISE on the phase
+  measurement, and that differs between builds for reasons a step size does not
+  capture. Measured on this board: mean phase -1 ns with a standard deviation of
+  462 ns — the oscillator was correctly tuned and all of that spread was noise,
+  while the level-0 threshold sat at 462 ns. 41% of samples crossed it. 620
+  corrections in 1685 seconds, the hierarchy resetting every 2.7 s and never
+  reaching level 2.
+
+  The firmware now estimates the phase noise continuously and sets each level's
+  threshold from it. A second error surfaced doing so: the threshold applies to
+  the test expression |3b - a|, whose deviation is sigma*sqrt(2^L)*sqrt(10), not
+  to the mean phase, whose deviation is sigma/sqrt(N). Using the latter made the
+  threshold 4.5x too low at level 0 and worse above. Six sigma on the correct
+  quantity brings the correction interval to about a minute, against the 256 s
+  Alan's design settles into.
+
+  `ML` reports the measured noise and whether the limits are following it.
+  Telemetry carries it as `sig=`. Setting `MG` above zero holds the stored table
+  instead, for anyone who would rather tune by hand.
+- **The tuner stopped reading anything back from the board.** `STATE_HINT` was
+  added to `TelemetryParser` but referenced as `self.STATE_HINT` from
+  `GpsdoTuner` — a different class. Every telemetry line then raised
+  `AttributeError` inside the line handler, so no reply ever reached its absorber
+  and the LL calibration fields and the algo-12 limit table both stayed empty.
+  Two symptoms, one crash.
+
+  The handler is now wrapped: a parse failure costs one line and prints to the
+  monitor, rather than silently killing reception. That the fault presented as two
+  unrelated parsing bugs, and was only found because the console traceback was
+  quoted, is the argument for the wrapper.
+
+- **`MG` and `LG` both answered `gain=`.** The Lars absorber runs first in the
+  line handler and matched the algo-12 reply, returning before it could reach the
+  algo-12 boxes. The firmware now answers `m_gain=` and `m_run_level=`, so the two
+  command sets no longer share field names.
+- **The tuner's algo-12 limit table showed zeros.** It was never read back: the
+  parameter query asked for the scalars only, so the eleven spin boxes sat at zero
+  until somebody typed in them — and pressing Send would then have written eleven
+  zeros over a table the firmware had defaults for. A control that displays a
+  value the device does not hold is worse than one that displays nothing.
+
+  The table is now read on connect, `MLP n` with no value prints its setting, and
+  Send refuses while any row is still zero. `MLP` and `ML` also print the phase
+  threshold each limit represents alongside the raw accumulator value — the raw
+  number is what you set, the nanoseconds are what it means, and only the latter
+  can be compared against a scope.
+- **Algorithm 12 ignored the detector polarity and confused nanoseconds with
+  hertz.** Two faults in the same conversion, found together from one log.
+
+  `LPOL -1` was not applied at all — algorithm 11 multiplies its phase term by
+  `-polarity` and this did not — so on such a board every correction went the
+  wrong way. And the average phase, in nanoseconds, was multiplied by LSB-per-hertz
+  as though the two were the same quantity: nulling P ns over T seconds needs
+  P/(100*T) Hz at 10 MHz, so the correction came out 100*T times too large, from
+  200x at level 0 to 102400x at level 9. Every correction hit the +/-2000 clamp.
+
+  Positive feedback four orders of magnitude too strong is a fair description of
+  what the log showed: 6000 counts of PWM swing over 148 corrections.
+
+- **`MG` and `MR` were accepted and stored but never read.** The commands worked,
+  the tuner sent them, `ML` listed them back, and the algorithm used neither — a
+  hand-set gain did nothing and the forced-correction level did not exist. Both
+  are now wired: `MG` overrides the CT-derived scale in LSB per ns, and `MR`
+  forces a correction once its level is reached, whatever the limits say, which is
+  what stops a drift slow enough to stay under every limit from accumulating
+  forever.
+- **Algorithm 12 now requires the LTIC detector, and holds instead of guessing.**
+  It was written to fall back to integrating the TIM2 count error on boards with
+  no detector. That fallback was actively destructive: the count is quantised to
+  whole hertz and reads zero on a disciplined oscillator, so integrating it
+  produced a random walk of quantisation noise rather than phase. The walk crossed
+  a level limit, a correction fired and hit the clamp, the oscillator was thrown
+  far enough to rail the detector, and railing kept the fallback running.
+  Measured: 6000 counts of PWM swing across 148 corrections with the detector
+  railed 58% of the time and the reported phase stuck at 0 throughout.
+
+  `LA 12` now refuses without `GPSDO_LTIC`, and when the detector is fitted but
+  not reading — railed, saturated or not yet armed — the algorithm holds and lets
+  the picDIV bridge do its work. A silent fallback that destroys the lock is worse
+  than refusing to run.
+- **Algorithm 12 now arms the picDIV.** It did not, and the failure was silent:
+  with the ramp railed the detector never returns a valid reading, so the code
+  fell through to integrating the count error and the algorithm was blind again —
+  the very thing moving to the detector was meant to fix, with nothing in the
+  telemetry to say so. Same hold-off bridge as algorithm 11.
+- **Algorithm 12 could be selected but never persisted.** `LA` gained a branch for
+  12, but `settings_recall` still clamped the stored value to `<= 11`, so the
+  setting saved correctly and was silently dropped on the next boot — which looks
+  like the flash ring failing rather than a stale constant in the recall path.
+- **White screen at boot.** The algorithm-12 telemetry declared a stats struct
+  inside `print_human_report()`, which runs in the display task. A stack frame is
+  sized at compile time, so a struct in a branch that never executes still
+  reserves its space on every call; twenty bytes took the display task over its
+  stack and it died before `tft.init()`. Now static.
+
+### Changed
+- **`SETTINGS_VER` 4 → 5** for the algo-12 block, **with migration**. A v4 block is
+  accepted, its fields applied, and the algo-12 values left at defaults. Rejecting
+  it outright would have discarded a working PID, LC and timezone because a new
+  algorithm was added.
+
 ## [v1.03-rtos] — 2026-08-01
 
 Built on v1.01. The v1.02 experiments — a sigma-delta DAC on PB5 and support for

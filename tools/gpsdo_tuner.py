@@ -27,6 +27,13 @@ visualiser are new here.
   Original logger .............. lucido
   GPSDO_FreeRTOS firmware ...... J. M. Niewiński (jmnlabs), from André Balsa's
                                  v0.06c Arduino GPSDO
+  Algorithm 11 (continuous PI) . the late Lars Walenius
+  Algorithm 12 (multi-level) ... Alan Cashin (MIS42N on EEVblog), whose Budget
+                                 GPSDO is also the origin of the zero-crossing
+                                 correction, the dithered PWM and the CS
+                                 self-assessment idea. The Multi-level (algo 12)
+                                 tab drives his design, so his name belongs on it.
+  Measurements, algos 10 & 11 .. Dan Wiering (rubidium reference)
   This tuning tool ............. built for the jmnlabs GPSDO project
 
 Dependencies:  pip install pyserial pyqtgraph PySide6
@@ -47,7 +54,7 @@ import math
 # against newer firmware silently mis-parses telemetry and writes commands the
 # board no longer understands, which is a confusing way to lose an evening.
 # Bump this whenever the firmware version changes, even if nothing here moved.
-TOOL_VERSION = "1.03"
+TOOL_VERSION = "1.05"
 from collections import deque, defaultdict
 
 # Force pyqtgraph to use the same Qt binding as the rest of this file (PySide6).
@@ -70,6 +77,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
         QDoubleSpinBox, QSpinBox, QTabWidget, QGroupBox, QSplitter, QCheckBox,
+        QScrollArea,
         QMessageBox,
     )
     from PySide6.QtGui import (QFont, QPainter, QPen, QColor, QLinearGradient,
@@ -157,6 +165,12 @@ PLOT_SERIES = {
              ("Vphase", "Detector Vphase (V) — ramp position",    "#2277cc")],
     "pid":  [("drift",  "Learned drift (LSB) — LRN feed-forward", "#22aa44"),
              ("Vctl",   "Control voltage Vctl (V)",               "#2277cc")],
+    # Algorithm 12 does not use the self-learning feed-forward, and its phase
+    # comes straight from the detector rather than through a loop filter, so
+    # neither pair above describes it. The top pane shows the phase it is
+    # actually accumulating.
+    "mlacc": [("ph",     "Phase error (ns, LTIC detector)",        "#22aa44"),
+              ("Vctl",   "Control voltage Vctl (V)",               "#2277cc")],
 }
 
 # Algorithm 11 (LTIC-Lars) parameters: verb -> (label, lo, hi, decimals).
@@ -189,6 +203,42 @@ LARS_FIELD_NAMES = {
     "LTR": "temp_ref",
 }
 
+# Algorithm 12 (multi-level accumulator, after Alan Cashin) parameters:
+# verb -> (label, lo, hi, decimals). The per-level limit table (MLP/MLS) is
+# 22 values and is edited via CLI (ML lists it); only the scalar tuning is
+# exposed as spinboxes here. Saved by ES ALGO12. gain is board-specific.
+MLACC_PARAMS = {
+    "MG":  ("gain (LSB/ns)", 0.0, 10000.0, 3),
+    "MR":  ("run level",     0.0,    10.0, 0),
+    # Limit source and its one parameter. Kept beside the gain in the GUI but
+    # deliberately separate from it in the firmware: the gain is a property of
+    # the oscillator (LSB per ns, so it changes with Vctl sensitivity) and the
+    # limits are a property of the phase noise the board sees.
+    "MF":  ("limits 0-3",    0.0,     3.0, 0),
+    "MFT": ("target s",      0.0, 65535.0, 0),
+}
+
+# Per-level phase limits, in nanoseconds. Eleven levels spanning 2 s to 2048 s;
+# only one was ever derived — 125 ns at 128 s, from the original 10 MHz +/-0.01 Hz
+# specification — and Alan describes the rest as arbitrary. They are exposed for
+# editing because they are the thing most likely to need changing per oscillator.
+MLACC_LEVEL_SECS = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+
+# Firmware prints each algo 12 scalar as "<field>=<value>" when queried with
+# no argument. Map that field name back to the verb so the readback lands in
+# the right spinbox. Field names match the firmware's cli_puts() strings.
+# Prefixed, because algorithm 11 answers LG with "gain=" too. Without the prefix
+# the Lars absorber — which runs first — swallowed the reply to MG and returned,
+# so the algo-12 boxes never filled and neither did anything after them in the
+# same pass. Two commands answering to the same field name is a trap worth
+# avoiding rather than ordering around.
+MLACC_FIELD_NAMES = {
+    "MG":  "m_gain",
+    "MR":  "m_run_level",
+    "MF":  "m_thr_src",
+    "MFT": "m_thr_tgt",
+}
+
 
 # ------------------------------------------------------------------------------
 # Telemetry parser
@@ -204,7 +254,11 @@ class TelemetryParser:
 
     # Live telemetry fields -> label used on plots / spin boxes
     LIVE_FIELDS = ["Vphase", "Vctl", "dph", "qErr", "PWM", "drift", "damp",
-                   "scale", "phase"]
+                   "scale", "phase",
+                   # Algorithm 12: the phase it accumulates (ns), which level
+                   # last acted, and the cumulative correction count.
+                   # All three come from the Learn line.
+                   "ph", "level", "corr", "arm", "sig", "zc"]
 
     def extract(self, line, name):
         """Return the first number following `name` on the line, or None.
@@ -214,11 +268,38 @@ class TelemetryParser:
         m = re.search(pattern, line, re.IGNORECASE)
         return float(m.group(1)) if m else None
 
+    # What each loop state means, shown beside the label so the reader does not
+    # have to know the firmware. Algorithm 12 has its own vocabulary: it holds in
+    # several distinct ways and saying which one matters when nothing is moving.
+    STATE_HINT = {
+        "LOCK":   "locked",
+        "DPLL":   "phase tracking",
+        "PLL":    "phase tracking",
+        "ACQ":    "acquiring",
+        "SURVEY": "survey-in",
+        "WARMUP": "OCXO warming",
+        "HOLD":   "holdover",
+        "CORR":   "correction applied",
+        "NOPH":   "holding - detector not reading",
+        "NoCT":   "holding - run CT first",
+        "NoLT":   "algo 12 needs the LTIC detector",
+        "WAIT":   "waiting for frequency data",
+    }
+
     def parse_state(self, line):
-        """Loop state from the PWM/Vctl telemetry line, e.g. '... LOCK'."""
+        """Loop state from the PWM/Vctl telemetry line, e.g. '... LOCK'.
+
+        The algorithm-12 states were missing here, so parse_state returned None
+        for them and the display kept showing whatever it had last recognised —
+        the telemetry said NOPH while the tuner still read ACQ. A state the
+        firmware can report and the tuner cannot name is worse than no state at
+        all, because it looks like information.
+        """
         # DPLL must be tested before PLL: "DPLL" contains "PLL", and \b would
-        # otherwise let the shorter algo-11 label match an algo-10 line.
-        for st in ("LOCK", "DPLL", "PLL", "ACQ", "SURVEY", "WARMUP", "HOLD"):
+        # otherwise let the shorter algo-11 label match an algo-10 line. NoCT and
+        # NoLT differ only in one letter, so both are listed explicitly.
+        for st in ("LOCK", "DPLL", "PLL", "ACQ", "SURVEY", "WARMUP", "HOLD",
+                   "NOPH", "NoCT", "NoLT", "CORR", "WAIT"):
             if re.search(r"\b" + st + r"\b", line):
                 return st
         return None
@@ -377,7 +458,10 @@ class GpsdoTuner(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"GPSDO Tuner v{TOOL_VERSION} — live tuning & phase visualisation")
-        self.resize(1280, 820)
+        # Fit a 1366x768 laptop panel with room for the taskbar, rather than
+        # assuming a desktop monitor. showMaximized() below takes whatever is
+        # actually available.
+        self.resize(1180, 700)
 
         self.parser = TelemetryParser()
         self.worker = SerialWorker()
@@ -424,6 +508,19 @@ class GpsdoTuner(QMainWindow):
         split.addWidget(self._build_control_tabs())
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
+        # Stretch factors alone are advisory — they divide the SPARE space, not
+        # the total. Give the splitter explicit starting sizes as well, or a wide
+        # tab still claims more than its share on the first show.
+        # Proportional, not absolute. Fixed sizes of 1100 + 620 add up to 1720,
+        # which on a 1366-wide screen made Qt report a minimum the display could
+        # not satisfy — "Unable to set geometry ... minimum size: 1383x363". The
+        # panes are told to take three fifths and two fifths of whatever the
+        # window actually has, and both are allowed to shrink; the tabs scroll if
+        # their content will not fit, which is what the scroll areas are for.
+        split.setSizes([600, 400])
+        split.setChildrenCollapsible(True)
+        for i, w in enumerate(( 400, 260)):
+            split.widget(i).setMinimumWidth(w)
         outer.addWidget(split, 1)
 
         outer.addLayout(self._build_command_row())
@@ -531,13 +628,27 @@ class GpsdoTuner(QMainWindow):
 
     def _build_control_tabs(self):
         tabs = QTabWidget()
-        tabs.addTab(self._tab_ltic(), "LTIC (algo 10)")
-        tabs.addTab(self._tab_lars(), "LTIC-Lars (algo 11)")
-        tabs.addTab(self._tab_fa(), "FA damping")
-        tabs.addTab(self._tab_pid(), "PID algo 3-9")
-        tabs.addTab(self._tab_cal(), "Calibration")
+        # Every tab goes inside a scroll area. A QSplitter will not shrink a pane
+        # below its content's minimum size hint, so one crowded tab silently sets
+        # the width of the whole right-hand panel and the plots lose the space —
+        # which is exactly what the algo-12 limit table did. Wrapped like this, a
+        # tab that does not fit scrolls instead of pushing.
+        def scrolled(widget):
+            sa = QScrollArea()
+            sa.setWidget(widget)
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QScrollArea.Shape.NoFrame)
+            sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            return sa
+
+        tabs.addTab(scrolled(self._tab_ltic()), "LTIC (algo 10)")
+        tabs.addTab(scrolled(self._tab_lars()), "LTIC-Lars (algo 11)")
+        tabs.addTab(scrolled(self._tab_algo12()), "Multi-level (algo 12)")
+        tabs.addTab(scrolled(self._tab_fa()), "FA damping")
+        tabs.addTab(scrolled(self._tab_pid()), "PID algo 3-9")
+        tabs.addTab(scrolled(self._tab_cal()), "Calibration")
         tabs.addTab(self._build_monitor(), "Raw monitor")
-        tabs.addTab(self._tab_help(), "Help")
+        tabs.addTab(scrolled(self._tab_help()), "Help")
         return tabs
 
     def _spin(self, lo, hi, dec, step):
@@ -638,6 +749,154 @@ class GpsdoTuner(QMainWindow):
         g.setRowStretch(row + 1, 1)
         return w
 
+    def _tab_algo12(self):
+        """Algorithm 12 (multi-level accumulator, after Alan Cashin).
+
+        Two scalars and an eleven-row limit table. The Lars tab lays its nine
+        parameters out three to a row, which suits nine; with only two the same
+        grid stretches each cell across half the window and the Set buttons come
+        out enormous. So the scalars go in a fixed-width row here, and the space
+        that frees is given to the limit table — which is the thing most likely
+        to need changing per oscillator, and which previously had no GUI at all.
+        """
+        w = QWidget()
+        g = QGridLayout(w)
+        row = 0
+        title = QLabel("Algorithm 12 — multi-level accumulator (after Alan Cashin, MIS42N)")
+        title.setStyleSheet("font-weight:bold;")
+        g.addWidget(title, row, 0, 1, 6); row += 1
+
+        # ---- scalars, side by side, not stretched -------------------------
+        self.algo12_boxes = {}
+        sc = QHBoxLayout()
+        for verb, (label, lo, hi, dec) in MLACC_PARAMS.items():
+            cell = QVBoxLayout()
+            lab = QLabel(label)
+            cell.addWidget(lab)
+            box = self._spin(lo, hi, dec, 0.1 if dec else 1.0)
+            box.setMaximumWidth(110)
+            self.algo12_boxes[verb] = box
+            cell.addWidget(box)
+            btn = QPushButton("Set")
+            btn.setMaximumWidth(110)
+            btn.clicked.connect(lambda _, v=verb: self.apply_algo12_param(v))
+            cell.addWidget(btn)
+            holder = QWidget(); holder.setLayout(cell)
+            holder.setMaximumWidth(120)
+            sc.addWidget(holder)
+        sc.addStretch(1)          # keep the cells at their natural width
+        scw = QWidget(); scw.setLayout(sc)
+        g.addWidget(scw, row, 0, 1, 6); row += 1
+
+        # ---- per-level phase limits ---------------------------------------
+        lt = QLabel("Phase limits per level (ns) — a correction fires at the "
+                    "lowest level whose error exceeds its limit")
+        lt.setWordWrap(True)
+        g.addWidget(lt, row, 0, 1, 6); row += 1
+
+        # Two columns, not four. Each cell is a label plus a spin box, and at four
+        # across the tab demanded about 770 px — more than the splitter would give
+        # the right-hand panel, so the plots were squeezed to a third of the window.
+        # A splitter cannot shrink a pane below its minimum size hint, so the tab
+        # content has to be narrow rather than the splitter told to be firmer.
+        # The per-row Set buttons are gone too: one button sends the whole table,
+        # which is what you want after adjusting several rows anyway.
+        self.algo12_lim = {}
+        lim = QGridLayout()
+        lim.setHorizontalSpacing(14)
+        lim.setVerticalSpacing(2)
+        for i, secs in enumerate(MLACC_LEVEL_SECS):
+            gr, gc = divmod(i, 2)
+            tag = QLabel(f"{secs}s")
+            tag.setMinimumWidth(38)
+            tag.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            box = self._spin(0.0, 500000.0, 0, 500.0)
+            box.setMaximumWidth(84)
+            self.algo12_lim[i] = box
+            lim.addWidget(tag, gr, gc * 2)
+            lim.addWidget(box, gr, gc * 2 + 1)
+        lim.setColumnStretch(4, 1)
+        limw = QWidget(); limw.setLayout(lim)
+        g.addWidget(limw, row, 0, 1, 6); row += 1
+
+        # ---- actions -------------------------------------------------------
+        acts = QHBoxLayout()
+        read12 = QPushButton("Read all")
+        read12.clicked.connect(self.read_algo12_params)
+        acts.addWidget(read12)
+        setlim = QPushButton("Send limits")
+        setlim.clicked.connect(self.apply_algo12_limits)
+        acts.addWidget(setlim)
+        listb = QPushButton("List (ML)")
+        listb.clicked.connect(lambda: self.worker.send("ML"))
+        acts.addWidget(listb)
+        saveb = QPushButton("Save (ES ALGO12)")
+        saveb.clicked.connect(lambda: self.confirm_send(
+            "ES ALGO12", "Save algo-12 parameters to the flash ring?"))
+        acts.addWidget(saveb)
+        acts.addStretch(1)
+        actw = QWidget(); actw.setLayout(acts)
+        g.addWidget(actw, row, 0, 1, 6); row += 1
+
+        note = QLabel(
+            "Input is phase in nanoseconds from the LTIC detector, which is "
+            "required — there is no fallback. gain=0 "
+            "takes the scale from the CT calibration. run level forces a "
+            "correction when reached, whatever the limits say. There is no time "
+            "constant to set: the error picks its own averaging time.\n"
+            "UNTUNED — only the 128 s limit was ever derived (125 ns, from "
+            "10 MHz +/-0.01 Hz); Alan describes the rest as arbitrary.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{theme_colours(w)['muted']}; font-size:11px;")
+        g.addWidget(note, row, 0, 1, 6); row += 1
+
+        g.setRowStretch(row, 1)
+        return w
+
+    def absorb_algo12_limit(self, line):
+        """Fill one limit box from 'lim[6]=32350 (126 ns over 128s)'."""
+        # Two formats reach here, because MLP and ML print differently:
+        #   MLP n  ->  "lim[6]=32350 (126 ns over 128s)"
+        #   ML     ->  "     6:   128s    32350 =  126 ns"
+        # Matching only the first meant the ML reply — the one the tuner sends on
+        # connect — filled nothing, and the table stayed at zeros.
+        m = re.search(r"\blim\[(\d+)\]\s*=\s*(\d+)", line)
+        if m:
+            level, val = int(m.group(1)), int(m.group(2))
+        else:
+            m = re.match(r"\s*(\d+):\s*\d+s\s+(\d+)\s*=\s*-?\d+\s*ns", line)
+            if not m:
+                return False
+            level, val = int(m.group(1)), int(m.group(2))
+        box = self.algo12_lim.get(level)
+        if box is None:
+            return False
+        box.blockSignals(True)
+        box.setValue(float(val))
+        box.blockSignals(False)
+        return True
+
+    def apply_algo12_limits(self):
+        """Send the whole limit table, one MLP per level.
+
+        One button rather than eleven: after changing a limit you almost always
+        want to change its neighbours too, and eleven Set buttons cost the width
+        that the plots need.
+        """
+        vals = {lv: int(b.value()) for lv, b in self.algo12_lim.items()}
+        if any(v < 1 for v in vals.values()):
+            # Zero means "never read back", not "set this to zero". Sending it
+            # would be eleven rejected commands, or worse on a firmware that
+            # accepted it.
+            QMessageBox.information(
+                self, "Limits not read",
+                "Some rows are still zero, which means the table has not been "
+                "read from the board yet.\n\nPress \u201cRead all\u201d first, "
+                "then adjust and send.")
+            return
+        for level in sorted(vals):
+            self.worker.send(f"MLP {level} {vals[level]}")
+
     def _tab_help(self):
         """Command reference, grouped the way the firmware's own H output is.
         Kept in sync with gpsdo_cli.cpp — if a verb changes there, change it
@@ -687,8 +946,26 @@ class GpsdoTuner(QMainWindow):
             ]),
             ("Discipline mode", [
                 ("MH / MD",     "Mode holdover / mode disciplined"),
-                ("LA <0-11>",   "Loop algorithm select. 10 = LTIC 3-stage, 11 = LTIC-Lars"),
-                ("SP <n>",      "Set the PWM DAC directly (1-65535) — manual override"),
+                ("LA <0-12>",   "Loop algorithm select. 10 = LTIC 3-stage,"),
+                ("",            "  11 = LTIC-Lars, 12 = multi-level accumulator"),
+                ("SP <n>",      "Set the PWM DAC directly (1-65535) — manual override."),
+                ("",            "  A whole-LSB intent, so it clears the fine fraction"),
+                ("",            "  (see DAC). CT, LC, the ramps and holdover do too."),
+                ("DAC",         "Control-voltage output: which path is driving the pin,"),
+                ("",            "  the 24-bit code beside the 16-bit view the displays"),
+                ("",            "  and the flash ring use, the fraction between them,"),
+                ("",            "  and one step expressed in uHz and fractional"),
+                ("",            "  frequency for both widths."),
+                ("",            "  'fine: ACTIVE' means a correction smaller than one"),
+                ("",            "  16-bit step is applied rather than truncated away."),
+                ("",            "  That matters more than it sounds: the truncation it"),
+                ("",            "  replaces discarded such a correction ENTIRELY, not"),
+                ("",            "  partly, because rounding back to the same code also"),
+                ("",            "  skipped the write. Needs the dithered PWM or an"),
+                ("",            "  external DAC compiled in; on plain PWM it says so."),
+                ("",            "  The Hz figures need CT — without it the resolution"),
+                ("",            "  is real but its meaning in frequency is unknown,"),
+                ("",            "  and the command says that instead of guessing."),
                 ("AP",          "Arm picDIV (resync the divider to 1PPS)"),
             ]),
             ("Calibration", [
@@ -731,8 +1008,50 @@ class GpsdoTuner(QMainWindow):
                 ("LTR [adc]",   "Temperature reference, ADC counts"),
                 ("",            "  Trend: ACQ = frequency-led, PLL = phase, LOCK = locked"),
             ]),
+            ("Algorithm 12 — multi-level accumulator", [
+                ("MG [v]",      "Gain, LSB per ns. 0 = derive it from the CT"),
+                ("",            "  calibration, which is usually what you want."),
+                ("MR [n]",      "Force a correction once level n is reached,"),
+                ("",            "  whatever the limits say (default 9 = 1024 s)."),
+                ("MLP <n> [ns]","Phase limit for level n. Without a value it"),
+                ("",            "  prints the current one."),
+                ("MF [0-3]",    "Where the limits come from, INDEPENDENTLY of MG:"),
+                ("",            "  0 follow MG (as before), 1 stored table,"),
+                ("",            "  2 sigma formula, 3 measured. The gain belongs"),
+                ("",            "  to the oscillator, the limits to the site's"),
+                ("",            "  phase noise; they were welded together until"),
+                ("",            "  now, so 'measured gain, hand-set limits' -"),
+                ("",            "  what a noisy install wants - was unaskable."),
+                ("MFT [s]",     "MF 3 only: how long between corrections that"),
+                ("",            "  noise alone triggers. Every per-level"),
+                ("",            "  multiplier follows from it. Default 3600."),
+                ("ML",          "List gain, run level, limit source and limits"),
+                ("ES ALGO12",   "Save the algo-12 block to the flash ring"),
+                ("",            ""),
+                ("",  "After Alan Cashin (MIS42N). Input is phase in ns from"),
+                ("",  "the LTIC detector — about 1 ns, against 100 ns for the"),
+                ("",  "frequency counter this first used. That first version"),
+                ("",  "was blind: a disciplined oscillator sits far below 1 Hz"),
+                ("",  "of error, so the count read zero and nothing ever"),
+                ("",  "accumulated. The detector is REQUIRED - LA 12 refuses"),
+                ("",  "without it. The old fallback integrated quantisation"),
+                ("",  "noise into a random walk and destroyed the lock."),
+                ("",  ""),
+                ("",  "Readings accumulate into levels: level n covers 2^n"),
+                ("",  "seconds. A correction is applied at the LOWEST level"),
+                ("",  "whose error exceeds that level's limit, so a large error"),
+                ("",  "acts within 2 s and a small one waits for a longer"),
+                ("",  "average. The error chooses its own time constant -"),
+                ("",  "there is no LTC to set."),
+                ("",  ""),
+                ("",  "UNTUNED: only the 128 s limit was ever derived (125 ns,"),
+                ("",  "from the 10 MHz +/-0.01 Hz specification). Alan calls the"),
+                ("",  "rest arbitrary, so they are exposed for editing."),
+                ("",  "Trend shows CORR at a correction, ACQ for the first"),
+                ("",  "64 s, LOCK after. NoCT means CT has not run."),
+            ]),
             ("Storage (flash ring)", [
-                ("ES [obj]",    "Save settings. Optional group: TZ / PID / LTIC / FLAGS / ALGO / PO"),
+                ("ES [obj]",    "Save settings. Group: TZ / PID / LTIC / FLAGS / ALGO / ALGO12 / PO"),
                 ("ER",          "Recall settings from the ring"),
                 ("EE",          "Erase settings (back to defaults)"),
                 ("EW",          "Flash wear stats: erase cycles and slots used"),
@@ -961,6 +1280,29 @@ class GpsdoTuner(QMainWindow):
         for verb in LARS_PARAMS:
             self.worker.send(verb)
 
+    def apply_algo12_param(self, verb):
+        """Write one algo 12 (multi-level accumulator) scalar parameter live."""
+        _, _, _, dec = MLACC_PARAMS[verb]
+        val = self.algo12_boxes[verb].value()
+        self.worker.send(f"{verb} {int(val) if dec == 0 else val:g}"
+                         if dec == 0 else f"{verb} {val:g}")
+
+    def read_algo12_params(self):
+        """Query the algo 12 scalars and the whole limit table.
+
+        The limits were missing from this, so their spin boxes sat at zero until
+        somebody typed in them — and pressing Send would then have written eleven
+        zeros over a table the firmware had defaults for. A control that shows a
+        value the device does not hold is worse than one that shows nothing.
+
+        `MLP n` with no value prints the current setting, so eleven of those fill
+        the table.
+        """
+        for verb in MLACC_PARAMS:
+            self.worker.send(verb)
+        for level in range(len(MLACC_LEVEL_SECS)):
+            self.worker.send(f"MLP {level}")
+
     def _set_active_algo(self, algo):
         """Track the active algorithm from telemetry and retitle the plots.
 
@@ -974,7 +1316,9 @@ class GpsdoTuner(QMainWindow):
         self._apply_plot_series()
 
     def _plot_family(self):
-        return "ltic" if self._active_algo in (10, 11) else "pid"
+        if self._active_algo in (10, 11): return "ltic"
+        if self._active_algo == 12:        return "mlacc"
+        return "pid"
 
     def _apply_plot_series(self):
         """Point the two upper curves at the fields that suit the active family
@@ -1049,7 +1393,8 @@ class GpsdoTuner(QMainWindow):
     def _read_all_params(self):
         """Query every parameter group the panels display, spaced over time.
         LL (LTIC algo 10), FA (damping), LP n (PID for each algo 3-9), the algo 11
-        Lars params, and LL again for the calibration fields (which share LL)."""
+        Lars params, the algo 12 multi-level scalars, and LL again for the
+        calibration fields (which share LL)."""
         seq = []
         seq.append("V")                  # firmware version — checked against TOOL_VERSION
         seq.append("LL")                 # LTIC algo 10 + calibration fields
@@ -1057,12 +1402,35 @@ class GpsdoTuner(QMainWindow):
         for n in range(3, 10):           # PID algos 3-9, one reply block each
             seq.append(f"LP {n}")
         seq += list(LARS_PARAMS.keys())  # algo 11: LG/LD/LTC/LFD/LTO/LPL/LPF/LTK/LTR
+        seq += list(MLACC_PARAMS.keys()) # algo 12: MG/MR
+        # ML lists the whole limit table in one reply, which is cheaper than
+        # eleven MLP queries and fills the same boxes — the absorber matches the
+        # "lim[n]=..." lines either way. Without this the table showed zeros
+        # until somebody pressed Read all by hand.
+        seq.append("ML")
         # 150 ms between commands keeps the link unsaturated; the whole sweep
         # finishes in ~3 s, after which the panels reflect the device.
         for i, cmd in enumerate(seq):
             QTimer.singleShot(300 + i * 150, lambda c=cmd: self.worker.send(c))
 
     def on_line(self, line):
+        """Entry point for every received line.
+
+        Wrapped, because a single exception in here stops the tuner receiving
+        ANYTHING — not just the line that raised. That is how one misplaced
+        attribute took down the LL calibration readback and the algo-12 limit
+        table at the same time: the traceback fired on every telemetry line, so
+        no reply ever reached its absorber, and the symptom looked like two
+        unrelated parsing faults rather than one crash.
+
+        A parse failure should cost one line, not the connection.
+        """
+        try:
+            self._on_line(line)
+        except Exception as e:                                  # noqa: BLE001
+            self.monitor.append(f"*** line handler error: {e!r}")
+
+    def _on_line(self, line):
         # Data arriving proves the link is live — if the status label somehow
         # missed the connect signal (e.g. a restarted worker), correct it here.
         if self.worker.isRunning() and self.connect_btn.text() == "Connect":
@@ -1100,7 +1468,7 @@ class GpsdoTuner(QMainWindow):
         now = time.time() - self.t0
         got_any = False
         for field in ("Vphase", "Vctl", "dph", "PWM", "drift", "damp", "qErr",
-                      "scale", "phase"):
+                      "scale", "phase", "ph", "level", "corr", "arm", "sig", "zc"):
             v = self.parser.extract(line, field)
             if v is not None:
                 self.data[field].append(v)
@@ -1115,7 +1483,8 @@ class GpsdoTuner(QMainWindow):
         st = self.parser.parse_state(line)
         if st:
             self.last_state = st
-            self.state_lbl.setText(f"state: {st}")
+            hint = self.parser.STATE_HINT.get(st, "")
+            self.state_lbl.setText(f"state: {st}" + (f"  ({hint})" if hint else ""))
 
         # Track the active algorithm from the Learn line so the LTIC tab can show
         # the algo-10 stage PID or the algo-11 Lars params as appropriate. The
@@ -1188,6 +1557,29 @@ class GpsdoTuner(QMainWindow):
                 self.lars_boxes[verb].setValue(float(m.group(1)))
                 self.lars_boxes[verb].blockSignals(False)
                 return
+
+        # Algo 12 (multi-level accumulator) single-line readbacks:
+        #   m_gain=0.000 (auto from CT)      m_run_level=9
+        #   m_thr_src=3 (measured)           m_thr_tgt=3600s (default)
+        # Same mechanism as Lars, but the pattern has to tolerate a trailing
+        # unit and a parenthesised gloss. Anchoring hard at the value — which is
+        # what this did — meant every annotated reply was silently dropped: the
+        # gain box stayed empty for the whole of MG 0, which is the default, and
+        # MF/MFT would never have filled at all. A control that shows nothing
+        # while the board is answering is the same failure as one that shows a
+        # value the board does not hold.
+        for verb, fname in MLACC_FIELD_NAMES.items():
+            m = re.match(rf"\s*{fname}=([-+]?\d+(?:\.\d+)?)\s*[A-Za-z/]*\s*(?:\(.*\))?\s*$", line)
+            if m and verb in self.algo12_boxes:
+                self.algo12_boxes[verb].blockSignals(True)
+                self.algo12_boxes[verb].setValue(float(m.group(1)))
+                self.algo12_boxes[verb].blockSignals(False)
+                return
+
+        # Limit table: "lim[6]=32350 (126 ns over 128s)", one line per level from
+        # MLP with no value, and eleven of them from ML.
+        if self.absorb_algo12_limit(line):
+            return
 
         if "DPLL=" in line and "LOCK=" in line:
             d, l = self.parser.parse_fa(line)
@@ -1746,6 +2138,16 @@ class SplashScreen(QWidget):
         p.setPen(self.COL_DIM)
         p.drawText(0, int(h * 0.16) + 34, w, 22, Qt.AlignHCenter,
                    f"v{TOOL_VERSION}  —  GPS Disciplined OCXO tuning console")
+
+        # About replays this splash, so it is the only place a user is shown
+        # who the loops come from. Two lines, small, under the subtitle.
+        cred = QFont(); cred.setPointSize(8)
+        p.setFont(cred)
+        p.drawText(0, int(h * 0.16) + 58, w, 18, Qt.AlignHCenter,
+                   "firmware J. M. Niewiński (jmnlabs) · after André Balsa v0.06c")
+        p.drawText(0, int(h * 0.16) + 74, w, 18, Qt.AlignHCenter,
+                   "algo 11 Lars Walenius · algo 12 Alan Cashin (MIS42N) · logger lucido")
+        p.setFont(sub)
 
         # status line fades in with the merge, echoing the firmware's metaphor
         if conv > 0.55:

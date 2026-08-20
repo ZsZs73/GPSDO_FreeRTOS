@@ -1,7 +1,7 @@
 /*
  * gpsdo_health.h — self-assessment from the loop's own corrections.
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * WHY THIS EXISTS
  * ---------------

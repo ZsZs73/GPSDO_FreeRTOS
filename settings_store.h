@@ -1,7 +1,7 @@
 /* ======================================================================
  * settings_store.h  —  persistent user settings via the flash ring
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * Replaces the old STM32duino emulated EEPROM (gpsdo_state.cpp eeprom_*).
  * Settings are stored as a REC_SETTINGS slot in the flash ring (sector 7),
@@ -28,7 +28,7 @@
 
 /* Bump when the on-flash layout of SettingsBlock_t changes. A mismatch with
  * the stored value triggers a fall-back to defaults on recall. */
-#define SETTINGS_VER  4u   /* v4: + LT local-time flag; v3 FA windows; v2 LTIC-Lars */
+#define SETTINGS_VER  5u   /* v5: + algo-12 block; v4 LT flag; v3 FA windows; v2 Lars */
 
 /* The flat on-flash block. Total size must stay <= FR_PAYLOAD (506 B).
  * Every field is little-endian and tightly packed; the recall path range-
@@ -88,6 +88,26 @@ typedef struct {
     uint8_t  tz_mode;        /* g_tz_mode (0=manual 1=auto-EU 2=posix)     */
     int16_t  tz_manual_min;  /* g_tz_manual_min                            */
     char     tz_str[48];     /* g_tz_str (POSIX rule, NUL-terminated)      */
+    /* Algorithm 12 (multi-level accumulator) — SETTINGS_VER 5+.
+     *
+     * These are here rather than compiled in because the limits are the one
+     * thing that has to change per oscillator: only the 128 s value was ever
+     * derived from a specification, and the rest were arbitrary even in the
+     * design this comes from. A user tuning against their own OCXO must be able
+     * to keep the result. */
+    float    a12_gain;       /* g_mlacc_gain, LSB per ns (0 = auto from CT) */
+    uint8_t  a12_run_level;  /* g_mlacc_run_level                          */
+    /* Carved out of the three alignment pad bytes this block already had, so
+     * the layout, the size and SETTINGS_VER are all unchanged and a block
+     * written by an older build still loads. Both snapshot paths memset the
+     * struct before filling it, so an old record reads back as 0/0 here —
+     * which is MLACC_THR_FOLLOW and "use the default target", i.e. exactly the
+     * behaviour that build had. Growing the struct instead would have forced a
+     * version bump and thrown away everyone's PID, LC and timezone for two
+     * fields that fit in the padding. */
+    uint8_t  a12_thr_src;    /* g_mlacc_thr_src   (MF)                     */
+    uint16_t a12_thr_tgt_s;  /* g_mlacc_thr_tgt_s (MFT), 0 = default       */
+    int32_t  a12_lim[11];    /* g_mlacc_lim[], phase limits in ns          */
 } SettingsBlock_t;
 
 /* Which group of fields a partial save should update. Used by `ES <object>`. */
@@ -98,6 +118,7 @@ typedef enum {
     SET_LTIC   = 3,   /* all ltic_* fields                                */
     SET_FLAGS  = 4,   /* warmup_en, splash_en, saw_en, lrn_en, svin_en    */
     SET_ALGO   = 5,   /* pwm, algo                                        */
+    SET_ALGO12 = 7,   /* algo-12 gain, run level, per-level limits         */
     SET_PO     = 6,    /* press_off, alt_off                              */
 } settings_partial_t;
 

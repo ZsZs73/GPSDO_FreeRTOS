@@ -56,6 +56,7 @@ of. Use the pair that shipped together.
 |-----|---------|
 | **LTIC (algo 10)** | Per-stage PID for the three-stage phase loop, plus the detector calibration |
 | **LTIC-Lars (algo 11)** | The continuous-PI parameters (`LG`, `LD`, `LTC`, …) |
+| **Multi-level (algo 12)** | The two scalars (`MG`, `MR`) and the eleven per-level phase limits |
 | **FA damping** | Damping-average window, per stage |
 | **PID algo 3-9** | Kp / Ki / Kd / I_LIMIT for the frequency-domain algorithms |
 | **Calibration** | `LC`, `CT` and the detector constants |
@@ -72,15 +73,21 @@ than empty.
 Three panes, updated once per second. What the upper two show depends on which
 algorithm the board reports:
 
-| | Algorithms 10 / 11 (LTIC) | Algorithms 0-9 |
-|---|---|---|
-| Top | Phase `dph` (ns) | Learned drift (LSB) |
-| Middle | Detector `Vphase` (V), with band guides | Control voltage `Vctl` (V) |
-| Bottom | Frequency error (Hz) | Frequency error (Hz) |
+| | Algorithms 10 / 11 (LTIC) | Algorithm 12 | Algorithms 0-9 |
+|---|---|---|---|
+| Top | Phase `dph` (ns) | Phase error `ph` (ns) | Learned drift (LSB) |
+| Middle | Detector `Vphase` (V), with band guides | Control voltage `Vctl` (V) | Control voltage `Vctl` (V) |
+| Bottom | Frequency error (Hz) | Frequency error (Hz) | Frequency error (Hz) |
 
 Only the LTIC loops have a phase detector, so under any other algorithm those
 two panes would sit empty for the entire session. They are repointed instead,
 and the titles follow automatically — no setting to change.
+
+Algorithm 12 gets its own pairing rather than borrowing either of the others: it
+does not use the self-learning feed-forward, so the drift trace would be flat,
+and its phase comes straight from the detector rather than through a loop
+filter, so it is not the same quantity `dph` plots. The detector band guides
+come down whenever the middle pane is showing a control voltage instead.
 
 ### Span and Follow
 

@@ -9,12 +9,533 @@ Wszystkie istotne zmiany w projekcie są udokumentowane poniżej.
 Projekt: **J. M. Niewiński** — <https://github.com/jmnlabs/GPSDO_FreeRTOS>
 Na podstawie **GPSDO v0.06c** autorstwa André Balsy
 (<https://github.com/AndrewBCN/STM32-GPSDO>); port na FreeRTOS oraz
-algorytmy 3–10 autorstwa autora, Claude AI jako asystent programowania,
+algorytmy sterowania autorstwa autora, Claude AI jako asystent programowania,
 projekt PCB — Scrachi (forum EEVBlog).
 
 Sufiks `-rtos` oznacza linię portu na FreeRTOS.
 
 ---
+
+## [v1.05-rtos] — 2026-08-20
+
+Algorytm 12 doprowadzony do działania. W v1.04 wyszedł z poprawną arytmetyką i
+pięcioma osobnymi usterkami w maszynerii wokół niej, z których każda zasłaniała
+następną. Pętla trzyma teraz fazę na poziomie 5–8 ns RMS przez 23 godziny przy
+jednym przezbrojeniu picDIV, wobec 10–23 ns najlepszego dotychczasowego
+odniesienia — a każda poprawka poniżej została przesymulowana przed wgraniem, bo
+dwie zmiany w tym projekcie, które poszły na samym rozumowaniu, obie okazały się
+błędne.
+
+### Naprawione
+- **Estymator szumu mógł już tylko maleć.** Bramka odstających brzmiała
+  `dp_lim = 5*sigma` i czytała estymatę, którą sama karmiła: gdy sigma raz
+  zmalała, każda różnica dość duża, by ją podnieść, była odrzucana jako
+  odstająca. Zmierzone 14.08 — `sig` czytało dokładnie 2 ns przez wszystkie 1020
+  próbek przebiegu, a wyprowadzone z niej granice poziomów przypięły hierarchię
+  do podłogi 100 jednostek: 79 z 80 korekcji odpaliło na poziomie 0. Akumulator
+  wielopoziomowy, który nigdy nie opuszcza poziomu zerowego, nie jest
+  wielopoziomowy. Bramka jest teraz bezwzględna (300 ns), a prawdziwe odstające,
+  dla których powstała — różnice liczone w poprzek przerwy NOPH/SYNC/re-arm —
+  są odcinane strukturalnie flagą ciągłości, a nie statystycznie. Sigma ma
+  podłogę 5 ns, poniżej której ten detektor nie rozdziela uczciwie.
+- **Człon częstotliwości miał odwrócony znak.** Nosił `+polarity`, przepisane z
+  gałęzi częstotliwości algorytmu 11 — ale tamta gałąź czyta TIM2, a własny
+  komentarz algo 11 w tym firmware zapisuje ustalenie sprzętowe, że TIM2 i
+  detektor LTIC mają na tym okablowaniu przeciwną orientację. Nachylenie `f_nss`
+  nie jest odczytem TIM2: to pochodna tych samych wartości akumulatora, które
+  dają człon fazowy, z tego samego czujnika. Wielkość i jej własna pochodna po
+  czasie, mierzone jednym czujnikiem, nie mogą wymagać przeciwnych znaków
+  sprzężenia. `cvPWM` Alana zgadza się z tym — przepuszcza fazę i nachylenie
+  przez jedną konwersję i dodaje je. Przy plancie zmierzonym, a nie założonym
+  (+319,5 µHz/LSB, z regresji stusekundowej średniej PWM wobec drukowanej
+  stusekundowej średniej częstotliwości, korelacja 0,999 przy zerowym
+  opóźnieniu), stary znak dawał `d(phase_rate) = +0,4·f_ns`. To dodatnie
+  sprzężenie.
+- **`s_mla_wait` nigdy nie było zerowane.** Występowało w pliku dokładnie dwa
+  razy — w deklaracji i przy `++` w teście rezygnacji — i nigdy nie wracało do
+  zera. Około pięciu minut po starcie przekraczało 300 i test rezygnacji kasował
+  flagę w tej samej sekundzie, w której była podnoszona, co zabijało obie rzeczy,
+  które ta flaga bramkuje: korekcję przejścia przez zero i blokadę nowych
+  korekcji w trakcie dochodzenia fazy. Przebieg, który to wykrył: `zc` = 7 przez
+  76 minut, wszystkie w pierwszych pięciu, i 1072 z 1174 korekcji dokładnie dwie
+  sekundy od siebie, czyli goła kadencja poziomu 0, gdy nic jej nie hamuje.
+  Mechanizm przejścia przez zero nigdy więc nie działał dłużej niż pierwsze
+  minuty jakiegokolwiek przebiegu od czasu wprowadzenia.
+- **Ratunkowy FLL był regulatorem bang-bang i nie mógł być niczym innym.** Krok
+  wynosił `-f*lsb_per_hz*0,10` klamrowany do ±64, co nasyca się przy
+  |f| = 0,256 Hz, podczas gdy bramka poniżej otwierała się dopiero przy 0,3 Hz —
+  człon proporcjonalny nie mógł więc zadziałać nigdy. Napędzany co sekundę ze
+  stusekundowej średniej, czyli około 50 s opóźnienia, daje 64 LSB/s × 50 s =
+  3200 LSB drogi, zanim pomiar zareaguje: 1,0 Hz przeregulowania. Obie liczby są
+  w logach (462 z 655 kolejnych kroków dokładnie ±64; PWM przebiegające 12 845
+  LSB; `f100` wahające się od −1,29 do +1,55 Hz). Teraz aplikuje całą policzoną
+  korekcję raz i przytrzymuje przez tyle, ile potrzebuje na odświeżenie średnia,
+  z której ją policzono, w dwóch biegach: średnia 10-sekundowa przy dużym
+  błędzie, 100-sekundowa gdy zmaleje, a przytrzymanie zawsze odpowiada oknu w
+  użyciu. Bramka zeszła z 0,3 Hz na 0,05 Hz, bo powyżej 0,147 Hz faza przebiega
+  całe pasmo detektora ±940 ns w jednym horyzoncie 64 s — stara bramka
+  zostawiała martwą strefę od 0,147 do 0,3 Hz, w której pętla fazowa nie
+  dostawała dość długiego okna, a FLL uznawał swoją pracę za skończoną.
+- **`instant_offset` zawijało się.** `FREQ_LOWER`/`FREQ_UPPER` dopuszczają
+  ±500 Hz, a pole było `int8_t`, więc wszystko powyżej ±127 podawało śmieci
+  każdej bramce, która je czytała. Teraz `int16_t`, we wszystkich trzech plikach,
+  które go dotykają — w strukturze, w rzutowaniu, które je wypełnia, i w
+  migawce, która je kopiuje. Naprawienie tylko jednego skompilowałoby się
+  czysto i zostawiło zawijanie na miejscu.
+- **Gałąź częstotliwości i gałąź FLL brały znak z zaszytego minusa.** Poprawne
+  wyłącznie dlatego, że `LPOL` na tej płytce wynosi −1; na płytce z `LPOL +1` to
+  dodatnie sprzężenie. Obie biorą teraz `polarity` z płytki, co tutaj wylicza się
+  identycznie, a gdzie indziej poprawnie.
+- **Dither zapisywał tylko jedną ze swoich dwóch tablic DMA.** Podwójne
+  buforowanie zmienia tablicę co przebieg, więc druga — wciąż z poprzednim kodem
+  — grała aż do następnego zapisu, a wyjście przeskakiwało między starą a nową
+  wartością z częstością około 3 Hz (jeden przebieg to 2^(24−N) okresów nośnej =
+  167,8 ms niezależnie od wyboru N). Filtr dwubiegunowy 0,8 Hz tłumi 3 Hz
+  zaledwie 14×. Obie tablice są teraz wypełniane, pod muteksem, bo
+  `pwm24_write()` jest osiągalne i z ControlTask, i z CliTask, a dwa równoległe
+  wypełnienia jednej tablicy przeplatają się w rozdarty 168-milisekundowy
+  przebieg. Nadpisywanie tablicy czytanej przez DMA jest bezpieczne przez
+  wyprzedzenie: wypełnianie zapisuje wpis co kilka mikrosekund, gdy DMA
+  konsumuje jeden co 81,9 µs.
+- **`PO` i `AO` nie dawały się ustawić na zero.** Kontrola zakresu brzmiała
+  `v >= −3000 && v <= 3000 && v != 0.0f`, więc jedyna wartość, której użytkownik
+  najpewniej chce, była jedyną odrzucaną. Zakresy poprawione na ±5000 Pa i
+  ±3000 m, a obie komendy podają teraz jednostki w pomocy i w echu.
+
+- **Płytka nie zawsze wstawała po zimnym starcie, a szyna 3,3 V nigdy nie była
+  przyczyną.** `ubx_poll_svin_nav()` wołało `vTaskDelay()` bezwarunkowo. Jego
+  bliźniak `ubx_poll_svin()` ma strażnika i komentarz, który to wyjaśnia —
+  *„before vTaskStartScheduler() this must not be vTaskDelay(): calling it with
+  no scheduler hangs the system"* — a poprawka trafiła do jednej z tych dwóch
+  funkcji i nie trafiła do drugiej.
+
+  Przed startem schedulera `vTaskDelay()` pisze przez `pxCurrentTCB`, który jest
+  jeszcze `NULL`, więc płytka wpada w hard fault, a domyślny handler kręci się w
+  pętli z wyłączonymi przerwaniami: żadnego wyjścia, żadnego watchdoga, tylko
+  przycisk reset. Haki awaryjne FreeRTOS dodane w v1.04 tego nie złapią —
+  potrzebują działającego jądra.
+
+  Usterka chowała się za kolejnością wywołań w `gpsdo_gps_init()`: NAV-SVIN jest
+  odpytywane wyłącznie wtedy, gdy TIM-SVIN nie odpowie w swoim oknie 500 ms.
+  Odbiornik, który już pracuje, odpowiada i płytka startuje — tak jest po
+  resecie, bo odbiornik ma własne zasilanie. Odbiornik dopiero wstający nie
+  odpowiada i płytka staje. To właśnie przypadek zimnego startu, i ta asymetria
+  jest powodem, dla którego rzecz przez długi czas wyglądała na zasilanie
+  siadające przy narastaniu szyny.
+
+  Znalezione w logu z czterema kolejnymi startami, z których każdy kończył się
+  po `UBX: CFG-NAV5 ACK`, a przed `LEA-T: starting survey-in`, przy przyczynie
+  resetu `PIN/NRST` za każdym razem — czyli przycisku operatora. Dekoder wypisuje
+  `POWER-ON/BROWN-OUT` i osobną linię o sprawdzeniu szyny 3V3, gdy winne jest
+  zasilanie, i nie pojawiła się ani razu. Usterka zasilania nie zatrzymuje się
+  cztery razy na tej samej linii kodu.
+- **Cyfry częstotliwości nie podążały za stanem lock algorytmu 12.** Logika
+  koloru ma gałąź autorytatywną dla pętli publikujących stan na żywo, a
+  algorytmu 12 nie było na tej liście — spadał więc do gałęzi oceniającej lock ze
+  średnich częstotliwości, czyli robił dokładnie to, przed czym ostrzega
+  komentarz nad tą gałęzią.
+
+  Zmierzone na przebiegu 2,99 h: pętla i kolor rozjeżdżały się przez **15,0%**
+  próbek, a każdy taki przypadek to pętla w LOCK i białe cyfry — nigdy odwrotnie.
+  Pętla weszła w LOCK w 108 s, cyfry zzieleniały w 1041 s. Piętnaście minut
+  zdyscyplinowanego oscylatora wyglądającego na niezdyscyplinowany, przy każdym
+  starcie, bo dopóki nie napełni się średnia 1000 s, ta gałąź nie ma czym
+  oceniać i `locked` jest fałszywe z konstrukcji.
+
+  Algorytm 12 bierze teraz kolor z własnego trendu, jak 10 i 11. `CORR` i `ZC`
+  liczą się jako lock: to stany jednosekundowe znaczące, że pętla robi swoje —
+  ta sama logika, dla której nie zerują `s_mla_quiet`. Bez tego cyfry mrugałyby
+  na biało przy każdej korekcji, czyli szesnaście razy w zmierzonych trzech
+  godzinach. Zgodność wynosi teraz 100%.
+- **Bramka „stale echo" była ustawiona na pół kwantu.** Odbiera ona lock oparty
+  na długiej średniej, gdy średnia 10-sekundowa odjechała, a próg wynosił
+  ±50 mHz. Ale średnia 10 s to zliczenie cykli przez dziesięć sekund, więc jej
+  ziarno to 0,1 Hz: przez trzy godziny przyjęła dokładnie trzy wartości —
+  −100, 0 i +100 mHz — i nic pomiędzy. Próg 50 mHz nie znaczył więc „w granicach
+  50 mHz", tylko „licznik musi pokazać dokładnie 10 000 000", a jeden kwant w
+  którąkolwiek stronę gasił zieleń. To 8,3% ustalonych próbek i 46% opisanego
+  wyżej rozjazdu. Teraz ±0,15 Hz: jeden pełny kwant plus pół kwantu zapasu, więc
+  pojedyncze drgnięcie przechodzi, a rzeczywista utrata dyscypliny — wiele
+  kwantów, czyli to, po co ta bramka istnieje — nadal ją zatrzymuje. Algorytmy
+  0–9 mają tę samą bramkę i tę samą poprawkę.
+
+### Dodane
+- **Bramka poziomowa na człon częstotliwości.** Własny szum nachylenia to
+  `sd(f_nss) = sigma · 2^((1−3L)/2)`, więc na poziomie 0 jest to 1,41·sigma
+  czystego szumu skalowanego przez 12,5 LSB na ns/s, wobec 0,39 LSB na ns dla
+  członu fazowego — przewaga 32:1 na rzecz niewłaściwej wielkości. Log pokazał,
+  co to kupuje: 46% korekcji uderzało w klamrę ±470, jedna z nich przy fazie
+  czytającej dokładnie 0 ns i korekcji na pełnej skali. Człon jest teraz używany
+  od poziomu 3 w górę, gdzie ta sama estymata jest uśredniona po parach
+  16-sekundowych i znów jest pomiarem.
+- **Trim częstotliwości z TIM2.** Gdy średnia stusekundowa pokazuje więcej niż
+  0,03 Hz, składowa częstotliwościowa korekcji brana jest z tego pomiaru zamiast
+  z nachylenia akumulatora. W stanie ustalonym jest uśpiony — w dziesięciogodzinnej
+  symulacji nie odpalił ani razu — i o to właśnie chodzi: łapie wyskoki
+  częstotliwości, które inaczej wyprowadziłyby fazę poza pasmo detektora, więc
+  pętla nigdy nie musi wchodzić w lock od nowa. Dwudziestotrzygodzinny przebieg,
+  który ustalił powyższe liczby, zanotował **jedno** przezbrojenie picDIV, wobec
+  121 przy tych samych nastawach bez niego.
+- **`configUSE_MUTEXES` i `INCLUDE_xTaskGetSchedulerState`**, ustawione jawnie.
+  Blokada dithera potrzebuje obu, żadne nie było ustawione przez ten projekt, a
+  tego, czy domyślna konfiguracja biblioteki je włącza, nie zostawia się
+  przypadkowi: brakujące makro to błąd kompilacji, nie niespodzianka w runtime.
+
+- **Dolne 8 bitów ditheru dociera wreszcie do pętli.** v1.04 wypuściła wyjście
+  24-bitowe i napisała w tym changelogu, że pętla nie dostaje jeszcze
+  drobniejszego kroku: każdy algorytm wołał `gpsdo_dac_write16()`, które
+  przesuwało wartość w górne 16 bitów, żeby zapisane ustawienia zachowały swoje
+  napięcie, a dolny bajt zawsze był zerem. Już nie jest.
+
+  Ułamek należy do `gpsdo_dac.cpp`, nie do pętli sterowania, i to jest cały
+  pomysł. Wartość sterująca zapisywana jest z 21 miejsc — z przemiatań `CT` i
+  `LC`, z ramp akwizycji, ze sterowania w holdoverze, z `SP` i z samej pętli — a
+  dwadzieścia z nich jest zgrubnych z rozmysłem: przemiatanie, które zatrzyma się
+  na 30720,4 zamiast na 30720, nie jest lepszym przemiataniem, tylko takim,
+  którego punktu odniesienia nikt nie potrafi podać. Każdy zgrubny zapis kasuje
+  ułamek przy okazji tego, że trafia do `gpsdo_dac_write16()`, więc żaden
+  wywołujący nie musi o tym pamiętać. Trzymanie ułamka w pętli oznaczałoby
+  dwadzieścia miejsc, z których każde musiałoby wiedzieć, że ma go wyzerować — a
+  to dokładnie ta klasa błędu, dla której ten jeden punkt zapisu powstał.
+
+  Co to daje na zmierzonym tutaj obiekcie: jeden krok 16-bitowy to około 320 µHz,
+  czyli 3,2e-11 z 10 MHz — grubiej, niż 4e-12, które pętla zmierzono trzymała
+  przez 10 000 s. Dochodziła tam ditherując między sąsiednimi kodami z korekcji
+  na korekcję, co działa, ale zostawia napięcie sterujące w ciągłym polowaniu. Z
+  zachowanym ułamkiem korekcja mniejsza od jednego kroku jest stosowana zamiast
+  obcinana, a krok schodzi do 1,25e-13.
+
+  Obcięcie, które znika, było przy tym stronnicze: `(int32_t)` zaokrągla w stronę
+  zera, więc każda korekcja traciła część siebie w tę samą stronę — co pętla
+  widzi jako błąd wzmocnienia sięgający jednej szóstej przy korekcjach rzędu
+  6 LSB, obserwowanych w normalnej pracy.
+
+  Powyżej warstwy DAC nie zmieniło się nic. `gpsdo_dac_last16()` nadal zwraca
+  zwykłe `uint16_t`, więc wyświetlacze, linia telemetrii i flash ring widzą
+  dokładnie to, co widziały wcześniej, a blok ustawień nadal zapisuje 16 bitów:
+  odtworzenie startuje z zerowym ułamkiem i oddaje co najwyżej 1,25e-13, czyli
+  mniej, niż ten sprzęt jest w stanie pokazać.
+- **`DAC` — komenda, która mówi, czym naprawdę jest napięcie sterujące.** Ścieżka
+  wyjściowa, a dla ditheru częstotliwość nośnej i RAM zajęty przez tablice; kod w
+  trzech ujęciach — 24-bitowym, zaokrąglonym 16-bitowym, którego używają
+  wyświetlacze i flash ring, oraz dokładnym ułamkowym wraz z różnicą względem
+  zaokrąglonego; zmierzone Vctl; oraz wielkość kroku dla obu szerokości, w µHz i
+  jako ułamek 10 MHz. Kod 24-bitowy niebędący wielokrotnością 256 jest dowodem na
+  to, że pinem steruje ścieżka precyzyjna — i dlatego drukowane są wszystkie trzy
+  ujęcia, a nie jedno; komenda mówi też wprost, czy ścieżka precyzyjna jest
+  aktywna, czy wyjście i tak ją zaokrągla.
+
+  Liczby kroku wymagają wzmocnienia obiektu, którego dostarcza tylko `CT`. Bez
+  niego komenda to mówi, zamiast drukować liczbę wyprowadzoną z wartości
+  domyślnej. Wpisana także do zakładki Help w tunerze.
+
+- **`MF` i `MFT` — limity per poziom dostają własne źródło, wybierane niezależnie
+  od wzmocnienia.** Oba siedziały w jednym `if`, więc `MG 0` znaczyło
+  „wzmocnienie z CT **i** limity z formuły szumu", a `MG > 0` — „wzmocnienie
+  ręcznie **i** limity ręcznie". Nie ma powodu, by były zespawane: wzmocnienie
+  należy do OSCYLATORA (jest w LSB na ns, a inny OCXO ma inną czułość Vctl),
+  natomiast limity należą do SZUMU FAZY, jaki widzi płytka, czyli do miejsca i
+  odbiornika. „Zmierzone wzmocnienie, ręczne limity" — dokładnie to, czego
+  potrzebuje hałaśliwa instalacja — nie dało się w ogóle wyrazić.
+
+  `MF 0` śledzi `MG` jak dotąd i jest domyślne, więc bez wyraźnej prośby nic się
+  nie zmienia. `MF 1` trzyma tablicę zapisaną, `MF 2` formułę szumu, `MF 3`
+  tablicę mierzoną poniżej. Oba ustawienia mieszczą się w trzech bajtach
+  wyrównania, które blok algo-12 już miał, więc układ, rozmiar i `SETTINGS_VER`
+  zostają bez zmian, a starszy zapis nadal się ładuje — odczytuje się jako 0/0,
+  czyli dokładnie zachowanie tamtej wersji.
+- **`MF 3` — limity per poziom mierzone zamiast ekstrapolowanych.** Formuła
+  brzmi `thr[L] = 8·σ·√(2^L)·√10`, a `√(2^L)` mówi, że faza jest BIAŁA, czyli że
+  uśrednienie 2^L próbek zbija test jak 2^(L/2). Zmierzone na dwóch płytkach tej
+  konstrukcji — to samo PCB, ten sam OCXO, różne pomieszczenia — wykładnik
+  wynosi **0,95 i 1,03**, a nie 0,50. Uśrednianie prawie nic tu nie daje, bo
+  liczy się wolna wędrówka (autokorelacja 0,96 przy 60 s, 0,64 przy 300 s), a nie
+  szum próbka-do-próbki. Błąd rośnie z poziomem: formuła zaniża rzeczywisty
+  rozrzut około 5× na poziomie 0 i ponad 100× na poziomie 10, więc jej tablica
+  opada 32× w skali hierarchii tam, gdzie sama faza opada 1,3×.
+
+  Wykładnik jest więc mierzony. Każdy poziom trzyma średni kwadrat swojej własnej
+  statystyki testowej, dopasowanie najmniejszych kwadratów log2(sd) względem
+  poziomu daje amplitudę i wykładnik naraz, a tablica powstaje z dopasowania.
+  Dopasowanie PO poziomach, a nie zaufanie każdemu z osobna, jest tym, co czyni
+  je użytecznym wcześnie — poziom 8 jest testowany raz na 512 s i sam
+  potrzebowałby pół doby na własną wariancję, ale niskie poziomy zapełniają się w
+  minuty i dopasowanie ekstrapoluje.
+
+  Znika przy tym pięć liczb wpisanych na sztywno: wykładnik 0,5, mnożnik `8.0`
+  (teraz kwantyl rozkładu normalnego dla częstości fałszywych strzałów zadanej
+  przez `MFT` — czyli robota, którą ósemka wykonywała ręcznie, bo hierarchia
+  testuje poziom 0 tysiąc razy częściej niż poziom 10), propagacja białego szumu
+  `√10`, podłoga σ na 5 ns — właściwość tego detektora, nie arytmetyki — oraz
+  podłoga 100 jednostek. Zostaje jedna liczba o fizycznym znaczeniu: co ile
+  czasu wolno wystąpić korekcji wywołanej samym szumem.
+
+  Wykładnik jest klamrowany do [0,5; 1,0] i jest to fizyka, nie gust. Poniżej 0,5
+  uśrednianie usuwałoby więcej, niż pozwala biały szum; powyżej 1,0 rozrzut
+  rośnie szybciej niż płasko-w-ns, czyli mamy RAMPĘ fazy, a nie hałaśliwszą
+  płytkę — a wpuszczenie rampy do progu to awaria już w tym pliku zapisana, gdzie
+  sigma wspięła się 165 → 746 ns i pętla zamarzła.
+
+  Zweryfikowane przez odtworzenie arytmetyki firmware po zapisach obu płytek:
+  tablica warsztatowa wychodzi 74 ns opadające do 14, czyli tam, gdzie ta płytka
+  została ustawiona ręcznie po tym, jak auto okazało się niestabilne, a płytka
+  domowa odtwarza własne ustalone zachowanie. Na trzygodzinnym przebiegu dom
+  dopasował **α = 1,00** i korygował na poziomach od 5 do 9 — po raz pierwszy ta
+  hierarchia użyła więcej niż jednego czy dwóch swoich poziomów.
+
+  **Nie jest to automatycznie lepsze.** Na płytce domowej, gdzie znacznie
+  ciaśniejsza tablica z formuły przypadkiem pasowała do cichego miejsca, tablica
+  mierzona podwaja RMS fazy (mediana 11,6 ns wobec 5,5 ns w oknie tej samej
+  długości), bo koryguje trzy razy rzadziej. Te dwie tablice zadają różne
+  pytania — formuła pyta, czy odchylenie przekracza szum pomiarowy, a tablica
+  mierzona, czy jest nietypowe dla tej płytki — i to, która ma rację, zależy od
+  miejsca. Po to właśnie jest `MF`.
+
+### Zmienione
+- `LOCK` w polu trendu znaczy teraz, że hierarchia jest cicha **oraz** że
+  częstotliwość z TIM2 mieści się w 0,05 Hz, liczone po kolejnych cichych
+  sekundach, a nie po `s_mla_count`, który zeruje się przy każdej korekcji i był
+  kiepskim wskaźnikiem tego, jak dawno cokolwiek się wydarzyło.
+
+- **`GPSDO_PWM_DITHER` jest włączony w wysyłanej konfiguracji.** W v1.04 wyszedł
+  wyłączony, dopóki ścieżka wyjściowa nie była sprawdzona; po domknięciu ścieżki
+  precyzyjnej i 23-godzinnym przebiegu „wyłączone" przestało być uczciwym
+  domyślnym ustawieniem. Zakomentowanie go nadal wraca do zwykłego PWM
+  16-bitowego, a pin, filtr i okablowanie są w obu przypadkach te same.
+- **Układ pól na panelu 320×240 jest wreszcie taki jak na 480×320.** Ten podręcznik
+  od v0.93 pisze, że ekran roboczy jest projektowany raz i skalowany — i to była
+  prawda o geometrii, a nie o treści: oba panele rozjechały się pole po polu.
+  qErr przeniósł się do wiersza Alt, obok danych fiksu, do których należy; AHT i
+  pole fazy zamieniły się kolumnami, więc czujniki środowiskowe dzielą lewą
+  kolumnę, a elektryczne prawą; Vcc i Vdd zajęły wspólnie zwolniony wiersz. Mały
+  panel pokazuje wszystko to, co duży.
+
+  Każde pole, które łączyło etykietę z wartością o zmiennej szerokości, zostało
+  rozbite na dwa. Pojedynczy napis kotwiczony do prawej unieruchamia jednostkę, a
+  etykietę ciągnie na boki wraz ze zmianą szerokości cyfr — na qErr widać to było
+  jako etykietę skaczącą raz na sekundę. Etykieta i wartość to teraz osobne sloty
+  z osobnym paddingiem: etykieta trzyma lewą krawędź kolumny, wartość zachowuje
+  prawą kotwicę, a zmienia się tylko odstęp między nimi. Tak samo `dph` i prąd
+  INA.
+- **Font 2 jest proporcjonalny, a ten układ był liczony po 8 px na znak.**
+  Sprawdzone z tablicą szerokości samej biblioteki: to zawyża napisy małego panelu
+  o jakąś jedną piątą — `Vph:1.951V` mierzy 70 px, nie 80. Błąd nie był
+  akademicki: to on kosztował etykietę `dph` i to on trzymał Vcc na dwóch
+  miejscach po przecinku tam, gdzie 480 pokazuje trzy. Obie rzeczy wróciły. Pola
+  po prawej dzielą teraz jedną linię wyrównania na x=314 — tę, na której Vdd
+  siedziało od dawna — więc qErr, dph, prąd INA i Vdd tworzą kolumnę zamiast
+  czterech prawie-trafień. Padding każdego pola to teraz zmierzona szerokość jego
+  własnej najszerszej formy, a nie dzisiejszego odczytu, i paddingi w wierszu
+  kafelkują go dokładnie, więc żadne tło nie może zjeść krawędzi sąsiada.
+
+### Podziękowania
+- **Alan Cashin** (MIS42N z forum EEVBlog) jest teraz wymieniony tam, gdzie praca
+  jest jego: w `V`, w nagłówku pomocy, na ekranie About tunera i w tabeli
+  podziękowań wszystkich trzech instrukcji. Algorytm 12, korekcja przejścia przez
+  zero, ditherowany PWM i pomysł na samoocenę `CS` pochodzą z jego Budget GPSDO.
+  Dotąd figurował jako „dither / DAC discussion", co znacznie to zaniżało.
+
+### Zmierzone
+Dwadzieścia trzy godziny, progi automatyczne, `MR 9`, dither 13-bitowy:
+
+| | ten przebieg | najlepszy poprzedni |
+|---|---|---|
+| faza RMS, po osiadaniu | **5–8 ns** | 10–23 ns |
+| \|faza\| < 10 ns | **86,7%** próbek | — |
+| przezbrojenia picDIV | **1** | 121 |
+| osiągane poziomy korekcji | **typowo 5–6, do 8** | 0 |
+| częstotliwość na 10 000 s | **4e-12** | 1,4e-11 |
+| odstęp między korekcjami | 254 s | 130 s |
+
+`NOPH` trzy razy na 82 572 próbki; `FLL` raz. Ciśnienie otoczenia spadło w trakcie
+przebiegu o 4 hPa, a pętla nie zareagowała.
+
+---
+
+## [v1.04-rtos] — 2026-08-12
+
+### Dodane
+- **`GPSDO_PWM_DITHER` — 24-bitowe napięcie sterujące z krótkiego PWM z ditherem.**
+  Pomysł Alana Cashina (MIS42N): puść PWM na mniejszej liczbie bitów, niż
+  potrzebujesz, i zmieniaj wypełnienie z okresu na okres tak, by resztę niosła
+  średnia.
+
+  Zyskiem jest NOŚNA, a nie dodatkowe bity. Tętnienie trzeba odfiltrować poniżej
+  jednego kroku wyjścia, a jak trudne to jest, zależy od odstępu między nośną a
+  zakresem filtru: PWM 16-bitowy przy 2 kHz pozwala na zakres 0,7 Hz i stałą
+  czasową 230 ms, a dither 13-bitowy przy 12,2 kHz — na 4,2 Hz i 38 ms.
+  Opóźnienie filtru wchodzi do pętli wprost jako przesunięcie fazy, więc
+  sześciokrotnie krótszy filtr jest wart więcej niż sama rozdzielczość.
+
+  Alan ditheruje w przerwaniu timera, bo PIC nie ma DMA. Tutaj byłoby to 12 000
+  przerwań na sekundę konkurujących z przechwytem 1PPS — jedynym przerwaniem,
+  którego nie wolno opóźniać. Ale wzór dla stałej wartości jest okresowy, więc
+  jest liczony raz do tablicy i odtwarzany przez DMA do rejestru porównania:
+  0,012% CPU przy 13 bitach i ani trochę tego w przerwaniu. Średnia jest dokładna
+  z konstrukcji — tablica trzyma dokładnie Y wpisów o wartości X+1 wśród
+  2^(24-N).
+
+  Ten sam pin co dotąd (PB9, TIM4 CH4), więc dotychczasowy filtr i okablowanie
+  zostają bez zmian. TIM4_UP steruje DMA1 Stream 6 Channel 2; takt 2 Hz jest na
+  TIM9, a łańcuch 1PPS na TIM2/TIM3, więc nic innego nie jest ruszane. Dwa bufory
+  w sprzętowym trybie double-buffer sprawiają, że zmiana wartości nigdy nie daje
+  glitcha na pinie.
+
+  Domyślnie wyłączone. Kosztuje 8 KB RAM przy 13 bitach, 16 KB przy 12.
+
+  **Czego to jeszcze nie daje**, to drobniejszego kroku dla pętli: każdy algorytm
+  woła `gpsdo_dac_write16()`, które przesuwa wartość w górne 16 bitów, żeby
+  zapisane ustawienia zachowały swoje napięcie. Dolne 8 bitów czekają na pętlę,
+  która zawoła `gpsdo_dac_write24()`.
+- **Korekcja przy przejściu przez zero, ze schematu Alana.** Po korekcji
+  granicznej, która zmienia częstotliwość, faza idzie dalej w tę stronę, w którą
+  już szła: przemiata przez zero, wychodzi po drugiej stronie i zwykle znów
+  przekracza granicę — więc pętla koryguje, przestrzeliwuje, koryguje z powrotem i
+  osiada powoli.
+
+  Chwila przejścia fazy przez zero jest szczególna. Błąd fazy jest zerowy, ale
+  błąd częstotliwości, który ją tam doprowadził, wciąż istnieje; skasowanie błędu
+  częstotliwości dokładnie wtedy zostawia oscylator z właściwą częstotliwością ORAZ
+  bez błędu fazy — zamiast w stanie, do którego pętla musi dopiero dochodzić
+  kolejnymi iteracjami.
+
+  Zmierzone względem własnych logów Alana z tej samej konstrukcji: jego pętla
+  koryguje co 506 sekund, gdzie ta korygowała co 130. Większość tej różnicy to
+  właśnie ten test, który Alan nazywa niezbędnym, a którego tutaj brakowało.
+
+  Raportowane jako `zc=` w telemetrii; trend pokazuje `ZC` w momencie zadziałania.
+- **Algorytm 12 — akumulator wielopoziomowy.** Wg konstrukcji Alana Cashina
+  (MIS42N z forum EEVblog). Każda inna pętla tutaj ma jedną stałą czasową, a ta
+  jest kompromisem, którego nikt nie wygrywa: zmierzone względem wzorca
+  rubidowego, `LTC 60` jest do 1,58× lepsze powyżej 800 s, a `LTC 240` do 1,44×
+  lepsze między 10 a 400 s. Ta pętla nie wybiera. Odczyty gromadzą się w
+  poziomach — poziom n obejmuje 2^n sekund — a korekcja następuje na
+  **najniższym** poziomie, którego błąd przekracza granicę. Duży błąd działa w
+  ciągu dwóch sekund, mały czeka na dłuższe uśrednienie. Nie ma `LTC` do
+  ustawienia.
+
+  Poziomy wynikają z układu bitów licznika sekund, a nie z tablicy buforów:
+  jedenaście poziomów, od 2 s do 2048 s, za 22 bajty.
+
+  **Wejściem jest faza w nanosekundach z detektora LTIC.** Pierwsza wersja
+  karmiła algorytm błędem zliczeń TIM2 w całych hercach i była ślepa —
+  zdyscyplinowany oscylator siedzi daleko poniżej 1 Hz, więc pole czytało zero w
+  83% i 95% próbek w dwóch przebiegach, a akumulator nie gromadził nic. Faza się
+  całkuje tam, gdzie sekundowy pomiar częstotliwości nie. Alan zapytał, dlaczego
+  podałem 100 ns, skoro TIC rozdziela 1 ns — miał rację, podałem rozdzielczość
+  licznika zamiast detektora.
+
+  **Test częstotliwości został usunięty**, zgodnie z radą Alana: *„To był
+  eksperyment... chcemy stabilnego układu, w którym testy zawsze przechodzą. Więc
+  test częstotliwości jest zbędny."*
+
+  Nowe komendy `MG`, `MR`, `MLP` i `ML`, zapisywane przez `ES ALGO12`. Granice
+  poziomów są edytowalne i utrwalane, bo tylko **jedna** została kiedykolwiek
+  wyprowadzona — 125 ns przy 128 s, ze specyfikacji 10 MHz ±0,01 Hz. Resztę Alan
+  nazywa arbitralną.
+- **Raportowanie przyczyny resetu przy starcie.** `RCC->CSR` jest odczytywany i
+  dekodowany, zanim cokolwiek innego ruszy, więc sporadyczny restart nie wygląda
+  już identycznie niezależnie od tego, czy przyszedł z zaniku zasilania, pinu
+  reset czy resetu programowego. Dodane po tym, jak płytka restartowała się
+  wielokrotnie w tym samym miejscu konfiguracji GPS, bez możliwości rozstrzygnięcia
+  przyczyny.
+- **Haki awaryjne FreeRTOS i własny `STM32FreeRTOSConfig.h`.**
+  `configCHECK_FOR_STACK_OVERFLOW` i `configUSE_MALLOC_FAILED_HOOK` domyślnie są
+  zerami, więc przepełniony stos po cichu psuje sąsiada, a `configASSERT` wpada w
+  `for(;;)` z wyłączonymi przerwaniami — martwy biały panel i cisza na konsoli.
+  Dokładnie tak wyglądały trzy ostatnie awarie: za mały stos CLI przy zapisie do
+  flash ringu, odczyt pustej grupy zdarzeń przed startem schedulera i struktura w
+  martwej gałęzi, która i tak powiększyła ramkę zadania wyświetlacza.
+
+  Nadpisanie włącza oba haki i przedefiniowuje `configASSERT`, by wypisał plik i
+  numer linii przed zatrzymaniem. Haki nazywają winne zadanie na konsoli USB i
+  migają diodą, więc następna awaria przedstawi się sama w kilka sekund. Goły
+  `Serial`, nie `OUT_SERIAL`: hak nie może dotykać muteksu ani strumienia
+  Bluetooth, który sam może być przyczyną awarii.
+
+  Autorstwo pliku: GLM-5.2, przyjęte tu zasadniczo bez zmian.
+
+### Naprawione
+- **Progi algorytmu 12 są teraz mierzone, a nie odziedziczone.** Były wzięte z
+  konstrukcji Alana i przeskalowane stosunkiem kroków licznika, co jest złą
+  wielkością: próg musi przekraczać **szum** pomiaru fazy, a ten różni się między
+  konstrukcjami z powodów, których rozmiar kroku nie oddaje. Zmierzone na tej
+  płytce: średnia fazy −1 ns przy odchyleniu standardowym 462 ns — oscylator był
+  poprawnie ustawiony, a całe to rozrzucenie to szum, podczas gdy próg poziomu 0
+  wynosił 462 ns. Przekraczało go 41% próbek. 620 korekcji w 1685 sekundach,
+  hierarchia resetowana co 2,7 s i nigdy nieosiągająca poziomu 2.
+
+  Firmware szacuje teraz szum fazy na bieżąco i wylicza z niego próg każdego
+  poziomu. Przy okazji wyszedł drugi błąd: próg dotyczy wyrażenia testowego
+  |3b − a|, którego odchylenie wynosi sigma·√(2^L)·√10, a nie średniej fazy, dla
+  której jest to sigma/√N. Użycie drugiego czyniło próg 4,5× za niskim na poziomie
+  0 i gorzej wyżej. Sześć sigma na właściwej wielkości daje odstęp między
+  korekcjami rzędu minuty, wobec 256 s, na których osiada konstrukcja Alana.
+
+  `ML` raportuje zmierzony szum i to, czy granice za nim podążają. W telemetrii
+  jest jako `sig=`. Ustawienie `MG` powyżej zera zatrzymuje autotuning.
+- **Algorytm 12 ignorował polaryzację detektora i mylił nanosekundy z hercami.**
+  Dwie usterki w tym samym przeliczeniu, znalezione razem z jednego logu.
+
+  `LPOL -1` nie było stosowane w ogóle — algorytm 11 mnoży swój człon fazowy przez
+  `-polarity`, a ten nie — więc na takiej płytce każda korekcja szła w złą stronę.
+  Do tego średnia faza w nanosekundach była mnożona przez LSB-na-herc, jakby to
+  była ta sama wielkość: skasowanie P ns w czasie T sekund wymaga P/(100·T) Hz przy
+  10 MHz, więc korekcja wychodziła 100·T razy za duża — od 200× na poziomie 0 do
+  102 400× na poziomie 9. Każda uderzała w ogranicznik ±2000.
+
+  Dodatnie sprzężenie zwrotne cztery rzędy wielkości za silne to uczciwy opis tego,
+  co pokazał log: 6000 kroków wahnięcia PWM w 148 korekcjach.
+- **`MG` i `MR` były przyjmowane i zapisywane, ale nigdy nieczytane.** Komendy
+  działały, tuner je wysyłał, `ML` je odczytywało, a algorytm nie używał żadnej —
+  ręcznie zadane wzmocnienie nic nie robiło, a wymuszony poziom korekcji nie
+  istniał. Oba są teraz podłączone.
+- **Algorytm 12 wymaga teraz detektora LTIC i wstrzymuje się zamiast zgadywać.**
+  Był napisany tak, by na płytkach bez detektora całkować błąd zliczeń TIM2. Ta
+  gałąź awaryjna była wręcz szkodliwa: zliczenia są skwantowane do całych herców i
+  na zdyscyplinowanym oscylatorze czytają zero, więc ich całkowanie dawało
+  błądzenie losowe szumu kwantyzacji, a nie fazę. Błądzenie przekraczało granicę
+  poziomu, korekcja uderzała w ogranicznik, oscylator był wyrzucany na tyle, że
+  detektor lądował na szynie, a szyna utrzymywała gałąź awaryjną przy życiu.
+  Zmierzone: 6000 kroków wahnięcia PWM w 148 korekcjach, detektor na szynie przez
+  58% czasu, a raportowana faza zablokowana na zerze.
+
+  `LA 12` odmawia teraz bez `GPSDO_LTIC`, a gdy detektor jest, ale nie czyta,
+  algorytm wstrzymuje się i pozwala pracować pomostowi picDIV. Cicha gałąź
+  awaryjna niszcząca lock jest gorsza niż odmowa uruchomienia.
+- **Algorytm 12 zbroi teraz picDIV.** Nie robił tego, a awaria była cicha: przy
+  rampie na szynie detektor nigdy nie zwraca poprawnego odczytu, więc kod spadał
+  do całkowania błędu zliczeń i algorytm znów był ślepy — dokładnie w sposób,
+  któremu przejście na detektor miało zapobiec, bez żadnego śladu w telemetrii.
+  Ten sam pomost z opóźnieniem, co w algorytmie 11.
+- **Tuner przestał cokolwiek odczytywać z płytki.** `STATE_HINT` zostało dodane do
+  `TelemetryParser`, ale użyte jako `self.STATE_HINT` z `GpsdoTuner` — innej klasy.
+  Każda linia telemetrii rzucała wtedy `AttributeError` w obsłudze linii, więc
+  żadna odpowiedź nie docierała do swojego absorbera i ani pola kalibracji z `LL`,
+  ani tablica granic algorytmu 12 się nie wypełniały. Dwa objawy, jedna awaria.
+
+  Obsługa jest teraz opakowana: błąd parsowania kosztuje jedną linię i wpis w
+  monitorze, zamiast po cichu zabijać odbiór.
+- **`MG` i `LG` odpowiadały tak samo — `gain=`.** Absorber Larsa biegnie pierwszy
+  i przechwytywał odpowiedź algorytmu 12. Firmware odpowiada teraz `m_gain=` i
+  `m_run_level=`.
+- **Tabela granic w tunerze pokazywała zera.** Nigdy nie była odczytywana:
+  zapytanie o parametry obejmowało tylko skalary, więc jedenaście pól stało na
+  zerach, a naciśnięcie wysyłki nadpisałoby zerami tablicę, dla której firmware ma
+  wartości domyślne. Tabela jest teraz czytana przy połączeniu, a wysyłka odmawia,
+  dopóki którykolwiek wiersz jest zerem.
+- **Płytka nie startowała: brak diody, brak konsoli, nic.** `setup()` zapisuje DAC
+  trzy razy, zanim wykona się `xEventGroupCreate()`. Nowe statystyki korekcji wiszą
+  na ścieżce zapisu DAC, a ich bramka czytała `xSysEvents`, wtedy jeszcze puste.
+  Ramka stosu jest wymiarowana przy kompilacji, więc struktura w gałęzi, która
+  nigdy się nie wykonuje, i tak rezerwuje miejsce przy każdym wywołaniu; dwadzieścia
+  bajtów przelało stos zadania wyświetlacza i zginęło ono przed `tft.init()`.
+
+### Zmienione
+- **`SETTINGS_VER` 4 → 5** dla bloku algorytmu 12, **z migracją**. Blok v4 jest
+  przyjmowany, jego pola stosowane, a wartości algorytmu 12 zostają domyślne.
+  Odrzucenie go odebrałoby działający PID, LC i strefę czasową tylko dlatego, że
+  doszedł nowy algorytm.
 
 ## [v1.03-rtos] — 2026-08-01
 

@@ -1,7 +1,7 @@
 /**
  * gpsdo_state.cpp — Shared state instances and persistence wrappers
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa

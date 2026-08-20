@@ -1,7 +1,7 @@
 /**
  * gpsdo_control.cpp — vControlTask — OCXO control loop
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -29,8 +29,8 @@
 #include <string.h>
 
 /* Shared with CLI task */
-float g_pressure_offset = 1230.0f;
-float g_altitude_offset = 1.0f;
+float g_pressure_offset = 1230.0f;   /* Pa, added to BMP280 raw pressure */
+float g_altitude_offset = 0.0f;      /* m, added to the GPS altitude at display */
 /* Resolved UTC→local offset in MINUTES. Minutes, not hours: India is
  * +5:30, Nepal +5:45, Chatham +12:45 — an hours-only offset misses those
  * silently. Written only by the tz_resolve() call in vControlTask; every
@@ -1163,7 +1163,28 @@ void vControlTask(void *pvParameters)
              * g_calib_active is set for the whole LC/CT sequence. */
             if (adjust && !holdover && !g_calib_active) {
                 uint16_t new_pwm = adjustVctlPWM(old_pwm, pps, algo);
-                if (new_pwm != old_pwm) {
+                if (g_vctl_fine_valid && gpsdo_dac_fine_available()) {
+                    /* FINE PATH. The algorithm computed a target below one
+                     * 16-bit step, so write it whole rather than rounding it
+                     * away. This is the only call site of the 21 that does —
+                     * the sweeps, ramps, holdover steps and SP all state
+                     * whole-LSB intents and go on using write16().
+                     *
+                     * gCtrl.pwm_output is still the ROUNDED view, because it is
+                     * what the displays, the telemetry line and the flash ring
+                     * read. It is updated only when that view actually moves;
+                     * a correction that changes nothing but the fraction still
+                     * reaches the pin, it just does not make the display
+                     * flicker between two codes for no reason. */
+                    gpsdo_dac_write16f(g_vctl_fine);
+                    uint16_t shown = gpsdo_dac_last16();
+                    if (shown != old_pwm) {
+                        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            gCtrl.pwm_output = shown;
+                            xSemaphoreGive(xCtrlMutex);
+                        }
+                    }
+                } else if (new_pwm != old_pwm) {
                     gpsdo_dac_write16(new_pwm);
                     if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         gCtrl.pwm_output = new_pwm;

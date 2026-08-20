@@ -1,7 +1,7 @@
 /* ======================================================================
  * settings_store.cpp  —  persistent user settings via the flash ring
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * See settings_store.h for the design. This module snapshots the runtime
  * settings globals into a flat SettingsBlock_t and stores it as a REC_SETTINGS
@@ -16,6 +16,7 @@
 #include "settings_store.h"
 #include "flash_ring.h"
 #include "gpsdo_state.h"
+#include <stddef.h>   /* offsetof, for the v4 migration */
 #include "GPSDO_algorithms.h"
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
@@ -43,6 +44,11 @@ static void snapshot_full(SettingsBlock_t *s)
     s->ver = SETTINGS_VER;
     s->pwm  = gCtrl.pwm_output;
     s->algo = gCtrl.active_algo;
+    s->a12_gain      = g_mlacc_gain;
+    s->a12_run_level = g_mlacc_run_level;
+    s->a12_thr_src   = g_mlacc_thr_src;
+    s->a12_thr_tgt_s = g_mlacc_thr_tgt_s;
+    for (int i = 0; i < 11; i++) s->a12_lim[i] = g_mlacc_lim[i];
     for (int n = 3; n <= 9; n++) {
         int i = n - 3;
         s->pid_kp[i] = (float)g_pid[n].Kp;
@@ -115,7 +121,20 @@ static void apply_full(const SettingsBlock_t *s)
 {
     /* PWM & algo (PWM applied later by the boot sequence after live_store) */
     if (s->pwm != 0) gCtrl.pwm_output = s->pwm;
-    if (s->algo <= 11u) gCtrl.active_algo = s->algo;
+    /* 12 is the highest algorithm; the bound has to move with every addition or
+     * the setting saves correctly and is silently dropped on recall, which looks
+     * like the flash ring failing rather than a stale constant here. */
+    if (s->algo <= 12u) gCtrl.active_algo = s->algo;
+    if (s->a12_gain >= 0.0f && s->a12_gain <= 10000.0f) g_mlacc_gain = s->a12_gain;
+    if (s->a12_run_level < 11u) g_mlacc_run_level = s->a12_run_level;
+    /* 0 is the valid "follow MG" / "use the default target" pair, which is also
+     * what an older block's padding reads back as — so no guard is needed for
+     * the old-record case, only for a corrupted one. */
+    if (s->a12_thr_src <= 3u) g_mlacc_thr_src = s->a12_thr_src;
+    if (s->a12_thr_tgt_s == 0u || s->a12_thr_tgt_s >= (1u << MLACC_LEVELS))
+        g_mlacc_thr_tgt_s = s->a12_thr_tgt_s;
+    for (int i = 0; i < 11; i++)
+        if (s->a12_lim[i] >= 1 && s->a12_lim[i] <= 500000) g_mlacc_lim[i] = s->a12_lim[i];
 
     /* PID[3..9] */
     for (int n = 3; n <= 9; n++) {
@@ -128,8 +147,8 @@ static void apply_full(const SettingsBlock_t *s)
     if (is_finite_pos(s->blend_cross, 0.0f, 1.0f))   g_blend_crossover = (double)s->blend_cross;
     if (is_finite_pos(s->blend_scale, 0.0f, 1.0f))   g_blend_scale     = (double)s->blend_scale;
     if (is_finite_pos(s->nn_max_step, 1.0f, 10000.0f)) g_nn_max_step   = (double)s->nn_max_step;
-    if (is_finite_pos(s->press_off, -500.0f, 5000.0f)) g_pressure_offset = s->press_off;
-    if (is_finite_pos(s->alt_off, -500.0f, 10000.0f))  g_altitude_offset = s->alt_off;
+    if (is_finite_pos(s->press_off, -5000.0f, 5000.0f)) g_pressure_offset = s->press_off;
+    if (is_finite_pos(s->alt_off, -3000.0f, 3000.0f))   g_altitude_offset = s->alt_off;
 
     g_svin_enabled = (s->svin_en != 0u);
 
@@ -225,7 +244,16 @@ bool settings_recall(void)
     SettingsBlock_t s;
     memset(&s, 0, sizeof(s));
     uint16_t n = flash_ring_read_newest(REC_SETTINGS, (uint8_t *)&s, sizeof(s));
-    if (n != sizeof(s) || s.ver != SETTINGS_VER) return false;
+    /* Migration. A v4 block is shorter than a v5 one and carries no algo-12
+     * fields; rejecting it outright would throw away a working PID, LC and
+     * timezone because a new algorithm was added. Accept it, apply what it has,
+     * and leave the algo-12 block at its defaults — the user notices nothing
+     * except that algorithm 12 starts untuned, which it would anyway. */
+    if (s.ver == 4u && n == offsetof(SettingsBlock_t, a12_gain)) {
+        /* the fields beyond the v4 layout are already at their defaults */
+    } else if (n != sizeof(s) || s.ver != SETTINGS_VER) {
+        return false;
+    }
     apply_full(&s);
     return true;
 }
@@ -323,6 +351,16 @@ bool settings_save_partial(settings_partial_t which)
         s.pwm  = gCtrl.pwm_output;
         s.algo = gCtrl.active_algo;
         break;
+    case SET_ALGO12:
+        /* Saved on its own so tuning algorithm 12 does not rewrite the PID or
+         * LTIC blocks, exactly as ES LTIC keeps to its own. */
+        s.a12_gain      = g_mlacc_gain;
+        s.a12_run_level = g_mlacc_run_level;
+        s.a12_thr_src   = g_mlacc_thr_src;
+        s.a12_thr_tgt_s = g_mlacc_thr_tgt_s;
+        for (int i = 0; i < 11; i++) s.a12_lim[i] = g_mlacc_lim[i];
+        break;
+
     case SET_PO:
         s.press_off = g_pressure_offset;
         s.alt_off   = g_altitude_offset;

@@ -1,7 +1,7 @@
 /**
  * gpsdo_config.h — Compile-time configuration
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -31,7 +31,7 @@ extern "C" {
 
 /* ── Version ─────────────────────────────────────────────────────────── */
 #define PROGRAM_NAME     "GPSDO"
-#define PROGRAM_VERSION  "v1.03-rtos"
+#define PROGRAM_VERSION  "v1.05-rtos"
 
 /* ---- Serial output macro ----
  * OUT_SERIAL routes user-facing output to Serial2 (Bluetooth) or Serial
@@ -61,7 +61,7 @@ extern "C" {
  * shares the bus with OLED/LCD/sensors, no extra pins, no conflicts.   */
 #define GPSDO_HT16K33            /* 4-digit HT16K33: HH:MM                 */
 #define HT16K33_I2C_ADDR  0x70   /* default; A0/A1/A2 jumpers raise it     */
-#define HT16K33_BRIGHTNESS  8    /* 0 (dim) .. 15 (max)                    */
+#define HT16K33_BRIGHTNESS  2    /* 0 (dim) .. 15 (max)                    */
 
 /* ── TFT SPI display — select exactly one, or comment all out ─────────
  *
@@ -107,9 +107,9 @@ extern "C" {
  *
  * The defines below only gate the display code in gpsdo_tasks.cpp —
  * driver selection happens in the TFT_eSPI User_Setup.h.              */
-/* #define GPSDO_TFT_ILI9341 */  /* ILI9341 240x320 SPI TFT */
+//#define GPSDO_TFT_ILI9341        /* ILI9341 240x320 SPI TFT */
 //#define GPSDO_TFT_ST7789         /* ST7789  240x320 SPI TFT */
-#define GPSDO_TFT_ILI9488   /* ILI9488 320x480 SPI TFT (480x320 landscape)
+#define GPSDO_TFT_ILI9488        /* ILI9488 320x480 SPI TFT (480x320 landscape)
 /* TFT control pins (documentation — actual config is in User_Setup.h) */
 #define PIN_TFT_SCK   PA5
 #define PIN_TFT_MOSI  PA7
@@ -184,6 +184,21 @@ extern "C" {
  *
  * No hardware SPI is needed: the DAC is written once per second, so bit-banging
  * costs microseconds. See dac_ext.h for the pin proposal and the reasoning. */
+/* GPSDO_PWM_DITHER replaces the plain 16-bit PWM with a shorter PWM whose duty
+ * is dithered from period to period, giving 24 bits after the filter. Idea from
+ * Alan Cashin (MIS42N); the table is replayed by DMA rather than run in an
+ * interrupt, so it costs no measurable CPU.
+ *
+ * The point is the carrier, not the extra bits. At 13 bits the carrier is
+ * 12.2 kHz against 2 kHz now, which lets the filter corner move from 0.7 Hz to
+ * 4.2 Hz for the same ripple — a six-fold shorter time constant, and filter delay
+ * goes straight into the loop as phase lag.
+ *
+ * Same pin (PB9, TIM4 CH4), so the existing filter and wiring are unchanged.
+ * Costs 2 x 2^(24-N) x 2 bytes of RAM: 8 KB at 13 bits, 16 KB at 12. */
+#define GPSDO_PWM_DITHER
+#define GPSDO_PWM_DITHER_BITS  13   /* 12 = 24.4 kHz/16 KB, 13 = 12.2 kHz/8 KB */
+
 //#define GPSDO_DAC_EXT
 
 #define GPSDO_GEN_2kHz_PB5
@@ -204,6 +219,19 @@ extern "C" {
 #endif
 #if defined(GPSDO_LCD_20x4) && (defined(GPSDO_TM1637) || defined(GPSDO_TM1637_6))
   #error "GPSDO_LCD_20x4 and TM1637 cannot be used together (I2C/GPIO conflict). Disable one."
+#endif
+/* The external DAC's chip-select shares PB4 with the TM1637 data line. Both are
+ * plain GPIO driven by software, so nothing detects the clash at run time: the
+ * display would corrupt every DAC write and the control voltage would jump
+ * whenever the clock updated. Caught here instead.
+ *
+ * If a board needs both, move PIN_DAC_CS — PB2, PB14, PA4, PA6, PA8, PA9 and PA10
+ * are free at the time of writing. Nothing in the firmware depends on which. */
+#if defined(GPSDO_PWM_DITHER) && defined(GPSDO_DAC_EXT)
+  #error "GPSDO_PWM_DITHER and GPSDO_DAC_EXT both drive the control voltage. Pick one."
+#endif
+#if defined(GPSDO_DAC_EXT) && (defined(GPSDO_TM1637) || defined(GPSDO_TM1637_6))
+  #error "GPSDO_DAC_EXT and TM1637 both claim PB4. Disable the TM1637 (the HT16K33 on I2C is the maintained clock display), or redefine PIN_DAC_CS."
 #endif
 /* exactly one TFT driver */
 #if (defined(GPSDO_TFT_ILI9341) + defined(GPSDO_TFT_ST7789) + defined(GPSDO_TFT_ILI9488)) > 1

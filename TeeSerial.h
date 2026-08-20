@@ -1,6 +1,6 @@
 /* =======================================================================
  * TeeSerial — mirror one logical stream onto two physical UARTs.
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * When GPSDO_BLUETOOTH_PARALLEL is enabled the firmware talks on USB Serial
  * and the Bluetooth UART (Serial2) at the same time: every byte written goes

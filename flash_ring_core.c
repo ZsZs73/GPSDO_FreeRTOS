@@ -1,6 +1,6 @@
 /* ======================================================================
  * flash_ring_core.c  —  hardware-independent ring-buffer logic
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * See flash_ring_core.h for the design and rationale.
  * ====================================================================== */
 #include "flash_ring_core.h"

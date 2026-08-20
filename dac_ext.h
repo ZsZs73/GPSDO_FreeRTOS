@@ -1,7 +1,7 @@
 /*
  * dac_ext.h — external SPI DAC on the control-voltage output. STUB.
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * NOT IMPLEMENTED. The interface is here so the decision can be made without
  * touching anything else; the body is empty and GPSDO_DAC_EXT is refused at

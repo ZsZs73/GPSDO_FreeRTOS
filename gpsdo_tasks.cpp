@@ -1,7 +1,7 @@
 /**
  * gpsdo_tasks.cpp — Sensor, Display and Uptime tasks
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -48,19 +48,17 @@ static bool i2c_probe(uint8_t addr)
 }
 
 /* ---- Sensor data globals ---------------------------------------------- */
-float  g_bmp_temp = 0.0f, g_bmp_pres = 0.0f, g_bmp_alti = 0.0f;
+float  g_bmp_temp = 0.0f, g_bmp_pres = 0.0f;
 float  g_aht_temp = 0.0f, g_aht_humi = 0.0f;
 float  g_ina_volt = 0.0f, g_ina_curr = 0.0f;
-
-/* ---- Frequency-error damping configuration ---------------------------- */
-uint16_t      g_freq_damp_win_dpll = 100; /* FAD: DPLL damping average window */
-uint16_t      g_freq_damp_win_lock = 100; /* FAL: LOCK damping average window */
 
 /* ---- LTIC globals (Lars TIC) ------------------------------------------ */
 #ifdef GPSDO_LTIC
 volatile bool g_ltic_must_read = false;
 int16_t       g_ltic_adc_raw   = 0;
 int16_t       g_ltic_adc_avg   = 0;
+uint16_t      g_freq_damp_win_dpll = 100; /* FAD: DPLL damping average window */
+uint16_t      g_freq_damp_win_lock = 100; /* FAL: LOCK damping average window */
 float         g_ltic_voltage   = 0.0f;
 
 /* ltic_read_fast — read PA1 (the TIC ramp) ~50 µs after the PPS edge, from
@@ -214,7 +212,6 @@ void vSensorTask(void *pvParameters)
             g_bmp_temp = s_bmp.readTemperature();
             float raw_pres = s_bmp.readPressure();
             g_bmp_pres = (raw_pres + g_pressure_offset) / 100.0f;
-            g_bmp_alti = s_bmp.readAltitude(g_bmp_pres + g_altitude_offset);
             xSemaphoreGive(xWireMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -440,7 +437,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
     if (g->pos_valid) {
         p=sa(buf,p,"Lat: "); p=sd(buf,p,g->lat,6);
         p=sa(buf,p," Lon: "); p=sd(buf,p,g->lon,6);
-        p=sa(buf,p," Alt: "); p=sd(buf,p,g->alt,1);
+        p=sa(buf,p," Alt: "); p=sd(buf,p,(double)g->alt + (double)g_altitude_offset,1);
         p=sa(buf,p,"m Sat:"); p=si(buf,p,g->sats);
         if (g->time_mode) { p=sa(buf,p," HDOP:TIME"); }
         else { p=sa(buf,p," HDOP:"); p=sd(buf,p,(double)g->hdop/100.0,2); }
@@ -472,10 +469,11 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
         static const char *algo_name[] = {
             "primitive", "forced-drift", "random-walk", "FLL-PID-man",
             "PLL-PI-man", "PLL-PID-man", "FLL-PID-gen", "PLL-PID-gen",
-            "hybrid-FLL-PLL", "NN-MLP", "LTIC-3stage", "LTIC-Lars" };
+            "hybrid-FLL-PLL", "NN-MLP", "LTIC-3stage", "LTIC-Lars",
+            "multi-level" };
         p=sa(buf,p,"\r\nLearn: algo="); p=si(buf,p,c->active_algo);
         p=sa(buf,p," (");
-        p=sa(buf,p,(c->active_algo <= 11) ? algo_name[c->active_algo] : "?");
+        p=sa(buf,p,(c->active_algo <= 12) ? algo_name[c->active_algo] : "?");
         p=sa(buf,p,")");
 
         if (c->active_algo == 11) {
@@ -489,6 +487,28 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
             p=sa(buf,p," scale="); p=sd(buf,p,(double)g_lars_scale,0);
             p=sa(buf,p," phase="); p=sd(buf,p,(double)g_lars_phase_filt,1);
             p=sa(buf,p,"ns "); p=sa(buf,p, g_lars_locked ? "LOCK" : "acq");
+        } else if (c->active_algo == 12) {
+            /* Algo 12 has no phase detector and no LRN feed-forward. What matters
+             * is the raw count error it accumulates and which level last acted:
+             * a low level means it is correcting often, a high one that it has
+             * settled and is averaging for longer before touching anything. */
+            /* static, NOT a local. The stack frame of this function is sized at
+             * compile time, so a struct declared in a branch that never executes
+             * still reserves its space on every call — and this runs inside
+             * vDisplayTask, which also carries four snapshot structs and
+             * TFT_eSPI's font rendering. Twenty bytes was enough to take the
+             * display task over its stack and the symptom was a white screen:
+             * the task died before tft.init() ever ran. Only this task calls it,
+             * so static costs nothing and is safe. */
+            static mlacc_stats_t m;
+            mlacc_get_stats(&m);
+            p=sa(buf,p," ph="); p=si(buf,p,(int)g_last_offset); p=sa(buf,p,"ns");
+            p=sa(buf,p," level="); p=si(buf,p,(int)m.last_action);
+            p=sa(buf,p," corr="); p=si(buf,p,(int)m.corrections);
+            p=sa(buf,p," arm="); p=si(buf,p,(int)m.arms);
+            p=sa(buf,p," sig="); p=si(buf,p,(int)m.sigma_ns); p=sa(buf,p,"ns");
+            p=sa(buf,p," zc="); p=si(buf,p,(int)m.zero_cross);
+            p=sa(buf,p," secs="); p=si(buf,p,(int)m.seconds);
         } else if (c->active_algo == 10) {
             /* Algo 10 (LTIC three-stage) is a state machine, not an LRN loop. */
             static const char *ltic_st[] = { "ACQ", "DPLL", "LOCK" };
@@ -785,6 +805,19 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   #define FREQ_SPR_Y       TFT_SY(22)                          /* top = header sep   */
   #define FREQ_SPR_H       (TFT_SY(58) - TFT_SY(22))           /* band height (px)   */
 
+/* Right-edge anchor for the frequency reading (MR_DATUM), both panels.
+ *
+ * The small panel used to centre the string instead. For the nominal reading
+ * the two agree exactly — font 1 at size 3 is fixed-width 18 px, so
+ * "10000000.0000 Hz" is 16 x 18 = 288 px and centring leaves 16 px margins,
+ * which is where an anchor 16 px in from the right edge puts it too. They part
+ * company only while the string is SHORTER, during acquisition: centred, the
+ * decimal point walks sideways as digits appear; anchored, it stays put and
+ * only the leading digits move. That is the reason the big panel anchors, and
+ * it applies here identically. */
+#if !defined(GPSDO_TFT_ILI9488)
+  #define FREQ_ANCHOR_X    (TFT_W - 16)
+#endif
 #if defined(GPSDO_TFT_ILI9488)
   /* Right-edge anchor for the frequency reading (MR_DATUM) — 480×320 only.
    * The value places the nominal reading dead centre: "10000000.0000 Hz" is
@@ -871,9 +904,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   /* left-column value anchor: right edge of the left half */
   #define TFT_COL_LVAL    (TFT_S(158))
 
-  /* Previous-value cache for selective redraw (16 + 1 extra slot for the
-   * split AHT humidity on the 480×320 panel). */
-  static char tft_prev[22][28];
+  /* Previous-value cache for selective redraw. One entry per drawn field, and
+   * fields have been split into label+value repeatedly (AHT humidity, qErr,
+   * dph, the INA current) so this has grown past the 16 it started at. Slot 22
+   * is the 320×240 panel's "d:" label. Highest slot used must stay below the
+   * bound: an out-of-range slot writes past the array with no diagnostic. */
+  static char tft_prev[23][28];
 
   /* Dirty flag: set when any tft_val/tft_val_r writes to the data sprite.
    * The update loop pushes the sprite once at the end of the cycle, so all
@@ -1527,19 +1563,66 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            *    long-window criterion stays, but it must be BACKED by the
            *    fast 10-s average still sitting near 10 MHz (±50 mHz) —
            *    losing discipline now kills the green in ~10 s, not minutes. */
-          if (c->active_algo == 10 || c->active_algo == 11) {
-              /* Both LTIC loops publish an authoritative live state and use the
-               * same trend vocabulary (ACQ / DPLL|PLL / LOCK), so green comes
-               * ONLY from trend "LOCK" — no long-average fallback. */
+          if (c->active_algo == 10 || c->active_algo == 11 ||
+              c->active_algo == 12) {
+              /* All three loops publish an authoritative live state and use the
+               * same trend vocabulary, so green comes ONLY from the trend — no
+               * long-average fallback.
+               *
+               * ALGORITHM 12 WAS MISSING FROM THIS LIST and fell through to the
+               * frequency-average branch below, which is exactly what the
+               * comment above says green must not be. Measured over the 20.08
+               * 16:04 run, 2.99 h: the loop and the colour disagreed for 15.0%
+               * of the samples, and every one of those was the loop LOCKED with
+               * the digits WHITE. Two causes, both structural rather than
+               * marginal:
+               *
+               *   For the first 17 minutes neither the 10 000 s nor the 1000 s
+               *   average exists, so `locked` below is false by construction.
+               *   The loop reached LOCK at 219 s and the digits stayed white
+               *   until 1041 s — thirteen and a half minutes of a disciplined
+               *   oscillator looking undisciplined. 48% of the disagreement.
+               *
+               *   The rest is the stale-echo guard, fixed separately below.
+               *
+               * CORR and ZC count as locked. They are one-second states that
+               * mean the loop is DOING ITS JOB — this algorithm corrects on a
+               * schedule as a form of self-test, which is the same reasoning
+               * that keeps them from resetting s_mla_quiet in the loop itself.
+               * Without this the digits would blink white once per correction:
+               * 16 times in the three hours measured. */
               locked = (strncmp(c->trendstr,"LOCK",4) == 0);
+              if (!locked && c->active_algo == 12)
+                  locked = (strncmp(c->trendstr,"CORR",4) == 0) ||
+                           (strncmp(c->trendstr,"ZC",2)   == 0);
           } else {
               if      (f->full10000) { double e = f->avg10000 - 10000000.0;
                                        locked = (e > -0.001 && e < 0.001); }
               else if (f->full1000)  { double e = f->avg1000  - 10000000.0;
                                        locked = (e > -0.010 && e < 0.010); }
               if (locked && f->full10) {
+                  /* ONE FULL COUNT, not half of one.
+                   *
+                   * The 10 s average is a cycle count over ten seconds, so its
+                   * granularity is 0.1 Hz and it can only ever read a multiple
+                   * of that. Measured over the 20.08 16:04 run it took exactly
+                   * three values — -100, 0 and +100 mHz — and nothing between.
+                   * A threshold of 50 mHz is therefore HALF A COUNT: it does
+                   * not mean "within 50 mHz", it means "the counter must read
+                   * exactly 10 000 000", and a single count either way killed
+                   * the green. That happened on 8.3% of settled samples and
+                   * accounted for 46% of the colour disagreeing with the loop.
+                   *
+                   * 0.15 Hz is one count plus half a count of margin: a
+                   * one-count wobble passes, and a genuine loss of discipline —
+                   * which is many counts, and is what this guard exists to
+                   * catch — still fails it. The alternative, testing avg100
+                   * against 50 mHz, is meaningful on ITS grid (10 mHz, and it
+                   * never left ±50 mHz in three hours) but responds in 100 s
+                   * where the point of this guard was to kill the green in
+                   * about ten. */
                   double e10 = f->avg10 - 10000000.0;
-                  if (e10 < -0.050 || e10 > 0.050) locked = false;  /* stale echo */
+                  if (e10 < -0.150 || e10 > 0.150) locked = false;  /* stale echo */
               }
               if (strncmp(c->trendstr,"hit",3) == 0) locked = true;
           }
@@ -1605,9 +1688,9 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #else
                   int sy_local = (TFT_SY(40) + TFT_YOFF) - FREQ_SPR_Y;
 #endif
-#if defined(GPSDO_TFT_ILI9488)
-                  /* Right-anchored (see FREQ_ANCHOR_X). Busy messages keep
-                   * MC_DATUM: proportional font, no columns to line up. */
+                  /* Right-anchored (see FREQ_ANCHOR_X), both panels. Busy
+                   * messages keep MC_DATUM: they are prose, not a column of
+                   * digits, and there is nothing in them to line up. */
                   if (busy) {
                       s_freq_sprite.setTextDatum(MC_DATUM);
                       s_freq_sprite.drawString(s, TFT_W/2, sy_local);
@@ -1615,12 +1698,6 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                       s_freq_sprite.setTextDatum(MR_DATUM);
                       s_freq_sprite.drawString(s, FREQ_ANCHOR_X, sy_local);
                   }
-#else
-                  /* Centred — the padded field makes the string a constant
-                   * width, so there is nothing for centring to shift. */
-                  s_freq_sprite.setTextDatum(MC_DATUM);
-                  s_freq_sprite.drawString(s, TFT_W/2, sy_local);
-#endif
                   if (!busy) TFT_FONT_FREQ_OFF(s_freq_sprite);
                   /* FREQ_SPR_Y is TFT_SY(22) — the sprite's first row lands
                    * exactly on the header separator, so the push would wipe it.
@@ -1641,7 +1718,6 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                   else      TFT_FONT_FREQ_ON(s_tft);
                   s_tft.setTextColor(fcol, TFT_COL_BG);
                   s_tft.setTextPadding(TFT_S(316));
-#if defined(GPSDO_TFT_ILI9488)
                   if (busy) {
                       s_tft.setTextDatum(MC_DATUM);
                       s_tft.drawString(s, TFT_W/2, TFT_SY(40) + TFT_YOFF);
@@ -1649,10 +1725,6 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                       s_tft.setTextDatum(MR_DATUM);
                       s_tft.drawString(s, FREQ_ANCHOR_X, TFT_SY(40) + TFT_YOFF);
                   }
-#else
-                  s_tft.setTextDatum(MC_DATUM);
-                  s_tft.drawString(s, TFT_W/2, TFT_SY(40) + TFT_YOFF);
-#endif
                   if (!busy) TFT_FONT_FREQ_OFF(s_tft);
                   /* the wide padding fill spills past the freq separator and
                    * the side rails — redraw them after each update */
@@ -1760,10 +1832,11 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       else snprintf(s,sizeof(s),"Lon: ---");
       tft_val(8, TFT_COL_R, TFT_GRID_Y+2*TFT_ROW_H, TFT_S(148), TFT_COL_VALUE, s);
 
-      if (g->pos_valid) snprintf(s,sizeof(s),"Alt:  %dm",(int)g->alt);
+      if (g->pos_valid) snprintf(s,sizeof(s),"Alt:  %dm",(int)(g->alt + g_altitude_offset));
       else              snprintf(s,sizeof(s),"Alt: ---");
 #if defined(GPSDO_TFT_ILI9488)
-      snprintf(s,sizeof(s), g->pos_valid ? "Alt:  %d m" : "Alt: ---", (int)g->alt);
+      snprintf(s,sizeof(s), g->pos_valid ? "Alt:  %d m" : "Alt: ---",
+               (int)(g->alt + g_altitude_offset));
       /* Alt gives up the right half of its field to qErr. Grouping is the whole
        * point: qErr is the receiver's own report on its 1PPS, so it belongs
        * with the fix data, which then leaves the row below free to hold Vcc
@@ -1820,7 +1893,74 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       }
   #endif
 #else
-      tft_val(9, TFT_COL_R, TFT_GRID_Y+3*TFT_ROW_H, TFT_S(148), TFT_COL_VALUE, s);
+      /* qErr joins the Alt row, grouped with the fix data it belongs to — the
+       * receiver's own report on its 1PPS sits beside the position it came
+       * with, and the row below is then free for the two supply rails.
+       * This is the arrangement the 480 uses; the small panel now matches it.
+       *
+       * The arithmetic, at the 8 px per character this font gives:
+       *     "Alt:175m"     8 ch = 64 px   168..232   (pad 64)
+       *     "qE:+12.3ns"  10 ch = 80 px   232..316   (pad 84, right-anchored)
+       * 64 + 84 = 148 = the width the field had as one cell, so the two
+       * background fills tile it exactly and neither erases the other's tail.
+       *
+       * TWO ABBREVIATIONS PAID FOR THE MOVE, both forced by 20 px:
+       *   - Alt gives up the space after its colon (as Vdd does below);
+       *   - the label is "qE:" not "qErr:".
+       * With "Alt: 175m" and "qErr:" the row wants 168 px and the cell is 148.
+       * Dropping only the spaces gets to 160, still 12 over — the label is the
+       * only remaining 16 px. The value keeps its sign and its decimal, which
+       * is the part that carries information. */
+      snprintf(s,sizeof(s), g->pos_valid ? "Alt:%dm" : "Alt:---",
+               (int)(g->alt + g_altitude_offset));
+      tft_val(9, TFT_COL_R, TFT_GRID_Y+3*TFT_ROW_H, TFT_S(64), TFT_COL_VALUE, s);
+  #ifdef GPSDO_LTIC
+      {   /* Guarded like the row it came from: qErr only ever shows under the
+           * LTIC algorithms, so without that hardware this would repaint an
+           * empty slot once a second forever. */
+          bool saw = g_qerr_enable;   /* what dph has had removed, whatever the algo */
+          if (saw && g_qerr_valid) {
+              /* Fixed-width magnitude and an always-present sign, so the digits
+               * do not shuffle sideways when qErr crosses zero. */
+              double q = (double)g_qerr_ns;
+              char sign = (q < 0.0) ? '-' : '+';
+              static char fq[8]; dtostrf(fabs(q), 4, 1, fq);  /* width 4: " 9.9" */
+              snprintf(s, sizeof(s), "%c%sns", sign, fq);
+          } else if (saw) {
+              snprintf(s, sizeof(s), "---");
+          } else {
+              s[0] = '\0';
+          }
+          /* LABEL AND VALUE ARE TWO FIELDS. They were one right-anchored
+           * string, and the label jumped: anchoring the whole thing keeps "ns"
+           * still but drags "qE:" left and right as the digits change width.
+           * The label belongs to the slot, not to the value — exactly what the
+           * 480 branch above says, and this is the same fix.
+           *
+           * The label carries padding of its own so that it erases itself when
+           * SAW goes off and its string becomes empty. Paddings are MEASURED
+           * widths of each field's widest form, not 8 px per character — font 2
+           * is proportional and the two disagree by a fifth:
+           *     Alt     TFT_S(64) = 64 px   168..232   ("Alt:1750m"  60)
+           *     "qEr:"  TFT_S(26) = 26 px   232..258   ("qEr:"       25)
+           *     value   TFT_S(56) = 56 px   258..314   ("+123.4ns"   56)
+           * 64 + 26 + 56 = 146 = TFT_COL_R..314, so the three fills tile the
+           * row exactly and none erases its neighbour's edge.
+           *
+           * The anchor is 314, not the cell's own 316: it is the alignment
+           * line this panel already uses for Vdd (TFT_W - TFT_S(6)), and dph
+           * and the INA current are pinned to it too, so the four right edges
+           * form one column instead of four near-misses.
+           *
+           * The label got its 'r' back. It was cut to "qE:" when the field was
+           * one 148 px cell counted at 8 px per character; measured, the row
+           * has the 6 px, and "qEr:" is the abbreviation that reads as qErr. */
+          tft_val  (17, TFT_COL_R + TFT_S(64), TFT_GRID_Y+3*TFT_ROW_H,
+                    TFT_S(26), TFT_COL_VALUE, saw ? "qEr:" : "");
+          tft_val_r(14, TFT_COL_R + TFT_S(146), TFT_GRID_Y+3*TFT_ROW_H,
+                    TFT_S(56), TFT_COL_VALUE, s);
+      }
+  #endif
 #endif
 
 #if defined(GPSDO_TFT_ILI9488)
@@ -1863,12 +2003,40 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                   (uint16_t)ina_ma_w, TFT_COL_VALUE, s);
       }
 #else
-      if (ina_ok) { static char fv[10],fi[10];
-          dtostrf(g_ina_volt,5,3,fv); dtostrf(g_ina_curr,6,2,fi);
-          snprintf(s,sizeof(s),"INA: %sV %smA",fv,fi);
+      /* TWO FIELDS, so the current lands on this panel's right-hand alignment
+       * line — the same 314 that Vdd, qErr and dph are anchored to. As one
+       * string its right edge was wherever the text happened to end (309 with
+       * today's readings) and it moved whenever a digit was gained or lost.
+       *
+       * The paddings are the MEASURED widths of each field's widest form, not
+       * 8 px per character — font 2 is proportional, and the difference is not
+       * small: "INA:4.920V" measures 68 px where counting characters says 80.
+       *     voltage  TFT_S(76) = 76 px   168..244   ("INA:12.050V" 76)
+       *     current  TFT_S(70) = 70 px   244..314   ("1250.00mA"   69)
+       * 76 + 70 = 146 = TFT_COL_R..314, so the two fills tile the row exactly
+       * and neither erases the other's edge.
+       *
+       * Both widest forms, not today's: dtostrf's width is a MINIMUM, so a
+       * 12 V supply prints six characters where 4.9 V prints five, and a
+       * DOCXO's oven pulls past 1000 mA on warm-up and prints seven. Sizing
+       * for the usual reading is what makes a field eat its neighbour the one
+       * time it matters.
+       *
+       * The space after the colon is gone — that is the 6 px that decides
+       * whether the 12 V form fits, and it also puts this row in step with
+       * "Alt:", "Vph:", "Vcc:" and "Vdd:", none of which carries one. */
+      { static char fv[10],fi[10];
+        if (ina_ok) { dtostrf(g_ina_volt,5,3,fv);
+                      snprintf(s,sizeof(s),"INA:%sV",fv); }
+        else          snprintf(s,sizeof(s),"INA:---");
+        tft_val(10, TFT_COL_R, TFT_GRID_Y+4*TFT_ROW_H,
+                TFT_S(76), TFT_COL_VALUE, s);
+        if (ina_ok) { dtostrf(g_ina_curr,6,2,fi);
+                      snprintf(s,sizeof(s),"%smA",fi); }
+        else          s[0] = '\0';
+        tft_val_r(20, TFT_COL_R + TFT_S(146), TFT_GRID_Y+4*TFT_ROW_H,
+                  TFT_S(70), TFT_COL_VALUE, s);
       }
-      else snprintf(s,sizeof(s),"INA: ---");
-      tft_val(10, TFT_COL_R, TFT_GRID_Y+4*TFT_ROW_H, TFT_S(148), TFT_COL_VALUE, s);
 #endif
 
       /* ---- sensor row ---- */
@@ -1982,7 +2150,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
         }
       }
 #else
-      tft_val(12, TFT_COL_R, TFT_SENS_Y, TFT_S(148), TFT_COL_VALUE, s);
+      /* AHT joins BMP in the left column, one row below it — environmental
+       * sensors together, phase data on the right. Same grouping as the 480.
+       * "AHT: 50.0C 11.7%rH" is 18 ch = 144 px at 8 px per character, inside
+       * the 156 px left cell with room to spare; it was already fitting the
+       * narrower 148 px right cell it came from. */
+      tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H, TFT_S(156), TFT_COL_VALUE, s);
 #endif
 
 #ifdef GPSDO_LTIC
@@ -2093,10 +2266,56 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           tft_val_r(21, align_R, TFT_SENS_Y,
                     (uint16_t)ns_pad, TFT_COL_VALUE, s);
 #else
-          if (cal) snprintf(s, sizeof(s), "Vph:%sV dph:%+4ldns", fv, (long)ns);
-          else     snprintf(s, sizeof(s), "Vph:%sV", fv);
-          tft_val(13, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
-                  TFT_S(156), TFT_COL_VALUE, s);
+          /* Right column, top sensor row — the place the 480 puts it.
+           *
+           * TWO FIELDS, NOT ONE STRING, for the reason the 480 states: a single
+           * right-anchored string nails the unit down but drags the label along
+           * with the digits. Vph keeps its slot's left edge and never moves;
+           * the phase keeps a right anchor so "ns" stays put; only the gap
+           * between them changes.
+           *
+           * It also would not fit as one string. At 8 px per character
+           * "Vph:1.951V dph:+110ns" is 21 ch = 168 px and this cell is 148 —
+           * which is why it used to sit in the wider left column, and even
+           * there it overflowed by 12 px whenever the detector was calibrated.
+           * Splitting it is what makes the move possible AND fixes that.
+           *
+           * THREE fields now, not two — the label came back. It was dropped
+           * because at 8 px per character the row wanted 168 px of a 148 px
+           * cell; measured, "Vph:1.951V" is 70 px rather than 80 and a bare
+           * "d:" is 10 rather than 16, so the row has 20 px it was never
+           * credited with. Font 2 is proportional; counting characters
+           * overstates it by about a fifth, and that error is what cost this
+           * label in the first place.
+           *
+           * The paddings tile the row exactly, so no fill erases a neighbour:
+           *     Vph    TFT_S(73) = 73 px   168..241   ("Vph:1.951V"  70)
+           *     "dp:"  TFT_S(18) = 18 px   241..259   ("dp:"         17)
+           *     phase  TFT_S(55) = 55 px   259..314   ("+1030ns"     51)
+           * 73 + 18 + 55 = 146 = TFT_COL_R..314, the alignment line Vdd, qErr
+           * and the INA current all sit on.
+           *
+           * The value's pad is sized for a FOUR-digit phase, which is what the
+           * detector's unambiguous range allows and what this field was sized
+           * for when it was one cell. A five-digit reading would be 59 px and
+           * would overrun the label — if LC ever calibrates a range that wide,
+           * this pad and the label's have to be re-cut, not left to find out.
+           *
+           * Vph's pad is its own width plus 3, which is what puts "d:" three
+           * pixels off the "V" — Vph is fixed-width (dtostrf 5,3 spans
+           * 0.000..9.999), so that gap is a constant, not today's coincidence.
+           *
+           * The label follows CAL, like the value: with the detector
+           * uncalibrated there is no phase to label, and its own padding is
+           * what erases it. */
+          snprintf(s, sizeof(s), "Vph:%sV", fv);
+          tft_val(13, TFT_COL_R, TFT_SENS_Y, TFT_S(73), TFT_COL_VALUE, s);
+          tft_val(22, TFT_COL_R + TFT_S(73), TFT_SENS_Y,
+                  TFT_S(18), TFT_COL_VALUE, cal ? "dp:" : "");
+          if (cal) snprintf(s, sizeof(s), "%+4ldns", (long)ns);
+          else     s[0] = '\0';
+          tft_val_r(21, TFT_COL_R + TFT_S(146), TFT_SENS_Y,
+                    TFT_S(55), TFT_COL_VALUE, s);
 #endif
       }
 #endif /* GPSDO_LTIC — the phase row ends here */
@@ -2149,39 +2368,43 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           tft_val_r(15, TFT_W - TFT_S(6), TFT_SENS_Y + TFT_ROW_H,
                     TFT_S(66), TFT_COL_VALUE, s);
 #else
-          /* 320 has no room for Vcc, so qErr keeps this row where it always was
-           * — but only when the TIC is built, since qErr only ever shows under
-           * algo 10. Without it there is nothing to make room for and Vdd keeps
-           * its second decimal. */
-  #ifdef GPSDO_LTIC
-          /* Always a sign and a fixed-width magnitude, so the digits don't
-           * shuffle sideways when qErr crosses zero (the '-' would otherwise
-           * appear and disappear, shifting everything after it). */
-          bool saw = g_qerr_enable;   /* what dph has had removed, whatever the algo */
-          if (saw) {
-              if (g_qerr_valid) {
-                  double q = (double)g_qerr_ns;
-                  char sign = (q < 0.0) ? '-' : '+';
-                  static char fq[8]; dtostrf(fabs(q), 4, 1, fq); /* width 4: " 9.9" */
-                  snprintf(s, sizeof(s), "qErr:%c%sns", sign, fq);
-              } else {
-                  snprintf(s, sizeof(s), "qErr: ---");
-              }
+          /* The two supply rails share this row, which is the arrangement the
+           * 480 uses. qErr has moved up to the Alt row, and that is what made
+           * the space: with it gone, Vdd no longer has to shrink to one decimal
+           * to stay clear, so both rails read at full precision.
+           *
+           * The arithmetic, on MEASURED glyph widths rather than 8 px per
+           * character — font 2 is proportional and counting characters
+           * overstates it by about a fifth:
+           *     "Vcc:4.920V"  70 px   168..240   (pad 72)
+           *     "Vdd:3.29V"   62 px   240..314   (pad 74, right-anchored)
+           * 72 + 74 = 146 = TFT_COL_R..314, so the two fills tile the row
+           * exactly. Neither carries a space after its colon — that space is
+           * what the third decimal below is paid for with.
+           *
+           * Vcc cannot outgrow its field: the divider halves the rail and the
+           * ADC reference is 3.3 V, so the reading saturates at 6.6 V and the
+           * integer part is always one digit. */
+  #ifdef GPSDO_VCC
+          if (c->avg_vcc_adc > 0) {
+              /* Three decimals, the same as the 480 and as Vctl. This used to
+               * be two because the third digit was reckoned to cost 8 px the
+               * row did not have; measured, it costs 8 px and the row has 10.
+               * The digit is worth having: the divider halves the rail, so one
+               * ADC LSB is ~1.6 mV at the input and the third decimal is
+               * carrying real information rather than dressing up noise. */
+              static char fc[10];
+              dtostrf((double)c->avg_vcc_adc / 4096.0 * 3.3 * 2.0, 5, 3, fc);
+              snprintf(s, sizeof(s), "Vcc:%sV", fc);
           } else {
-              s[0] = '\0';
+              snprintf(s, sizeof(s), "Vcc:---");
           }
-          tft_val(14, TFT_COL_R, TFT_SENS_Y + TFT_ROW_H, TFT_S(84), TFT_COL_VALUE, s);
-  #else
-          const bool saw = false;
+          tft_val(18, TFT_COL_R, TFT_SENS_Y + TFT_ROW_H, TFT_S(72), TFT_COL_VALUE, s);
   #endif
-          /* Padding 66 px fits the longest form "Vdd: 3.29V" (SAW off). When SAW
-           * is on and qErr occupies the left of the row, Vdd is the short
-           * "Vdd: 3.3V" (1 decimal), so the wider background never reaches the
-           * qErr field — the long Vdd only appears when qErr is blank. */
-          dtostrf(vdd, saw ? 3 : 4, saw ? 1 : 2, fv);
-          snprintf(s, sizeof(s), "Vdd: %sV", fv);
+          dtostrf(vdd, 4, 2, fv);
+          snprintf(s, sizeof(s), "Vdd:%sV", fv);
           tft_val_r(15, TFT_W - TFT_S(6), TFT_SENS_Y + TFT_ROW_H,
-                    TFT_S(66), TFT_COL_VALUE, s);
+                    TFT_S(74), TFT_COL_VALUE, s);
 #endif
       }
 

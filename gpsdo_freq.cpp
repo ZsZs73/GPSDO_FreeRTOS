@@ -1,7 +1,7 @@
 /**
  * gpsdo_freq.cpp — vFreqRelayTask — frequency measurement processing
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -203,7 +203,7 @@ void vFreqRelayTask(void *pvParameters)
                 if (diff > FREQ_LOWER && diff < FREQ_UPPER) {
                     f->calcfreq64     = diff;
                     f->calcfreqint    = (uint32_t)diff;
-                    f->instant_offset = (int8_t)((int64_t)diff - (int64_t)BASE_FREQ);
+                    f->instant_offset = (int16_t)((int64_t)diff - (int64_t)BASE_FREQ);
                     log_freq_offset(f);
                     f->ppscount++;
                     f->must_adjust = true;

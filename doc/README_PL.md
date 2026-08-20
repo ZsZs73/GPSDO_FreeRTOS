@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v1.03
+# GPSDO FreeRTOS v1.05
 
 [English](README_EN.md) | **Polski** | [Español](README_ES.md)
 
@@ -19,6 +19,7 @@ na platformie STM32 BlackPill (WeAct F411CE / F401CCU6).
 | Obsługa ILI9486 / ILI9488 — impuls do implementacji | **lucido** (forum EEVBlog) |
 | Autor v0.06c — inspiracja portu RTOS | **André Balsa** — [repozytorium](https://github.com/AndrewBCN/STM32-GPSDO) |
 | Ciągła pętla PI (algorytm 11) — projekt oryginalny | **Lars Walenius** (pamięci) — kontroler GPSDO udostępniony społeczności [time-nuts](http://www.leapsecond.com/time-nuts.htm) i EEVBlog. Rozwinięty tutaj o auto-kalibrację z CT, gałąź akwizycji prowadzoną częstotliwością i pomost przechwytywania fazy picDIV. |
+| Akumulator wielopoziomowy (algorytm 12) — projekt oryginalny | **Alan Cashin** (MIS42N, forum EEVBlog) — [profil](https://www.eevblog.com/forum/profile/?u=121386) — jego Budget GPSDO jest źródłem algorytmu 12, korekcji przejścia przez zero, ditherowanego PWM osiągającego 24 bity z krótkiego przebiegu oraz pomysłu na samoocenę `CS`. Zaimplementowane tutaj na detektorze fazy LTIC, z granicami poziomów pozostawionymi do edycji, bo tylko ta dla 128 s została kiedykolwiek wyprowadzona ze specyfikacji. |
 | Projekt PCB (prototyp) | **Scrachi** (forum EEVBlog) — [post z plikami](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/825/) · [profil](https://www.eevblog.com/forum/profile/?u=762266) |
 | Wątek projektowy | [Yet another DIY GPSDO](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/) — EEVBlog Forum |
 
@@ -151,6 +152,7 @@ Firmware oferuje jedenaście algorytmów przełączanych komendą `LA n` (0–10
 | 9 | Sieć neuronowa | e/∫e/de + temp | 10 s | MLP 5-wejść; uczy się tempco oscylatora, termicznie kompensowany holdover |
 | 10 | LTIC | faza TIC + częst. | etapowy | Trzy etapy ACQ→DPLL→LOCK; sprzętowy detektor fazy, samokalibrujący |
 | 11 | LTIC-Lars | faza TIC | ciągła | Pojedyncza ciągła pętla PI, bez maszyny stanów; wzmocnienie wyliczane z `CT`. Wg Larsa Waleniusa |
+| 12 | Akumulator wielopoziomowy | faza LTIC [ns] | adaptacyjna | Brak stałej czasowej do ustawienia: błąd sam wybiera okno uśredniania. Wg Alana Cashina (MIS42N). **Niedostrojony.** |
 
 Algorytmy PLL (4, 5, 7 i gałąź PLL algo 8) używają architektury
 **dwuczasowej**, strojonej pod „szybkie złapanie, łagodne pilnowanie fazy":
@@ -246,18 +248,42 @@ kompilacji przez `TFT_SX` / `TFT_SY` / `TFT_F`. Rozmieszczenie pól jest więc
 sposób renderowania tekstu, a ta różnica jest na tyle duża, że ma znaczenie.
 
 ```
- ┌──────────────────────────────────────────┐
- │  GPSDO v1.00-rtos            LOCK        │  pasek stanu + trend pętli
- │                                          │
- │        1 0 0 0 0 0 0 0   H z             │  częstotliwość, duży monospace
- │                                          │
- │  PWM  40849      Vctl  1.799 V           │  wyjście sterujące i napięcie
- │  dph   -5.3 ns   Vphase 2.083 V          │  błąd fazy i detektor
- │  Sat 11  HDOP 0.77   Up 000d 01:42:12    │  stan GPS i czas pracy
- │  BMP 51.1C  1006.7hPa   INA 4.92V 182mA  │  czujniki
- │  14:32:45  Pon 28/07/2026                │  zegar
- └──────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────┐
+ │ GPSDO v1.05-rtos                LMT 14:32:45 Pon │   nagłówek: wersja + czas lokalny
+ │                                                  │
+ │          1 0 0 0 0 0 0 0 . 0 0 0 0  H z          │   częstotliwość, duży font
+ │                                                  │
+ │ UTC: 12:32:45 Pon        Sat: 11 HDOP: 0.77      │
+ │ DATE: 28/07/2026         Lat:  52.229676         │
+ │ Uptime: 000d 01:42:12    Lon:  21.012229         │
+ │ Algo: 12 LOCK            Alt:118m     qEr:-4.2ns │   algorytm + trend   |  dane fiksu + qErr
+ │ PWM:40849 Vct:1.799V     INA:4.920V     182.00mA │   wyjście sterujące  |  monitor zasilania
+ │ BMP: 51.1C 1006.7hPa     Vph:2.083V dp:     -5ns │   czujniki           |  detektor fazy
+ │ AHT: 24.60C 41.20%rH     Vcc:5.012V    Vdd:3.29V │                      |  szyny zasilania
+ │                                                  │
+ │               DISCIPLINED  FIX OK                │   pasek stanu (kolor = stan)
+ └──────────────────────────────────────────────────┘
 ```
+
+Układ powyżej jest taki sam na obu panelach. Nie zawsze taki był — obie gałęzie
+rozjeżdżały się pole po polu aż do v1.05, kiedy mały panel wrócił do szeregu:
+qErr siedzi w wierszu Alt obok danych fiksu, czujniki środowiskowe dzielą lewą
+kolumnę, elektryczne prawą, a Vcc i Vdd dzielą dolny wiersz czujników.
+
+**Jeśli zmieniasz układ małego panelu, mierz — nie licz znaków.** Font 2 jest
+proporcjonalny. `Vph:1.951V` to 70 px, a nie 80, które sugeruje dziesięć znaków
+po 8 px; w skali wiersza zawyżenie sięga jednej piątej. Dwa pola zostały już na
+podstawie tej arytmetyki skasowane i oba się mieściły, gdy je zmierzono.
+`tft_text_w()` pyta bibliotekę — tak robi cała gałąź 480; tam, gdzie zamiast tego
+użyto stałej, komentarz obok podaje zmierzoną szerokość, z której pochodzi.
+
+Padding każdego pola to szerokość jego **najszerszej** formy, a nie dzisiejszego
+odczytu: argument szerokości w `dtostrf()` jest minimum, więc wartość zyskuje
+znak przy przekroczeniu potęgi dziesiątki, a padding wymierzony na typowy
+przypadek pozwala temu znakowi wylądować na sąsiedzie. Paddingi w wierszu
+kafelkują go dokładnie — bez dziur i bez nakładek — więc żadne tło nie zetrze
+krawędzi sąsiedniego pola. Na małym panelu wszystkie pola prawej kolumny są
+zakotwiczone na x=314.
 
 **320×240 (ILI9341, ST7789)** używa klasycznych fontów numerycznych GLCD do
 ekranu roboczego. Mają już właściwy rozmiar w skali 1:1, renderują się szybko i
@@ -619,6 +645,7 @@ liter** (`LA`, `la` i `La` są równoważne), więc działa dowolna wielkość l
 | `CT` | Kalibracja + auto-strojenie: pomiar K, wyliczenie PID dla algo 3-9 (+ LTIC 10 & 11; auto-save) |
 | `T [baud]` | Tunel GPS na USB dla u-center — czysty dwukierunkowy NMEA/UBX (telemetria na Bluetooth jeśli jest, inaczej wyciszona); opcjonalny baud UART GPS, zachowany po wyjściu; wyłącza się po 300 s |
 | `SP <n>` | Ustaw PWM DAC bezpośrednio (1–65535), omija algorytm |
+| `DAC` | Wyjście napięcia sterującego: ścieżka, kod 24/16-bitowy i dokładny, zmierzone Vctl, wielkość kroku w µHz i df/f (liczby w Hz wymagają `CT`) |
 | `RH` | Tryb raportowania: czytelny (domyślny) |
 | `RD` | Tryb raportowania: rozdzielany tabulatorem |
 | `RP` | Wstrzymaj strumień danych serial/BT |
@@ -632,7 +659,7 @@ liter** (`LA`, `la` i `La` są równoważne), więc działa dowolna wielkość l
 |---------|------|
 | `MH` | Włącz tryb holdover (ręczny) |
 | `MD` | Włącz tryb dyscyplinowany |
-| `LA [0-10]` | Wybierz / pokaż algorytm sterowania |
+| `LA [0-12]` | Wybierz / pokaż algorytm sterowania |
 | `AP` | Uzbrój picDIV — zatrzymuje wyjście na 1,0–1,2 s, resynchronizuje z GPS 1PPS |
 
 ### Dostrajanie algorytmów
@@ -671,7 +698,7 @@ TZ Kolkata           → UTC+5:30, bez DST
 
 Nazwy miast są unikalne w całej bazie IANA, więc region jest opcjonalny —
 `TZ Australia/Adelaide` też działa — a wielkość liter nie ma znaczenia.
-Wbudowanych jest 407 stref.
+Wbudowanych jest 503 strefy.
 
 Regułę można też podać w całości, co ma znaczenie, gdy rząd zmieni przepisy,
 zanim firmware to nadgoni:
@@ -1127,6 +1154,91 @@ Brakujące urządzenie zgłasza `not found`, a firmware działa dalej bez niego.
 
 ---
 
+## Algorytm 12 — akumulator wielopoziomowy
+
+Wg konstrukcji Alana Cashina (MIS42N z forum EEVblog). Każda inna pętla tutaj ma
+jedną stałą czasową, a ta jest kompromisem, którego nikt nie wygrywa: zmierzone
+względem wzorca rubidowego, `LTC 60` jest do 1,58× lepsze powyżej 800 s, a
+`LTC 240` do 1,44× lepsze między 10 a 400 s. Trzeba wybrać jedno.
+
+Ten algorytm nie wybiera. Odczyty gromadzą się w poziomach — poziom n obejmuje
+2^n sekund — a korekcja następuje na **najniższym** poziomie, którego błąd
+przekracza granicę tego poziomu. Duży błąd działa w ciągu dwóch sekund, mały
+czeka na dłuższe uśrednienie. Nie ma `LTC` do ustawienia.
+
+Poziomy wynikają z układu bitów licznika sekund, a nie z tablicy buforów: przegląd
+od najmłodszego bitu w górę, zatrzymanie na pierwszym zerze. Jedenaście poziomów —
+od 2 s do 2048 s — kosztuje 22 bajty.
+
+### Co mierzy
+
+**Fazę w nanosekundach, z detektora LTIC.** Pierwsza wersja karmiła algorytm
+błędem zliczeń TIM2 w całych hercach i była ślepa: zdyscyplinowany oscylator siedzi
+daleko poniżej 1 Hz, więc pole czytało zero w 83% i 95% próbek w dwóch przebiegach,
+a algorytm nigdy nie korygował. Faza się całkuje tam, gdzie sekundowy pomiar
+częstotliwości nie — błąd 10⁻¹¹ jest niewidoczny w zliczeniach, ale po 2500 s daje
+25 ns fazy.
+
+**Detektor jest wymagany.** Wcześniejsza wersja miała gałąź awaryjną całkującą
+błąd zliczeń na płytkach bez detektora; nie odtwarzała ona fazy, tylko gromadziła
+błądzenie losowe szumu kwantyzacji, które przekraczało granicę poziomu, wyzwalało
+korekcję, uderzało w ogranicznik i wyrzucało detektor na szynę — zmierzone jako
+6000 kroków wahnięcia PWM w 148 korekcjach, z detektorem na szynie przez 58% czasu.
+`LA 12` odmawia teraz bez `GPSDO_LTIC`, a gdy detektor jest, ale nie czyta,
+algorytm wstrzymuje się zamiast zgadywać.
+
+Tak jak algorytmy 10 i 11, zbroi picDIV. Bez tego rampa detektora stoi na szynie,
+odczyt nigdy nie staje się poprawny, a algorytm po cichu wraca do bycia ślepym.
+Pomost czeka na kilka kolejnych nieudanych odczytów, zanim ruszy dzielnik, potem
+robi przerwę na ustalenie fazy. Trend pokazuje wtedy `ARM`.
+
+### Progi wyliczane z pomiaru szumu
+
+Granice poziomów były najpierw wzięte z tablicy Alana i przeskalowane stosunkiem
+kroków licznika. To zła wielkość do skalowania: próg musi przekraczać **szum**
+pomiaru fazy — detektora, sawtootha i wahania GPS razem — a ten różni się między
+konstrukcjami z powodów, których rozmiar kroku nie oddaje.
+
+Zmierzone na jednej płytce: średnia fazy −1 ns przy odchyleniu standardowym
+462 ns. Oscylator był ustawiony poprawnie, a całe to rozrzucenie to szum — podczas
+gdy próg poziomu 0 wynosił 462 ns i przekraczało go 41% próbek. Efekt: 620 korekcji
+w 1685 sekundach, hierarchia resetowana co 2,7 s i nigdy nieosiągająca poziomu 2.
+
+Firmware szacuje więc szum na bieżąco i wylicza z niego próg każdego poziomu. Próg
+dotyczy wyrażenia testowego `|3b − a|`, którego odchylenie wynosi `σ·√(2^L)·√10` —
+nie średniej fazy, dla której byłoby to `σ/√N`. Sześć sigma na właściwej wielkości
+daje odstęp między korekcjami rzędu minuty.
+
+`ML` raportuje zmierzony szum i to, czy granice za nim podążają; telemetria niesie
+go jako `sig=`. Ustawienie `MG` powyżej zera zatrzymuje autotuning i zachowuje
+tablicę zapisaną ręcznie.
+
+### Komendy
+
+| Komenda | Działanie |
+|---------|-----------|
+| `LA 12` | Wybór algorytmu |
+| `MG [v]` | Wzmocnienie w LSB na ns. 0 = wylicz z kalibracji `CT` i strój progi automatycznie |
+| `MR [n]` | Wymuś korekcję po osiągnięciu poziomu n, niezależnie od granic |
+| `MLP <n> [ns]` | Granica fazy dla poziomu n; bez wartości wypisuje bieżącą |
+| `MF [0-3]` | Skąd biorą się limity, niezależnie od `MG`: 0 śledź `MG`, 1 tablica zapisana, 2 formuła sigma, 3 mierzone |
+| `MFT [s]` | Tylko `MF 3`: docelowy odstęp w sekundach między korekcjami wywołanymi samym szumem (domyślnie 3600) |
+| `ML` | Lista wzmocnienia, poziomu wymuszenia, zmierzonego szumu i wszystkich granic |
+| `ES ALGO12` | Zapis bloku do flash ringu |
+
+### Niedostrojony — i dlaczego
+
+Tylko **jedna** granica została kiedykolwiek wyprowadzona. Specyfikacja Alana
+mówiła 10 MHz ±0,01 Hz, co daje 125 ns fazy w 128 sekundach — i to ustala wpis dla
+128 s. Mógł użyć 64 ns przy 64 s, ale tani moduł ze słabym sygnałem błądzi ±100 ns
+i generowałby fałszywe błędy. O reszcie mówi wprost: *„działają przez większość
+czasu, ale nie były w żaden sposób optymalizowane"*.
+
+Nie ma więc czego wiernie odtwarzać poza tą jedną kotwicą — stąd autotuning i stąd
+cała tablica pozostaje edytowalna i zapisywana per płytka.
+
+---
+
 ## Samoocena bez wzorca — `CS`
 
 Algorytm 11 został zweryfikowany względem wzorca rubidowego na cudzym stanowisku.
@@ -1172,6 +1284,81 @@ zamiast podawać liczbę bez określonego znaczenia.
 > mierzonego wewnątrz pętli tego nie zobaczy. Małą wartość czytaj jako „pętla z
 > niczym nie walczy" — konieczne, ale niewystarczające. Sygnałem użytecznym jest
 > wartość rosnąca.
+
+---
+
+## 24-bitowe napięcie sterujące — PWM z ditherem (`GPSDO_PWM_DITHER`)
+
+Pomysł jest Alana Cashina (MIS42N na EEVBlog), z jego Budget GPSDO: puść PWM na
+mniejszej liczbie bitów, niż potrzebujesz, i zmieniaj wypełnienie z okresu na
+okres tak, by brakujące bity niosła **średnia**.
+
+**Zyskiem jest nośna, a nie dodatkowe bity.** Tętnienie trzeba odfiltrować poniżej
+jednego kroku wyjścia, a jak trudne to jest, zależy od tego, jak wysoko nośna
+siedzi nad zakresem filtru:
+
+| | nośna | zakres filtru | stała czasowa |
+|---|---|---|---|
+| PWM 16-bitowy | 2 kHz | 0,7 Hz | 230 ms |
+| dither 13-bitowy (domyślny) | 12,2 kHz | 4,2 Hz | 38 ms |
+| dither 12-bitowy | 24,4 kHz | 8,4 Hz | 19 ms |
+
+Opóźnienie filtru wchodzi do pętli wprost jako przesunięcie fazy, więc
+sześciokrotnie krótszy filtr jest wart więcej niż sama rozdzielczość. Ta dochodzi
+za darmo.
+
+**Jak to działa tutaj.** Alan ditheruje w przerwaniu timera, bo PIC nie ma DMA. Na
+tym układzie byłoby to 12 000 przerwań na sekundę konkurujących z przechwytem
+1PPS — jedynym przerwaniem w tym firmware, którego nie wolno opóźniać. Ale wzór
+ditheru dla stałej wartości jest okresowy: powtarza się co 2^(24−N) okresów. Jest
+więc liczony raz do tablicy i odtwarzany przez DMA do rejestru porównania, a CPU
+między zmianami wartości nie dotyka niczego.
+
+Średnia jest **dokładna**, nie przybliżona: tablica trzyma dokładnie Y wpisów o
+wartości X+1 wśród 2^(24−N), więc uśrednia się do X + Y/2^(24−N), czyli z
+konstrukcji do wartości 24-bitowej. Odtwarzanie jej nie może dryfować.
+
+| `GPSDO_PWM_DITHER_BITS` | tablica | RAM (dwa bufory) | nośna | CPU |
+|---|---|---|---|---|
+| 12 | 4096 wpisów | 16 KB | 24,4 kHz | 0,025% |
+| 13 (domyślnie) | 2048 wpisów | 8 KB | 12,2 kHz | 0,012% |
+
+Ten sam pin co zwykły PWM — **PB9, TIM4 CH4** — więc dotychczasowy filtr i
+okablowanie zostają bez zmian. TIM4_UP steruje DMA1 Stream 6 Channel 2; takt 2 Hz
+jest na TIM9, a łańcuch 1PPS na TIM2/TIM3, więc nic innego nie jest ruszane. Dwa
+bufory w sprzętowym trybie double-buffer sprawiają, że zmiana wartości nigdy nie
+daje glitcha na pinie — i oba są przepisywane przy każdym zapisie: wypełnienie
+tylko jednego zostawia drugi odtwarzający poprzedni kod aż do następnego zapisu,
+co daje na wyjściu falę prostokątną o częstotliwości około 3 Hz.
+
+**Włączone** w wysyłanym `gpsdo_config.h` od v1.05 — w v1.04 było domyślnie
+wyłączone, dopóki ścieżka wyjściowa nie została sprawdzona. Zakomentowanie
+`GPSDO_PWM_DITHER` wraca do zwykłego PWM 16-bitowego; pin, filtr i okablowanie są
+w obu przypadkach te same, więc poza płytką nic się nie zmienia. Wymaga
+`configUSE_MUTEXES` i `INCLUDE_xTaskGetSchedulerState`, które ten projekt ustawia
+teraz jawnie. Wzajemnie wyklucza się z `GPSDO_DAC_EXT` — włączenie obu jest
+błędem kompilacji, bo oba sterują napięciem sterującym.
+
+### Co pętla robi z dolnymi 8 bitami
+
+Od v1.05 pętla sterowania zachowuje ułamek swojej korekcji, zamiast go obcinać.
+Na zmierzonym tutaj obiekcie jeden krok 16-bitowy to około 320 µHz — 3,2e-11 z
+10 MHz, grubiej niż 4e-12, które pętla trzyma przez 10 000 s, a dochodziła tam
+polując między sąsiednimi kodami. Z zachowanym ułamkiem krok wynosi **1,25e-13**
+i polowanie znika.
+
+Ułamek należy do warstwy DAC, nie do pętli. Wartość sterująca zapisywana jest z
+21 miejsc, a dwadzieścia z nich — przemiatania `CT` i `LC`, rampy akwizycji,
+sterowanie w holdoverze, `SP` — jest zgrubnych z rozmysłem i każde z nich kasuje
+ułamek już przez samo wywołanie `gpsdo_dac_write16()`. Powyżej tej warstwy nie
+zmieniło się nic: wyświetlacze, linia telemetrii, flash ring i blok ustawień
+nadal widzą zwykły kod 16-bitowy.
+
+Komenda `DAC` pokazuje, która ścieżka jest wkompilowana, kod we wszystkich trzech
+ujęciach oraz wielkość kroku w µHz i w częściach ułamkowych. Kod 24-bitowy
+niebędący wielokrotnością 256 jest dowodem na to, że pinem steruje ścieżka
+precyzyjna. Liczby kroku wymagają wzmocnienia obiektu z `CT`; bez niego komenda to
+mówi, zamiast drukować liczbę z wartości domyślnej.
 
 ---
 
@@ -1238,6 +1425,7 @@ Plik `gpsdo_config.h` steruje konfiguracją. Najważniejsze przełączniki:
 #define GPSDO_BLUETOOTH          // HC-06 na Serial2 (57600 Bd)
 
 // Inne:
+#define GPSDO_PWM_DITHER         // 24-bitowe napiecie sterujace (PWM z ditherem, PB9)
 #define GPSDO_PICDIV             // Wsparcie picDIV
 #define GPSDO_UBX_CONFIG         // Konfiguracja UBX NEO-6M/7M
 #define GPSDO_GEN_2kHz_PB5       // Generator 2 kHz na PB5
@@ -1286,27 +1474,54 @@ kompilatora. Plik jest wykrywany automatycznie; nic nie trzeba włączać.
 
 ### Planowane
 
-**Dwa porty USB CDC.** Jedno urządzenie szeregowe obsługuje dziś CLI i całą
-resztę, więc tunelowanie odbiornika do u-center oznacza rezygnację z konsoli. Dwa
-punkty końcowe CDC w urządzeniu złożonym rozdzieliłyby to: pierwszy pozostaje CLI
-dokładnie jak teraz, drugi staje się przezroczystym tunelem GPS, dzięki czemu
-u-center może konfigurować odbiornik, a konsola nie przestaje raportować.
+**Zewnętrzny przetwornik SPI na napięcie sterujące.** 16-bitowe PWM daje około
+50 µV na krok przy 3,3 V, blisko 2,7×10⁻¹¹ względnie na oscylatorze 5,3 Hz/V.
+Układ 18-bitowy z odniesieniem zaprojektowanym do tego zadania osiąga mniej
+więcej 17 µV, blisko 9×10⁻¹², bez opóźnienia filtru w pętli.
 
-**24-bitowy przetwornik delta-sigma na SPI + DMA.** Napięcie sterujące pochodzi
-dziś z 16-bitowego PWM przez filtr RC. Przy nachyleniach typowych dla tych
-oscylatorów jeden LSB to już kilka części na 10¹¹, więc kwantyzacja nie jest
-dzisiaj ograniczeniem — ale wyznacza podłogę, a stała czasowa RC potrzebna do
-wygładzenia 16-bitowego PWM dodatkowo opóźnia pętlę.
+Instalacja jest gotowa: `GPSDO_DAC_EXT` i sterownik-zaślepka, który odmawia
+kompilacji, dopóki nie zostanie wybrany układ. Sprzętowe SPI nie jest potrzebne
+ani dostępne — przetwornik zapisuje się raz na sekundę, więc programowe
+kluczowanie kosztuje mikrosekundy. Do zdecydowania: układ, odniesienie i zakres
+wyjścia względem EFC oscylatora.
 
-Zamiennikiem ma być **modulator delta-sigma drugiego rzędu** wyprowadzany przez
-SPI z DMA, kształtujący szum kwantyzacji z dala od częstotliwości istotnych dla
-pętli, zamiast tylko go filtrować. Pracę wykonuje DMA, więc modulator nie
-kosztuje czasu procesora ani opóźnień przerwań. Efektywna rozdzielczość rzędu
-24 bitów przy znacznie krótszej stałej analogowej wygląda na osiągalną.
+Warto wiedzieć, gdzie leży użyteczna granica. Przy 24 bitach krok wynosi 197 nV;
+szum termiczny 10 kΩ w paśmie 1 Hz to około 13 nV, więc szum Johnsona nie jest
+przeszkodą — ale dobry wzmacniacz zero-drift wnosi około 180 nV międzyszczytowo w
+paśmie 0,1–10 Hz, a precyzyjne odniesienie około 1 µV. **18 bitów to punkt
+optymalny, 20 rozsądny sufit** — powyżej łańcuch analogowy nie dostarczy tego, co
+obiecuje przetwornik.
 
-Konstrukcja Alana (MIS42N) na PIC-u dochodzi do tego samego inną drogą — 10-bitowy
-PWM ditherowany 14-bitowym akumulatorem, co daje 24 bity przy 40 kHz — i to
-właśnie ona podsunęła ten kierunek.
+### Próbowane i porzucone
+
+Oba zostały porządnie sprawdzone i oba są tu zapisane, bo powody są bardziej
+użyteczne niż same pomysły.
+
+**24-bitowy przetwornik delta-sigma na wolnym pinie, zasilany przez DMA.**
+Zbudowany, przetestowany na hoście, potem zmierzony — i w tym momencie przestał
+być atrakcyjny. Komenda ma 24 bity, ale rozdzielczość docierającą do oscylatora
+wyznacza to, jak długo uśrednia filtr analogowy: 13,6 bita efektywnego przy 4 096
+bitach uśredniania, 19,0 przy 262 144 i 24,0 dopiero po 16,7 miliona — czyli
+43 sekundach przy 390 kHz. Filtr dostatecznie szybki, by nie opóźniać pętli, daje
+około 18 bitów, za cenę 6% CPU pracującego bez przerwy plus precyzyjne
+odniesienie, bramka CMOS i aktywny filtr czwartego rzędu. Podniesienie
+częstotliwości bitowej tego nie ratuje: 24 bity w filtrze 32 ms wymagałyby
+524 MHz.
+
+Wcześniejsza wersja tego dokumentu obiecywała poprawę 320-krotną. To było błędne
+— porównywało szerokość komendy z krokiem PWM, co nie porównuje niczego. Kod
+zostaje w drzewie, oznaczony jako ślepy zaułek: rdzeń modulatora jest poprawny i
+przetestowany, a zmierzony ślepy zaułek jest wart więcej niż nieprzetestowany
+pomysł.
+
+**Dwa porty USB CDC**, jeden na CLI i jeden jako przezroczysty tunel GPS dla
+u-center. Niemożliwe bez forka warstwy USB rdzenia: stos STM32duino jest
+jednoklasowy, zgłoszenie o obsługę urządzeń złożonych jest otwarte od lat, a
+rdzeń 3.0.0 nic w tej sprawie nie zmienił. Ręcznie pisane deskryptory to kilkaset
+linii, które psułyby się przy każdej aktualizacji rdzenia — dokładnie to, co
+spotkało TFT_eSPI na 3.0.0. Istniejący tryb równoległy z Bluetooth osiąga zresztą
+ten sam skutek: `T` tuneluje GPS przez USB, a CLI zostaje na Bluetooth,
+nietknięte.
 
 ### Nieplanowane
 

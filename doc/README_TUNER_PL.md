@@ -55,6 +55,7 @@ nigdy nie widziała. Używaj pary, która przyszła razem.
 |----------|---------------|
 | **LTIC (algo 10)** | PID per stan trójstopniowej pętli fazowej oraz kalibracja detektora |
 | **LTIC-Lars (algo 11)** | Parametry ciągłej pętli PI (`LG`, `LD`, `LTC`, …) |
+| **Multi-level (algo 12)** | Dwa skalary (`MG`, `MR`) i jedenaście limitów fazy per poziom |
 | **FA damping** | Okno uśredniania członu tłumiącego, per stan |
 | **PID algo 3-9** | Kp / Ki / Kd / I_LIMIT dla algorytmów częstotliwościowych |
 | **Calibration** | `LC`, `CT` i stałe detektora |
@@ -71,15 +72,21 @@ wypełnione, a nie puste.
 Trzy okna, odświeżane raz na sekundę. To, co pokazują dwa górne, zależy od tego,
 jaki algorytm zgłasza płytka:
 
-| | Algorytmy 10 / 11 (LTIC) | Algorytmy 0-9 |
-|---|---|---|
-| Górne | Faza `dph` (ns) | Wyuczony dryf (LSB) |
-| Środkowe | `Vphase` detektora (V), z liniami pasma | Napięcie sterujące `Vctl` (V) |
-| Dolne | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) |
+| | Algorytmy 10 / 11 (LTIC) | Algorytm 12 | Algorytmy 0-9 |
+|---|---|---|---|
+| Górne | Faza `dph` (ns) | Błąd fazy `ph` (ns) | Wyuczony dryf (LSB) |
+| Środkowe | `Vphase` detektora (V), z liniami pasma | Napięcie sterujące `Vctl` (V) | Napięcie sterujące `Vctl` (V) |
+| Dolne | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) |
 
 Tylko pętle LTIC mają detektor fazy, więc przy każdym innym algorytmie te dwa
 okna stałyby puste przez całą sesję. Zamiast tego są przekierowane na inne
 wielkości, a tytuły zmieniają się automatycznie — nie ma czego przestawiać.
+
+Algorytm 12 dostaje własną parę, a nie pożycza żadnej z pozostałych: nie używa
+samouczącego się sprzężenia w przód, więc wykres dryfu byłby płaski, a jego faza
+idzie prosto z detektora, a nie przez filtr pętli — to nie jest ta sama wielkość,
+którą rysuje `dph`. Linie pasma detektora znikają zawsze wtedy, gdy środkowe
+okno pokazuje zamiast niego napięcie sterujące.
 
 ### Span i Follow
 

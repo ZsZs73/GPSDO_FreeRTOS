@@ -1,7 +1,7 @@
 /* ======================================================================
  * flash_ring.h  —  wear-levelled ring buffer for live + settings data
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  *
  * Purpose
  * -------

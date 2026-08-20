@@ -1,7 +1,7 @@
 /**
  * GPSDO_FreeRTOS.ino — Main entry point — hardware init and FreeRTOS scheduler start
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -98,6 +98,89 @@ TeeSerial g_tee(Serial, Serial2);
 #endif
 
 /* ====================================================================== */
+
+/* Why did we just restart?
+ *
+ * The board was rebooting intermittently, always at the same point in GPS
+ * configuration, and there was no way to tell a brown-out from a software fault
+ * by looking at the log — both leave the same silence followed by a fresh banner.
+ * RCC->CSR holds the answer and costs nothing to read.
+ *
+ * BOR/POR means the 3V3 rail dipped: the regulator on the BlackPill feeds the
+ * GPS, the TFT, the LTIC detector and the clock display, and the receiver draws a
+ * step of current when it changes mode. PIN is the reset button or a floating
+ * NRST. SFT is NVIC_SystemReset, i.e. our own RB command. The flags latch, so
+ * they must be cleared afterwards or the next boot reports this one. */
+static void print_reset_cause(void)
+{
+    uint32_t csr = RCC->CSR;
+    OUT_SERIAL.print("Reset cause:");
+    if (csr & RCC_CSR_LPWRRSTF) OUT_SERIAL.print(" LOW-POWER");
+    if (csr & RCC_CSR_WWDGRSTF) OUT_SERIAL.print(" WINDOW-WDG");
+    if (csr & RCC_CSR_IWDGRSTF) OUT_SERIAL.print(" INDEP-WDG");
+    if (csr & RCC_CSR_SFTRSTF)  OUT_SERIAL.print(" SOFTWARE");
+    if (csr & RCC_CSR_PORRSTF)  OUT_SERIAL.print(" POWER-ON/BROWN-OUT");
+    if (csr & RCC_CSR_PINRSTF)  OUT_SERIAL.print(" PIN/NRST");
+    if (csr & RCC_CSR_BORRSTF)  OUT_SERIAL.print(" BROWN-OUT");
+    OUT_SERIAL.println();
+    if (csr & (RCC_CSR_BORRSTF | RCC_CSR_PORRSTF))
+        OUT_SERIAL.println("  -> supply dipped: check the 3V3 rail under load");
+
+    RCC->CSR |= RCC_CSR_RMVF;      /* clear, or the next boot reports this one */
+}
+
+extern "C" void gpsdo_assert_diagnostic(const char *file, int line)
+{
+    noInterrupts();
+    Serial.println("\r\n!!! FreeRTOS configASSERT failed");
+    Serial.print("!!! file: "); Serial.println(file);
+    Serial.print("!!! line: "); Serial.println(line);
+    Serial.flush();
+    /* Rapid LED blink so the fault is visible even without the console. */
+    for (int i = 0; i < 40; i++) {
+        digitalWrite(PIN_BLUE_LED, (i & 1) ? HIGH : LOW);
+        for (volatile uint32_t d = 0; d < 200000; d++) { /* busy-wait, no delay() */
+        }
+    }
+    interrupts();
+}
+
+/* Stack overflow hook — configCHECK_FOR_STACK_OVERFLOW == 2 in
+ * STM32FreeRTOSConfig.h. FreeRTOS calls this from the tick / task-switch
+ * path when a task's stack sentinel is corrupted. pcTaskName is a char[16];
+ * print it so the offending task is identifiable. */
+extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    (void)xTask;
+    noInterrupts();
+    Serial.println("\r\n!!! FreeRTOS STACK OVERFLOW");
+    Serial.print("!!! task: ");
+    Serial.println(pcTaskName ? pcTaskName : "(null)");
+    Serial.flush();
+    for (int i = 0; i < 60; i++) {
+        digitalWrite(PIN_BLUE_LED, (i & 1) ? HIGH : LOW);
+        for (volatile uint32_t d = 0; d < 300000; d++) {
+        }
+    }
+    interrupts();
+}
+
+/* Malloc-failed hook — configUSE_MALLOC_FAILED_HOOK == 1 in
+ * STM32FreeRTOSConfig.h. Fires when pvPortMalloc returns NULL inside a
+ * FreeRTOS API (typically task/queue creation if the heap is exhausted). */
+extern "C" void vApplicationMallocFailedHook(void)
+{
+    noInterrupts();
+    Serial.println("\r\n!!! FreeRTOS MALLOC FAILED (heap exhausted)");
+    Serial.flush();
+    for (int i = 0; i < 60; i++) {
+        digitalWrite(PIN_BLUE_LED, (i & 1) ? HIGH : LOW);
+        for (volatile uint32_t d = 0; d < 300000; d++) {
+        }
+    }
+    interrupts();
+}
+
 void setup()
 {
     delay(500);   /* let power stabilise */
@@ -151,6 +234,7 @@ void setup()
     OUT_SERIAL.println("Algo 11 (LTIC-Lars) after Lars Walenius' PI loop");
     OUT_SERIAL.println("Type H = help  SW = stack diagnostics");
     OUT_SERIAL.println("================================================\r\n");
+    print_reset_cause();
 
     /* ---- I2C ---- */
     Wire.begin();
@@ -174,16 +258,24 @@ void setup()
     analogWrite(PIN_TEST_2KHZ, 32767);
 #endif
 
-    /* ---- 16-bit PWM DAC on PB9 (TIM4 CH4) ---- */
+    /* ---- control-voltage output on PB9 (TIM4 CH4) ---- */
     analogReadResolution(12);
-    /* Output stage first: under GPSDO_DAC_EXT this brings the DAC up, and the
-     * first command must not arrive before it is ready. */
+
+    /* Output stage first: under GPSDO_DAC_EXT this brings the DAC up, and under
+     * GPSDO_PWM_DITHER it claims TIM4 and starts the DMA replay. Either way the
+     * first command must not arrive before the stage is ready. */
     if (!gpsdo_dac_begin()) {
-        OUT_SERIAL.println("HW: control-voltage DAC failed to start");
+        OUT_SERIAL.println("HW: control-voltage output failed to start");
     }
     gpsdo_dac_write16(127);
+
+    /* Only for the plain PWM path. With dithering, TIM4 belongs to the DMA
+     * stream and these calls would reconfigure it underneath — analogWrite
+     * rewrites ARR and the compare mode, which would stop the replay dead. */
+#ifndef GPSDO_PWM_DITHER
     analogWriteFrequency(2000);
     analogWriteResolution(16);
+#endif
 
     /* ---- Default control state (overwritten by EEPROM recall below) ---- */
     gCtrl.pwm_output  = DEFAULT_PWM_OUTPUT;

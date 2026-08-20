@@ -1,7 +1,7 @@
 /**
  * gpsdo_state.h — Shared application state and FreeRTOS handles
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -72,7 +72,7 @@ typedef struct {
     double   avg20000;
 
     /* Misc */
-    int8_t   instant_offset;
+    int16_t  instant_offset;   /* int16: ±500 Hz legal range, int8 wrapped */
     uint32_t ppscount;
     bool     flush_requested;
     bool     must_adjust;
@@ -181,7 +181,7 @@ extern CtrlData_t  gCtrl;
 extern Uptime_t    gUptime;
 
 /* ---- Sensor data (written by SensorTask, read by DisplayTask) ---------- */
-extern float  g_bmp_temp, g_bmp_pres, g_bmp_alti;
+extern float  g_bmp_temp, g_bmp_pres;
 extern float  g_aht_temp, g_aht_humi;
 extern float  g_ina_volt, g_ina_curr;
 extern uint16_t g_freq_damp_win_dpll; /* FAD: 10/100/1000 (default 100) */

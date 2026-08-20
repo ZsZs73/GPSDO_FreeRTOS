@@ -1,7 +1,7 @@
 /**
  * gpsdo_gps.cpp — vGpsTask — GPS NMEA parsing and UBX configuration
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -396,7 +396,29 @@ static bool ubx_poll_svin_nav(uint32_t *dur, uint32_t *acc_mm,
                    if (n >= sizeof(buf)) goto done2; }
         }
         if (n >= 40) break;                 /* full payload already in */
-        vTaskDelay(pdMS_TO_TICKS(10));
+        /* SAME GUARD AS ubx_poll_svin(). This one was missed when that fix went
+         * in, and it is a boot hang, not a cosmetic difference: vTaskDelay()
+         * before vTaskStartScheduler() writes through pxCurrentTCB, which is
+         * still NULL, so the board takes a hard fault and the default handler
+         * spins with interrupts off — no output, no watchdog, nothing but the
+         * reset button.
+         *
+         * It hid because of the order in gpsdo_gps_init(): NAV-SVIN is only
+         * polled when TIM-SVIN did not answer inside its 500 ms window. A
+         * LEA-6T that replies boots normally; one that is still starting up —
+         * which is exactly the cold power-on case, as against a reset where the
+         * receiver keeps running — falls through to here and the board stops
+         * dead at the same line every time. Hence "it needs a few resets".
+         *
+         * Symptom-matched to the 20.08 16:04 log: four boots, each ending after
+         * "UBX: CFG-NAV5 ACK" and before "LEA-T: starting survey-in", with the
+         * reset cause reading PIN/NRST every time — the operator's button, not
+         * a watchdog and not a brown-out. A supply fault does not stop at the
+         * same source line four times. */
+        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        else
+            delay(10);
     }
 done2:
     if (n < 40) return false;

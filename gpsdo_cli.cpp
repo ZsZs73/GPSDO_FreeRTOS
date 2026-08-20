@@ -1,7 +1,7 @@
 /**
  * gpsdo_cli.cpp — vCliTask — Serial / Bluetooth command line interface
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -19,6 +19,9 @@
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
 #include "gpsdo_dac.h"
+#ifdef GPSDO_PWM_DITHER
+  #include "gpsdo_pwm24.h"    /* PWM24_N / PWM24_TBL, for the DAC report */
+#endif
 #include "gpsdo_health.h"
 #include "gpsdo_state.h"
 #include "GPSDO_algorithms.h"
@@ -195,6 +198,7 @@ extern void persist_erase(void);
 static void print_help(void)
 {
     cli_putln(PROGRAM_NAME " " PROGRAM_VERSION " by jmnlabs (see V)");
+    cli_putln("  algo 11 after Lars Walenius; algo 12 after Alan Cashin (MIS42N)");
     cli_putln("Commands (case-insensitive, end with Enter):");
     cli_putln("  V           Version, authors and links");
     cli_putln("  H / ?       this help  (H TZ for timezone details)");
@@ -203,12 +207,14 @@ static void print_help(void)
     cli_putln("  CT          Calibrate + auto-Tune PID for all algos");
     cli_putln("  T [baud]    GPS tunnel on USB (300s; opt. GPS UART baud for u-center)");
     cli_putln("  SP <n>      Set PWM DAC directly (1-65535)");
+    cli_putln("  DAC         Output path, 24/16-bit code, step size in Hz");
     cli_putln("  up1 / up10  increase PWM by 1 / 10");
     cli_putln("  dp1 / dp10  decrease PWM by 1 / 10");
     cli_putln("  RH / RD     Human readable / Tab Delimited reporting");
     cli_putln("  RP / RR     Report Pause / Report Resume");
     cli_putln("  MH / MD     Mode Holdover / Mode Disciplined");
-    cli_putln("  LA <0-11>   Loop Algorithm select (10=LTIC 3-stage, 11=LTIC-Lars)");
+    cli_putln("  LA <0-12>   Loop Algorithm select");
+    cli_putln("              10=LTIC 3-stage, 11=LTIC-Lars, 12=multi-level accum");
     cli_putln("  LP [n]      List PID Parameters (algo n or current)");
     cli_putln("  KP n val    set Kp for algo n (3-7)");
     cli_putln("  KI n val    set Ki for algo n (3-7)");
@@ -246,6 +252,14 @@ static void print_help(void)
     cli_putln("  ES [obj]    Save settings to flash ring (obj: TZ/PID/LTIC/FLAGS/ALGO/PO)");
     cli_putln("  ER          Recall settings (flash ring)");
     cli_putln("  EE          Erase settings (reset to defaults)");
+    cli_putln("-- Algo 12 (multi-level accumulator) --");
+    cli_putln("  MG [v]      Gain LSB/ns (0 = auto from CT)");
+    cli_putln("  MR [n]      Force a correction at level n (0-10)");
+    cli_putln("  MLP <n> [ns] Phase limit for level n");
+    cli_putln("  MF [0-3]    Limits: 0=follow MG 1=stored 2=formula 3=measured");
+    cli_putln("  MFT [s]     MF 3: target s between noise-driven corrections");
+    cli_putln("  MZ [0|1]    Zero-crossing correction on/off");
+    cli_putln("  ML          List all algo-12 parameters");
     cli_putln("  CS           Correction statistics over 100/1k/10k/100k corrections");
     cli_putln("  EW          Flash wear stats (ring buffer erase cycles)");
     cli_putln("  FR 0|1      Flash ring buffer on/off (saved with ES)");
@@ -253,8 +267,8 @@ static void print_help(void)
     cli_putln("  ACG g [cap] ACQ centring drive: LSB/V and max step (algo 10)");
     cli_putln("  RB          Reboot (warm, keep settings)");
     cli_putln("  CR YES      Cold Restart (wipe settings, factory defaults)");
-    cli_putln("  PO <f>      Pressure Offset");
-    cli_putln("  AO <f>      Altitude Offset");
+    cli_putln("  PO <f>      Pressure Offset [Pa, added to BMP280 raw]");
+    cli_putln("  AO <f>      Altitude Offset [m, added to GPS altitude]");
     cli_putln("  TO <n|A>    Fixed UTC offset (h or h:mm) or Auto (EU only)");
     cli_putln("  TZ <zone>   Timezone with DST, e.g. TZ Adelaide  (H TZ)");
 #ifdef GPSDO_GPS_TIMING
@@ -338,10 +352,103 @@ static void dispatch(char *line)
         cli_putln("https://github.com/AndrewBCN/STM32-GPSDO");
         cli_putln("");
         cli_putln("Algo 11 continuous-PI loop:  the late Lars Walenius");
+        cli_putln("Algo 12, zero-cross, dither: Alan Cashin, MIS42N (EEVBlog)");
+        cli_putln("  and the CS self-assessment idea");
         cli_putln("Measurements, algos 10 & 11: Dan Wiering (Rb reference)");
         cli_putln("ILI9486/9488 support urged:  lucido (EEVBlog)");
-        cli_putln("Dither / DAC discussion:     Alan, MIS42N (EEVBlog)");
         cli_putln("PCB design (prototype):      Scrachi (EEVBlog)");
+        return;
+    }
+
+    /* ---- DAC — what the control voltage is and how finely it can move ---- */
+    if (cli_ieq(verb, "DAC")) {
+        /* Every line is assembled whole and emitted with one cli_putln().
+         *
+         * The first version built lines from cli_puts() + cli_putfloat()
+         * fragments, which came out broken on the wire: cli_putfloat() always
+         * terminates its line, so each number landed on one of its own and the
+         * units ended up on the next. It is a line printer, not an inline
+         * formatter. Assembling here also means the serial mutex is taken once
+         * per line, so another task's output cannot interleave mid-sentence. */
+        char l[96], b1[16], b2[16];
+        uint32_t c24 = gpsdo_dac_last24();
+        double   f16 = gpsdo_dac_last16f();
+        uint16_t v16 = gpsdo_dac_last16();
+
+        cli_putln("-- Control voltage output --");
+
+#if defined(GPSDO_DAC_EXT)
+        cli_putln("  path: external SPI DAC");
+#elif defined(GPSDO_PWM_DITHER)
+        snprintf(l, sizeof(l), "  path: %u-bit PWM + dither -> 24 bit, PB9/TIM4 CH4, DMA",
+                 (unsigned)PWM24_N);
+        cli_putln(l);
+        /* TIM4 runs from the 100 MHz APB1 timer clock with no prescaler, so the
+         * carrier is that divided by the period. */
+        snprintf(l, sizeof(l), "        carrier %lu Hz, table %lu x2 = %lu bytes RAM",
+                 (unsigned long)(100000000UL / (1UL << PWM24_N)),
+                 (unsigned long)PWM24_TBL,
+                 (unsigned long)(PWM24_TBL * 2UL * 2UL));
+        cli_putln(l);
+#else
+        cli_putln("  path: plain 16-bit PWM (analogWrite) - no dither compiled in");
+#endif
+
+        /* Three views of one number. Printing all three is the point: a fraction
+         * that never appears anywhere is a fraction nobody can trust. A 24-bit
+         * code that is not a multiple of 256 is the proof the fine path is the
+         * one driving the pin. */
+        snprintf(l, sizeof(l), "  code: 24-bit %lu%s", (unsigned long)c24,
+                 (c24 & 0xFFu) ? "  (fractional - fine path is driving)" : "");
+        cli_putln(l);
+        snprintf(l, sizeof(l), "        16-bit %u  (displays, flash ring)", (unsigned)v16);
+        cli_putln(l);
+        dtostrf(f16, -1, 4, b1);
+        dtostrf(f16 - (double)v16, -1, 4, b2);
+        snprintf(l, sizeof(l), "        exact  %s  (%s from the 16-bit view)", b1, b2);
+        cli_putln(l);
+
+        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            double vm = ((double)gCtrl.avg_vctl_adc / 4096.0) * 3.3;
+            xSemaphoreGive(xCtrlMutex);
+            dtostrf(vm, -1, 4, b1);
+            snprintf(l, sizeof(l), "  Vctl: %s V measured", b1);
+            cli_putln(l);
+        }
+
+        /* The Hz figures need the plant gain, which only CT can supply. Without
+         * it the resolution is still real but its meaning in frequency is
+         * unknown, and saying so beats printing a number from a default. */
+        double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
+        if (lsb_per_hz > 0.0) {
+            double hz16 = 1.0 / lsb_per_hz;
+            double hz24 = hz16 / 256.0;
+            dtostrf(hz16 * 1e6, -1, 1, b1);
+            dtostrf(hz16 / 1.0e7 * 1e12, -1, 2, b2);
+            snprintf(l, sizeof(l), "  step: 16-bit 1 LSB = %s uHz = %se-12", b1, b2);
+            cli_putln(l);
+            /* uHz on both lines, so the two are comparable at a glance. */
+            dtostrf(hz24 * 1e6, -1, 3, b1);
+            dtostrf(hz24 / 1.0e7 * 1e15, -1, 1, b2);
+            snprintf(l, sizeof(l), "        24-bit 1 LSB = %s uHz = %se-15", b1, b2);
+            cli_putln(l);
+            dtostrf(lsb_per_hz, -1, 0, b1);
+            dtostrf((double)g_pid[7].Kp, -1, 0, b2);
+            snprintf(l, sizeof(l), "        plant %s LSB/Hz (from CT, Kp[7]=%s)", b1, b2);
+            cli_putln(l);
+        } else {
+            cli_putln("  step: run CT first - plant gain unknown, so the");
+            cli_putln("        resolution cannot be stated in Hz");
+        }
+
+        if (gpsdo_dac_fine_available()) {
+            cli_putln("  fine: ACTIVE - sub-LSB corrections are applied, not");
+            cli_putln("        truncated. Coarse writes (CT, LC, SP, holdover,");
+            cli_putln("        ramps) clear the fraction by design.");
+        } else {
+            cli_putln("  fine: inactive - the output resolves 16 bits, so the");
+            cli_putln("        fraction is carried but rounded away on the pin.");
+        }
         return;
     }
 
@@ -591,6 +698,24 @@ static void dispatch(char *line)
 #else
                 cli_putln("LA 11 needs GPSDO_LTIC enabled at build time.");
 #endif
+            } else if (v == 12) {
+                /* Algo 12 needs the phase detector, like 10 and 11. It was first
+                 * written to fall back to the frequency counter on boards without
+                 * one; that fallback integrated quantisation noise into a random
+                 * walk and destroyed the lock, so it is gone. Refuse rather than
+                 * run something that cannot work. */
+#ifndef GPSDO_LTIC
+                cli_reject("LA 12: needs the LTIC phase detector "
+                           "(enable GPSDO_LTIC and run LC)");
+                return;
+#endif
+                if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    gCtrl.active_algo = 12;
+                    xSemaphoreGive(xCtrlMutex);
+                }
+                cli_putln("Algorithm: 12 (multi-level accumulator, after MIS42N)");
+                cli_putln("No LTC to set: the error picks its own averaging time.");
+                cli_putln("UNTUNED - per-level limits are not yet measured.");
             } else if (v >= 0 && v <= 9) {
                 if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     gCtrl.active_algo = (uint8_t)v;
@@ -598,7 +723,7 @@ static void dispatch(char *line)
                 }
                 cli_puts("Algorithm: "); cli_putint(v);
             } else {
-                cli_reject("LA: value must be 0..11 (10=LTIC 3-stage, 11=LTIC-Lars)");
+                cli_reject("LA: value must be 0..12 (10=LTIC 3-stage, 11=LTIC-Lars, 12=multi-level)");
             }
         }
         if (arg != NULL) cli_manual_save("ES ALGO");
@@ -1114,35 +1239,43 @@ static void dispatch(char *line)
         return;
     }
 
-    /* ---- PO <f> ---- */
+    /* ---- PO <f> ---- Calibration offset in pascals, added to the BMP280's
+     * raw reading before the /100 to hPa. Zero is legal — it means "show the
+     * sensor's own pressure". Range matches the recall guard in
+     * settings_store.cpp so nothing accepted here is silently dropped on
+     * the next boot. */
     if (cli_ieq(verb, "PO")) {
         if (arg == NULL) {
-            cli_puts("Pressure offset: "); cli_putfloat(g_pressure_offset, 2);
+            cli_puts("Pressure offset [Pa]: "); cli_putfloat(g_pressure_offset, 2);
         } else {
             float v = (float)atof(arg);
-            if (v >= -3000.0f && v <= 3000.0f && v != 0.0f) {
+            if (v >= -5000.0f && v <= 5000.0f) {
                 g_pressure_offset = v;
-                cli_puts("Pressure offset: "); cli_putfloat(v, 2);
+                cli_puts("Pressure offset [Pa]: "); cli_putfloat(v, 2);
                 cli_autosaved(SET_PO, "PO/AO");
             } else {
-                cli_putln("PO: invalid value");
+                cli_putln("PO: -5000..5000 Pa");
             }
         }
         return;
     }
 
-    /* ---- AO <f> ---- */
+    /* ---- AO <f> ---- Offset in metres added to the GPS altitude wherever it
+     * is shown (serial report and TFT). It is NOT a barometric correction:
+     * the old implementation mixed it into readAltitude()'s sea-level hPa
+     * argument, silently changing units and feeding a value nothing ever
+     * displayed. Range matches the recall guard. */
     if (cli_ieq(verb, "AO")) {
         if (arg == NULL) {
-            cli_puts("Altitude offset: "); cli_putfloat(g_altitude_offset, 2);
+            cli_puts("Altitude offset [m]: "); cli_putfloat(g_altitude_offset, 2);
         } else {
             float v = (float)atof(arg);
-            if (v >= -3000.0f && v <= 3000.0f && v != 0.0f) {
+            if (v >= -3000.0f && v <= 3000.0f) {
                 g_altitude_offset = v;
-                cli_puts("Altitude offset: "); cli_putfloat(v, 2);
+                cli_puts("Altitude offset [m]: "); cli_putfloat(v, 2);
                 cli_autosaved(SET_PO, "PO/AO");
             } else {
-                cli_putln("AO: invalid value");
+                cli_putln("AO: -3000..3000 m");
             }
         }
         return;
@@ -1174,6 +1307,10 @@ static void dispatch(char *line)
             cli_putln("Saving flags...");
             settings_save_partial(SET_FLAGS);
             cli_putln("Done.");
+        } else if (cli_ieq(arg, "ALGO12")) {
+            cli_putln("Saving algo-12 params...");
+            settings_save_partial(SET_ALGO12);
+            cli_putln("Done.");
         } else if (cli_ieq(arg, "ALGO")) {
             cli_putln("Saving algo+PWM...");
             settings_save_partial(SET_ALGO);
@@ -1183,7 +1320,7 @@ static void dispatch(char *line)
             settings_save_partial(SET_PO);
             cli_putln("Done.");
         } else {
-            cli_putln("ES usage: ES | ES TZ|PID|LTIC|FLAGS|ALGO|PO");
+            cli_putln("ES usage: ES | ES TZ|PID|LTIC|FLAGS|ALGO12|ALGO|PO");
         }
         return;
     }
@@ -1254,6 +1391,180 @@ static void dispatch(char *line)
         cli_putln("  Small and steady = the loop is not fighting anything.");
         cli_putln("  Growing = something is wrong. Cannot distinguish a bad");
         cli_putln("  oscillator from a noisy detector - see H CS.");
+        return;
+    }
+    /* ---- Algorithm 12: multi-level accumulator ------------------------- */
+    if (cli_ieq(verb, "MG")) {                 /* gain, LSB per ns */
+        char t[40];
+        if (arg == NULL) {
+            snprintf(t, sizeof(t), "m_gain=%.3f%s", (double)g_mlacc_gain,
+                     g_mlacc_gain <= 0.0f ? " (auto from CT)" : " LSB/ns");
+            cli_putln(t);
+        } else {
+            double v = atof(arg);
+            if (v >= 0.0 && v <= 10000.0) {
+                g_mlacc_gain = (float)v;
+                snprintf(t, sizeof(t), "m_gain=%.3f", v); cli_putln(t);
+                cli_manual_save("ES ALGO12");
+            } else cli_reject("MG: 0..10000 LSB/ns (0 = auto from CT)");
+        }
+        return;
+    }
+    if (cli_ieq(verb, "MR")) {                 /* forced-correction level */
+        if (arg == NULL) { cli_puts("m_run_level="); cli_putint(g_mlacc_run_level); }
+        else { long v = atol(arg);
+            if (v >= 0 && v < MLACC_LEVELS) {
+                g_mlacc_run_level = (uint8_t)v;
+                cli_puts("m_run_level="); cli_putint((int)v);
+                cli_manual_save("ES ALGO12");
+            } else cli_reject("MR: 0..10 (level at which a correction is forced)"); }
+        return;
+    }
+    if (cli_ieq(verb, "MF")) {                 /* where the limits come from */
+        /* Separate from MG on purpose. The gain is a property of the
+         * OSCILLATOR — LSB per ns, and a different OCXO has a different Vctl
+         * sensitivity — while the limits are a property of the PHASE NOISE the
+         * board sees, which belongs to the site and the receiver. They shared
+         * one `if` until now, so "measured gain with hand-set limits" — exactly
+         * what a noisy installation wants — could not be asked for. */
+        static const char *const NAMES[4] = {
+            "follow MG (as before)", "stored table", "sigma formula", "measured"
+        };
+        char t[72];
+        if (arg == NULL) {
+            uint8_t s = g_mlacc_thr_src;
+            snprintf(t, sizeof(t), "m_thr_src=%u (%s)", (unsigned)s,
+                     (s < 4u) ? NAMES[s] : "?");
+            cli_putln(t);
+        } else {
+            long v = atol(arg);
+            if (v >= 0 && v <= 3) {
+                g_mlacc_thr_src = (uint8_t)v;
+                snprintf(t, sizeof(t), "m_thr_src=%ld (%s)", v, NAMES[v]);
+                cli_putln(t);
+                cli_manual_save("ES ALGO12");
+            } else cli_reject("MF: 0=follow MG  1=stored  2=sigma formula  3=measured");
+        }
+        return;
+    }
+    if (cli_ieq(verb, "MFT")) {                /* target s between noise fires */
+        /* The one number MF 3 leaves to the user, and it is a statement about
+         * what you want rather than a coefficient: how long between corrections
+         * that noise alone triggered. Every per-level multiplier follows from
+         * it, which is the job the hard-coded "8 sigma" was doing by hand. */
+        char t[72];
+        unsigned cur = (g_mlacc_thr_tgt_s > 0u) ? (unsigned)g_mlacc_thr_tgt_s
+                                                : (unsigned)MLACC_THR_TGT_DEFAULT;
+        if (arg == NULL) {
+            snprintf(t, sizeof(t), "m_thr_tgt=%us%s", cur,
+                     (g_mlacc_thr_tgt_s == 0u) ? " (default)" : "");
+            cli_putln(t);
+        } else {
+            long v = atol(arg);
+            /* Below the top level's own period the target says nothing the
+             * hierarchy can honour — level 10 is only tested every 2048 s, so
+             * asking for less than that between noise fires is asking for
+             * something the loop has no opportunity to deliver. The upper bound
+             * is the storage: the field is a uint16_t carved out of the block's
+             * padding, and a range the CLI accepts but the flash ring cannot
+             * hold is worse than a smaller honest one. 65535 s is 18 hours. */
+            if (v == 0 || (v >= (long)(1u << MLACC_LEVELS) && v <= 65535)) {
+                g_mlacc_thr_tgt_s = (uint16_t)v;
+                snprintf(t, sizeof(t), "m_thr_tgt=%us", (unsigned)
+                         ((g_mlacc_thr_tgt_s > 0u) ? g_mlacc_thr_tgt_s
+                                                   : MLACC_THR_TGT_DEFAULT));
+                cli_putln(t);
+                cli_manual_save("ES ALGO12");
+            } else cli_reject("MFT: 0 (default 3600) or 2048..65535 s");
+        }
+        return;
+    }
+    if (cli_ieq(verb, "MLP")) {
+        /* MLP <level> [ns] — one row of the limit table. Eleven separate verbs
+         * would be worse than one that takes an index. */
+        if (arg == NULL) { cli_reject("MLP <level 0..10> [ns]  (ML lists them)"); return; }
+        long n = atol(arg);
+        if (n < 0 || n >= MLACC_LEVELS) { cli_reject("MLP: level must be 0..10"); return; }
+        const char *p2 = arg;
+        while (*p2 && *p2 != ' ') p2++;
+        while (*p2 == ' ') p2++;
+        char t[48];
+        if (*p2 == '\0') {
+            /* Two numbers, because one is what you set and the other is what it
+             * means. The stored value is in accumulator units; the phase it
+             * corresponds to is that divided by 2^(level+2), since the level
+             * holds 2^(level+1) samples of (2*phase + 1). Printing only the
+             * former — and calling it "ns", as this did — invites tuning a
+             * number nobody can relate to the oscilloscope. */
+            snprintf(t, sizeof(t), "lim[%ld]=%ld (%ld ns over %us)",
+                     n, (long)g_mlacc_lim[n],
+                     (long)(g_mlacc_lim[n] >> (n + 2)),
+                     (unsigned)(1u << (n + 1)));
+            cli_putln(t);
+        } else {
+            long v = atol(p2);
+            if (v >= 1 && v <= 500000) {
+                g_mlacc_lim[n] = (int32_t)v;
+                snprintf(t, sizeof(t), "lim[%ld]=%ldns", n, v); cli_putln(t);
+                cli_manual_save("ES ALGO12");
+            } else cli_reject("MLP: 1..500000 accumulator units");
+        }
+        return;
+    }
+    if (cli_ieq(verb, "ML")) {
+        char line[76];
+        cli_putln("Algo 12 (multi-level accumulator, after MIS42N):");
+        snprintf(line, sizeof(line), " m_gain=%.3f%s  m_run_level=%u",
+                 (double)g_mlacc_gain,
+                 g_mlacc_gain <= 0.0f ? " (auto from CT)" : " LSB/ns", (unsigned)g_mlacc_run_level);
+        cli_putln(line);
+        {
+            mlacc_stats_t st;  mlacc_get_stats(&st);
+            mlacc_fit_t   ft;  mlacc_get_fit(&ft);
+            char sl[80], b1[16], b2[16];
+            uint8_t s = g_mlacc_thr_src;
+            static const char *const NAMES[4] = {
+                "follow MG", "stored table", "sigma formula", "measured"
+            };
+            unsigned eff = (s != 0u) ? s
+                         : ((g_mlacc_gain <= 0.0f) ? 2u : 1u);
+            snprintf(sl, sizeof(sl), "  limits from: MF %u (%s) -> %s",
+                     (unsigned)s, (s < 4u) ? NAMES[s] : "?",
+                     (eff < 4u) ? NAMES[eff] : "?");
+            cli_putln(sl);
+            snprintf(sl, sizeof(sl), "  measured phase noise: %ld ns 1-sigma",
+                     (long)st.sigma_ns);
+            cli_putln(sl);
+            if (eff == 3u) {
+                /* The exponent is the whole point of the measured table, so it
+                 * gets printed rather than hidden: 0.50 is what the formula
+                 * assumes, and anything near 1.00 says averaging is buying this
+                 * board nothing and the formula's table would be far too tight
+                 * at every level above the bottom. */
+                if (ft.valid) {
+                    dtostrf((double)ft.exponent, -1, 3, b1);
+                    dtostrf((double)((g_mlacc_thr_tgt_s > 0u)
+                            ? g_mlacc_thr_tgt_s : MLACC_THR_TGT_DEFAULT), -1, 0, b2);
+                    snprintf(sl, sizeof(sl),
+                             "  fitted exponent %s over %u levels (0.50 = white), target %ss",
+                             b1, (unsigned)ft.levels_used, b2);
+                } else {
+                    snprintf(sl, sizeof(sl),
+                             "  fit not ready: %u of %u levels have enough tests",
+                             (unsigned)ft.levels_used, (unsigned)MLACC_FIT_MIN_LVL);
+                }
+                cli_putln(sl);
+            }
+        }
+        cli_putln("  phase limits by averaging span (units = phase):");
+        for (int i = 0; i < MLACC_LEVELS; i++) {
+            snprintf(line, sizeof(line), "    %2d: %5us  %7ld = %4ld ns%s",
+                     i, (unsigned)(1u << (i + 1)), (long)g_mlacc_lim[i],
+                     (long)(g_mlacc_lim[i] >> (i + 2)),
+                     (i == 6) ? "  <- the one derived value" : "");
+            cli_putln(line);
+        }
+        cli_putln("  UNTUNED: only the 128s limit came from a specification.");
         return;
     }
     if (cli_ieq(verb, "EW")) {

@@ -55,6 +55,7 @@ placa nunca ha oído. Usa el par que se distribuyó junto.
 |---------|---------|
 | **LTIC (algo 10)** | PID por etapa del lazo de fase de tres etapas, más la calibración del detector |
 | **LTIC-Lars (algo 11)** | Los parámetros del PI continuo (`LG`, `LD`, `LTC`, …) |
+| **Multi-level (algo 12)** | Los dos escalares (`MG`, `MR`) y los once límites de fase por nivel |
 | **FA damping** | Ventana de promediado de amortiguación, por etapa |
 | **PID algo 3-9** | Kp / Ki / Kd / I_LIMIT para los algoritmos en el dominio de la frecuencia |
 | **Calibration** | `LC`, `CT` y las constantes del detector |
@@ -71,16 +72,23 @@ poblados en vez de vacíos.
 Tres paneles, actualizados una vez por segundo. Lo que muestran los dos
 superiores depende del algoritmo que reporte la placa:
 
-| | Algoritmos 10 / 11 (LTIC) | Algoritmos 0-9 |
-|---|---|---|
-| Superior | Fase `dph` (ns) | Deriva aprendida (LSB) |
-| Central | `Vphase` del detector (V), con guías de banda | Tensión de control `Vctl` (V) |
-| Inferior | Error de frecuencia (Hz) | Error de frecuencia (Hz) |
+| | Algoritmos 10 / 11 (LTIC) | Algoritmo 12 | Algoritmos 0-9 |
+|---|---|---|---|
+| Superior | Fase `dph` (ns) | Error de fase `ph` (ns) | Deriva aprendida (LSB) |
+| Central | `Vphase` del detector (V), con guías de banda | Tensión de control `Vctl` (V) | Tensión de control `Vctl` (V) |
+| Inferior | Error de frecuencia (Hz) | Error de frecuencia (Hz) | Error de frecuencia (Hz) |
 
 Solo los lazos LTIC tienen detector de fase, así que bajo cualquier otro
 algoritmo esos dos paneles quedarían vacíos toda la sesión. En su lugar se
 reorientan a otras magnitudes y los títulos se ajustan solos — no hay nada que
 configurar.
+
+El algoritmo 12 recibe su propia pareja en lugar de tomar prestada ninguna de las
+otras: no usa la realimentación anticipativa autoaprendida, así que la traza de
+deriva saldría plana, y su fase viene directamente del detector y no a través de
+un filtro de lazo, de modo que no es la misma magnitud que dibuja `dph`. Las
+guías de banda del detector desaparecen siempre que el panel central muestra en
+su lugar una tensión de control.
 
 ### Span y Follow
 

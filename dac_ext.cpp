@@ -1,7 +1,7 @@
 /*
  * dac_ext.cpp — external SPI DAC. STUB, deliberately non-functional.
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * See dac_ext.h for why this path exists and what has to be decided first.
  */
 #include <Arduino.h>

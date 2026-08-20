@@ -1,7 +1,7 @@
 /**
  * GPSDO_algorithms.h — Control loop algorithm declarations and tunable parameters
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -114,9 +114,9 @@ extern float    g_lrn_damp;
  * from older flash can be clamped into range on load. */
 #define LRN_DAMP_LO     0.45f
 #define LRN_DAMP_HI     1.5f
-extern float    g_nn_tempco;
+extern float    g_nn_tempco;             /* algo 9: learned oscillator tempco [LSB/degC] */
 extern float    g_ltic_acq_centre_gain;  /* algo 10: ACQ centring gain [LSB/V]  */
-extern float    g_ltic_acq_centre_cap;   /* algo 10: ACQ centring cap   [LSB]   */ /* algo 9: learned oscillator tempco [LSB/°C] */
+extern float    g_ltic_acq_centre_cap;   /* algo 10: ACQ centring cap   [LSB]   */
 int16_t nn_thermal_holdover_step(void); /* algo 9: HO thermal steering */
 extern float    g_lrn_slope_ns_s;
 extern uint16_t g_lrn_osc_period;
@@ -128,6 +128,20 @@ enum { LTIC_ACQ = 0, LTIC_DPLL = 1, LTIC_LOCK = 2 };
 
 /* ---- Algorithm selector --------------------------------------------- */
 uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no);
+
+/* ---- the fine control value ------------------------------------------------
+ *
+ * adjustVctlPWM() returns the rounded 16-bit value every existing caller,
+ * display and flash record expects. When the running algorithm computed a
+ * fractional target this cycle it also leaves it here, so the control task can
+ * drive the 24-bit output path without the return type — and everything that
+ * depends on it — having to change.
+ *
+ * g_vctl_fine_valid is cleared at the top of every adjustVctlPWM() call. Read
+ * it before g_vctl_fine and treat false as "write 16 bits as before"; a stale
+ * fraction is then impossible by construction. */
+extern double g_vctl_fine;        /* exact control value, 16-bit LSB units */
+extern bool   g_vctl_fine_valid;  /* set only by an algorithm, only this cycle */
 
 /* ---- Individual algorithms ------------------------------------------ */
 
@@ -162,6 +176,75 @@ uint16_t hybrid_fll_pll(uint16_t pwm, uint32_t ppscount);
 uint16_t nn_mlp_ctl_loop(uint16_t pwm, uint32_t ppscount);
 #ifdef GPSDO_LTIC
 uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount);
+
+/* Algorithm 12: multi-level accumulator, after Alan Cashin (MIS42N).
+ *
+ * REQUIRES GPSDO_LTIC — it works on the detector's phase in nanoseconds. An early
+ * version fed the TIM2 count error instead and was blind: a disciplined
+ * oscillator sits far below 1 Hz, so that field reads zero. See the .cpp. */
+#define MLACC_LEVELS 11
+uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount);
+
+/* Algorithm 12 state, for telemetry. last_action is the level that most recently
+ * applied a correction: low means it is acting often, high that it has settled
+ * and is averaging longer before touching anything. */
+typedef struct {
+    uint8_t  last_action;
+    uint32_t corrections;
+    uint32_t arms;            /* picDIV re-arms since reset */
+    uint32_t zero_cross;      /* zero-crossing corrections applied */
+    int32_t  sigma_ns;        /* measured phase noise, 1-sigma [ns] */
+    uint32_t seconds;
+    int32_t  last_slope;
+    int32_t  last_phase;
+} mlacc_stats_t;
+
+void mlacc_get_stats(mlacc_stats_t *out);
+extern int16_t g_last_offset;
+extern int32_t g_mlacc_lim[MLACC_LEVELS];   /* per-level phase limits [ns] */
+extern float   g_mlacc_gain;                /* LSB per ns, 0 = auto from CT */
+extern uint8_t g_mlacc_run_level;
+
+/* ---- where the per-level limits come from (MF) --------------------------
+ *
+ * Until now this was not a choice: the limits and the gain lived in one
+ * branch, so MG 0 meant "gain from CT AND limits from the noise formula" and
+ * MG > 0 meant "gain by hand AND limits by hand". There is no reason those two
+ * should be welded together — the gain belongs to the OSCILLATOR (it is LSB per
+ * ns, and a different OCXO has a different Vctl sensitivity) while the limits
+ * belong to the PHASE NOISE the board sees, which is a property of the site and
+ * the receiver. A workshop board wants the measured gain with hand-set limits;
+ * that combination could not be expressed.
+ *
+ * MLACC_THR_FOLLOW is what every existing installation gets, so nothing moves
+ * until someone asks for it. */
+enum {
+    MLACC_THR_FOLLOW   = 0,  /* as before: MG 0 -> formula, MG > 0 -> stored  */
+    MLACC_THR_STORED   = 1,  /* the table in flash / MLP, whatever MG says    */
+    MLACC_THR_SIGMA    = 2,  /* the white-noise formula, whatever MG says     */
+    MLACC_THR_MEASURED = 3,  /* fitted from the per-level spread — see .cpp   */
+};
+extern uint8_t  g_mlacc_thr_src;    /* one of the above                       */
+extern uint16_t g_mlacc_thr_tgt_s;  /* MFT: target s between noise-driven
+                                     * corrections; 0 = MLACC_THR_TGT_DEFAULT */
+#define MLACC_THR_TGT_DEFAULT  3600u
+/* Levels the fit needs before it will produce a table. Here rather than in the
+ * .cpp because ML reports progress against it while the estimator is filling
+ * up, and a number the user is shown should not be a number only one
+ * translation unit knows. */
+#define MLACC_FIT_MIN_LVL      3
+
+/* Live state of the measured estimator, for ML. exponent is the fitted scaling
+ * of the test statistic with level: 0.5 is what white noise gives and what the
+ * formula assumes, 1.0 is a phase that averaging does not reduce at all. */
+typedef struct {
+    float    exponent;              /* fitted alpha, 0 = not fitted yet       */
+    float    intercept_log2;        /* fitted log2(sd) at level 0             */
+    uint16_t tests[MLACC_LEVELS];   /* evaluations seen at each level         */
+    uint8_t  levels_used;           /* levels that entered the fit            */
+    bool     valid;                 /* a fit exists and is driving the table  */
+} mlacc_fit_t;
+void mlacc_get_fit(mlacc_fit_t *out);
 #endif
 
 /* ---- Helper exposed to ControlTask ---------------------------------- */

@@ -1,7 +1,7 @@
 /**
  * GPSDO_algorithms.cpp — Control loop algorithm implementations
  *
- * Part of GPSDO FreeRTOS v1.03
+ * Part of GPSDO FreeRTOS v1.05
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -26,6 +26,7 @@
 #include "GPSDO_algorithms.h"
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
+#include "gpsdo_dac.h"
 #include "ubx_timtp.h"
 #include <string.h>
 #include <math.h>
@@ -38,6 +39,11 @@ typedef struct {
     double   avg10, avg100, avg1000, avg10000, avg20000;
     bool     have10, have100, have1000, have10000, have20000;
     int16_t  cumul10, cumul100, cumul1000, cumul10000, cumul20000;
+    /* Instantaneous count error this second, TIM2 ticks from BASE_FREQ.
+     * Algorithm 12 accumulates these one at a time; every other algorithm uses
+     * the averages above. int16_t: FREQ_LOWER/UPPER admit ±500 Hz and the old
+     * int8_t wrapped past ±127, feeding garbage to any gate that read it. */
+    int16_t  instant_offset;
 } FreqSnapshot_t;
 
 static void take_freq_snapshot(FreqSnapshot_t *s)
@@ -54,6 +60,7 @@ static void take_freq_snapshot(FreqSnapshot_t *s)
         s->cumul1000   = gFreq.cumul1000;
         s->cumul10000  = gFreq.cumul10000;
         s->cumul20000  = gFreq.cumul20000;
+        s->instant_offset = gFreq.instant_offset;
         xSemaphoreGive(xFreqMutex);
     }
 }
@@ -64,6 +71,41 @@ static uint16_t clamp_pwm(int32_t v)
     if (v < 1)     return 1;
     if (v > 65535) return 65535;
     return (uint16_t)v;
+}
+
+/* ---- the fine control value, published for the control task ----------------
+ *
+ * adjustVctlPWM() returns uint16_t and that signature is load-bearing: the
+ * control task, the displays, the telemetry line and the flash ring all speak
+ * 16 bits, and widening the return would touch every one of them. So the exact
+ * value rides alongside instead.
+ *
+ * g_vctl_fine_valid is cleared at the top of every adjustVctlPWM() call and set
+ * only by an algorithm that actually computed a fractional target this cycle.
+ * A stale fraction is therefore impossible: if the algorithm held (returned pwm
+ * unchanged), or if it is one that does not do fractional arithmetic, the
+ * control task falls back to the plain 16-bit write it has always done. */
+double g_vctl_fine       = 0.0;
+bool   g_vctl_fine_valid = false;
+
+/* The value an output stage should add its correction to.
+ *
+ * NOT the uint16_t pwm the caller passed in — that is gCtrl.pwm_output, which
+ * is the rounded view. Adding to it would discard the fraction once per cycle
+ * and leave the whole fine path buying nothing.
+ *
+ * The DAC layer's value is used only when it agrees with what the caller thinks
+ * the PWM is, to within one step. If anything else has moved the output since
+ * the last loop cycle — a CT sweep, an SP from the CLI, a holdover step — they
+ * will disagree, and then the caller's value is the truth and the fraction is
+ * correctly abandoned. */
+static double fine_base(uint16_t pwm)
+{
+    if (!gpsdo_dac_fine_available()) return (double)pwm;
+    double f = gpsdo_dac_last16f();
+    double d = f - (double)pwm;
+    if (d < -1.0 || d > 1.0) return (double)pwm;
+    return f;
 }
 
 /* -----------------------------------------------------------------------
@@ -249,7 +291,16 @@ static uint16_t apply_correction(uint16_t pwm, double u,
     if (u >  max_step) u =  max_step;
     if (u < -max_step) u = -max_step;
 
-    return clamp_pwm((int32_t)pwm + (int32_t)u);
+    /* Keep the fraction. (int32_t)u truncated toward zero, so a correction of
+     * 6.7 LSB was applied as 6 and the missing 0.7 was thrown away — in the
+     * same direction every time, which the loop cannot distinguish from a gain
+     * error. Accumulating it instead is what makes a run of sub-LSB corrections
+     * add up to a real one. */
+    double target = fine_base(pwm) + u;
+    g_vctl_fine       = target;
+    g_vctl_fine_valid = true;
+
+    return clamp_pwm((int32_t)(target + (target < 0.0 ? -0.5 : 0.5)));
 }
 
 /* Write trendstr — caller already holds xCtrlMutex */
@@ -1227,8 +1278,1132 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
 }
 #endif /* GPSDO_LTIC */
 
+/* ======================================================================
+ * ALGORITHM 12 — Multi-level accumulator
+ *
+ * After Alan Cashin's (MIS42N on EEVblog) Budget GPSDO, transcribed from the
+ * PIC16F1455 assembly he publishes on SourceForge. The structure is his; this is
+ * a port rather than a reinterpretation, so that a misbehaviour is traceable to
+ * the transcription rather than to a rewrite of the idea.
+ *
+ * WHAT PROBLEM IT SOLVES
+ * ----------------------
+ * Every other loop here has one time constant, and that constant is a compromise
+ * nobody wins. Measured on Dan Wiering's bench against a rubidium reference:
+ *
+ *     tau          LTC 60              LTC 240
+ *     10-400 s     worse               up to 1.44x better
+ *     800-2000 s   up to 1.58x better  worse
+ *
+ * You pick one. Short tracks the oscillator and lets GPS noise in; long rejects
+ * the noise and is slow to catch real drift.
+ *
+ * This does not pick. Readings accumulate into a hierarchy of levels, level n
+ * covering 2^(n+1) seconds, and a correction is applied at the LOWEST level whose
+ * error exceeds that level's limit. A large error acts within two seconds; a small
+ * one waits for a longer average before anything is done. The error chooses its
+ * own averaging time.
+ *
+ * HOW THE LEVELS WORK — no ring buffers, no loop over timescales
+ * -------------------------------------------------------------
+ * The level comes out of the bit pattern of the seconds counter: inspect from the
+ * least significant bit upward, stop at the first zero. Level n then receives a
+ * value once every 2^n seconds exactly, for one 16-bit variable per level. Eleven
+ * levels — 2 s to 2048 s — cost 22 bytes.
+ *
+ * At each level two stored values, A (older) and B (newer):
+ *
+ *     slope = B - A                  frequency error over the level's span
+ *     phase = (A + B) + 2*(B - A)    error extrapolated to end of period
+ *
+ * Both are tested against per-level limits. Exceed either and a correction is
+ * applied and collection restarts from level 0. Pass both and A+B is promoted to
+ * the next level, where the same test runs over twice the span.
+ *
+ * TWO DETAILS WORTH KEEPING
+ * -------------------------
+ * The frequency test is SKIPPED when slope and phase have opposite signs: the
+ * loop is already correcting the phase and testing the frequency would add a
+ * redundant nudge. One XOR on the sign bit.
+ *
+ * Each reading enters as 2*x+1, not x. Alan found that assigning zero to a
+ * reading inside the target window let the phase wander; forcing every reading to
+ * carry a significant value pinned it, and converges the mean of early and late
+ * arrivals on zero rather than on the middle of a quantisation bin. The same
+ * principle as dither in a converter: a dead zone in a control loop is worse than
+ * noise, because the loop pushes, sees nothing, pushes harder, and then jumps.
+ *
+ * NOT AN LTIC ALGORITHM
+ * ---------------------
+ * This works on the raw TIM2 count, so it needs no phase detector and no picDIV.
+ * That is the point: Alan's design reaches parts in 10^11 from a PIC and a NEO-6M
+ * for under twenty dollars precisely because it never needs the hardware that
+ * algorithms 10 and 11 depend on. So this is the algorithm for a board that has
+ * none — and a fair comparison for one that does.
+ *
+ * STATUS: UNTUNED. The limits below are scaled from Alan's, whose counter
+ * resolves 25 ns where TIM2 here resolves 100 ns, and whose receiver had no
+ * sawtooth correction where this firmware applies qErr. They are a starting point
+ * and are expected to need adjusting against measurement.
+ * ====================================================================== */
+
+/* Levels 0..MLACC_LEVELS-1 span 2..2048 seconds. Past that an OCXO's own drift
+ * dominates whatever the averaging recovers — Alan's limit, and his reasoning
+ * carries over. */
+/* Per-level limits: {phase, slope}, in TIM2 ticks.
+ *
+ * Alan's table, scaled. His counter resolves 25 ns against 100 ns here, so his
+ * tick counts are divided by four; but his receiver had no sawtooth correction
+ * and this one does, so the phase limits are not loosened further to compensate
+ * for jitter that is no longer present. The result is a table that should be in
+ * the right region and is certainly not yet right.
+ *
+ * The pattern matters more than the numbers: limits grow with level, because a
+ * longer average tolerates a larger absolute error before it is worth acting on,
+ * while the frequency limit tightens in relative terms. */
+/* Shortest time a correction may be spread over, in seconds.
+ *
+ * Alan corrects over the measurement span and calls the choice arbitrary — "it
+ * could be shorter or longer". Taken literally it is far too aggressive at the
+ * low levels: a 1012 ns error seen at level 0 asks to be nulled in two seconds,
+ * which needs 5 Hz, which is 15685 DAC counts on this oscillator. It clamped,
+ * the phase could not be cleared, and the oscillator was thrown far enough that
+ * the arming gate never opened — so the detector stayed railed and the loop
+ * could not recover. Measured: 14000 counts of PWM swing.
+ *
+ * A GPSDO wants a large error corrected gently. The floor makes a big excursion
+ * take a minute rather than two seconds, still far quicker than the oscillator
+ * drifts. */
+/* ---- MEASURED per-level limits (MF 3) -------------------------------------
+ *
+ * The formula this replaces is
+ *
+ *     thr[L] = 8 * sigma * sqrt(2^L) * sqrt(10)
+ *
+ * and every term in it is an assumption. sqrt(2^L) says the phase is WHITE, so
+ * that averaging 2^L samples reduces the test by 2^(L/2). Measured on two
+ * boards of this design — same PCB, same OCXO, different rooms — the exponent
+ * is 0.95 and 1.03, not 0.50. Averaging buys almost nothing, because the phase
+ * that matters here is a slow wander (autocorrelation 0.96 at 60 s, 0.64 at
+ * 300 s) and not sample-to-sample noise.
+ *
+ * The error compounds: at level 0 the formula understates the real spread by
+ * about 5x, at level 10 by over 100x, so the table falls 32x across the
+ * hierarchy where the phase itself falls by 1.3x. On a board holding 5 ns of
+ * phase the crossing still lands at level 4-6 and the loop behaves; on the same
+ * board in a noisier room, holding 26 ns, it lands at level 0-1 — below
+ * MLACC_FREQ_MIN_LEVEL, where the frequency term is gated off and the
+ * correction is a bare slew. That is the hunting mode this file's own
+ * correction comment warns about.
+ *
+ * So the exponent is measured instead of assumed. Each level keeps the mean
+ * square of its own test statistic; a least-squares fit of log2(sd) against
+ * level gives the amplitude and the exponent together, and the table is built
+ * from the fit. Fitting ACROSS levels rather than trusting each level alone is
+ * what makes it usable early: level 8 is evaluated once every 512 s and would
+ * need half a day to have a variance of its own, but it does not need one — the
+ * low levels populate in minutes and the fit extrapolates.
+ *
+ * WHAT KEEPS IT FROM CHASING ITSELF. Two failure modes are on record in this
+ * file, and the design has to survive both.
+ *
+ *   Downward: the loop suppresses the phase, the spread falls, the threshold
+ *   falls, the loop acts on less. It stops on its own, and on a floor that is
+ *   MEASURED rather than declared: once the phase is down to the per-sample
+ *   noise, consecutive readings decorrelate and sd(3b-a) can fall no further
+ *   than 2*sigma*sqrt(10). The old code wrote that floor as a constant 5 ns,
+ *   which is a property of THIS detector and this receiver's sawtooth, not of
+ *   the arithmetic.
+ *
+ *   Upward: an uncorrected frequency error ramps the phase, the ramp inflates
+ *   the spread, the threshold grows with the error it exists to catch and the
+ *   loop freezes. That is what the exponent clamp below is for, and it is why
+ *   the clamp is [0.5, 1.0] rather than a wider band picked for comfort: 0.5 is
+ *   white noise, the most that averaging can ever remove, and 1.0 is a spread
+ *   flat in nanoseconds. A fit above 1.0 is not a noisier board — it is a ramp,
+ *   and accepting it would be that second failure exactly.
+ *
+ * The adaptation time constant is the full depth of the hierarchy, so every
+ * level averages over the same wall-clock span rather than the same number of
+ * evaluations. Nothing here is tuned to a board: the only quantity a user sets
+ * is how often a correction may be triggered by noise alone (MFT), and the
+ * per-level multiplier follows from it, which is what the hand-picked 8 in the
+ * formula was standing in for. */
+#define MLACC_FIT_MIN_N     24u        /* evaluations before a level may be fitted */
+#define MLACC_FIT_TAU_S     ((double)(1u << (MLACC_LEVELS + 1)))  /* 4096 s */
+#define MLACC_ALPHA_WHITE   0.5        /* what white noise gives                */
+#define MLACC_ALPHA_FLAT    1.0        /* spread flat in ns; above this is a ramp */
+
+uint8_t  g_mlacc_thr_src   = MLACC_THR_FOLLOW;
+uint16_t g_mlacc_thr_tgt_s = 0;        /* 0 = MLACC_THR_TGT_DEFAULT */
+
+static double   s_mla_ms_test[MLACC_LEVELS];   /* EMA of test^2, per level */
+static uint16_t s_mla_test_n[MLACC_LEVELS];
+static mlacc_fit_t s_mla_fit;
+
+#define MLACC_MIN_HORIZON  64
+
+/* Lowest hierarchy level at which the frequency term is trusted. Below this the
+ * pair-slope is dominated by its own noise — see the sign/gate block in
+ * multi_level_accum() for the arithmetic and the measurement. The TIM2 trim
+ * below is not bound by this: it reads the counter, not the slope. */
+#define MLACC_FREQ_MIN_LEVEL 3
+
+/* Gate for the TIM2 frequency trim, in Hz. avg100 resolves 0.01 Hz, so 0.03 Hz
+ * is three counts of the measurement. Below it the counter has nothing to say
+ * and the pair-slope term owns the fine work as before. */
+#define MLACC_TIM2_TRIM_GATE 0.03
+
+/* Per-level phase limits, in accumulator units (1 ns per LSB of phase).
+ *
+ * These are Alan's own table, multiplied by 25 — his counter stepped 25 ns where
+ * the LTIC detector steps about 1, and the accumulator arithmetic is otherwise
+ * identical, so his numbers carry across by simple scaling.
+ *
+ * The first attempt scaled them down instead, on the reasoning that a finer
+ * detector should permit tighter thresholds. That was wrong, and the measurement
+ * says so. What sets the floor is not the detector's resolution but the GPS
+ * signal's own wander, which is the same for both of us — Alan's note about the
+ * one derived value makes the point exactly: the specification allowed 64 ns at
+ * 64 s, but "a cheap GPS module with a poor signal can often wander +/-100 ns and
+ * generate a false error", so he used 125 ns at 128 s instead.
+ *
+ * Halving his numbers put the level-0 threshold at 225 ns against a phase that
+ * swings +/-400 ns, so corrections fired on noise: 177 of them in 720 seconds,
+ * with the loop never climbing past level 3. Restored, level 0 sits at 462 ns and
+ * noise alone no longer reaches it.
+ *
+ * The phase threshold each entry represents is limit / 2^(level+2), since the
+ * accumulator holds 2^(level+1) samples of (2*phase + 1):
+ *
+ *     level 0    462 ns     level 4    191 ns     level 8    108 ns
+ *     level 1    400 ns     level 5    164 ns     level 9    103 ns
+ *     level 2    331 ns     level 6    126 ns  <- the derived one
+ *     level 3    264 ns     level 7    117 ns     level 10    63 ns
+ *
+ * Runtime rather than const: only the 128 s value was ever derived from a
+ * specification and Alan calls the rest arbitrary, so every board will want to
+ * adjust them. Editable with MLP, listed by ML, saved with ES ALGO12. */
+int32_t g_mlacc_lim[MLACC_LEVELS] = {
+    /* level  0,    2 s */    1850,
+    /* level  1,    4 s */    3200,
+    /* level  2,    8 s */    5300,
+    /* level  3,   16 s */    8450,
+    /* level  4,   32 s */   12200,
+    /* level  5,   64 s */   21050,
+    /* level  6,  128 s */   32350,   /* 126 ns — the one derived value */
+    /* level  7,  256 s */   59700,
+    /* level  8,  512 s */  110300,
+    /* level  9, 1024 s */  210200,
+    /* level 10, 2048 s */  259200,
+};
+
+/* Static run state. Not user-tunable — that lives in g_mlacc_* above. */
+static int32_t  s_mla_val[MLACC_LEVELS];   /* stored value per level          */
+static uint32_t s_mla_count;               /* seconds since last correction   */
+static uint8_t  s_mla_last_level;          /* level that last acted           */
+static uint32_t s_mla_corrections;
+/* Seconds since the loop last LOST the phase, not since it last acted. A
+ * correction or a zero-crossing is the loop working, not the loop struggling —
+ * coupling the LOCK lamp to s_mla_count showed "ACQ" for 40% of a healthy
+ * run (measured, 17.08 log: corrections every ~4 min, 64 s of count needed).
+ * Reset only where control was genuinely absent: WAIT/SYNC/FLL/NOPH. */
+static uint32_t s_mla_quiet;
+/* Scale from phase to DAC counts, published so the zero-crossing test can use it
+ * before the correction block computes it. */
+static double   s_mla_lsb_ns;
+static bool     lsb_per_ns_ready;
+static double   s_mla_ms_phase;     /* mean square phase, for the noise estimate */
+static uint32_t s_mla_ms_n;
+/* Zero-crossing state. See the block in multi_level_accum() for why this is
+ * not optional. */
+static bool     s_mla_returning;    /* a limit correction is still settling   */
+static uint32_t s_mla_wait;         /* samples since the limit correction     */
+static int32_t  s_mla_ph_sign;      /* sign of the phase when the limit fired */
+static int32_t  s_mla_slew_lsb;     /* deliberate slew, removed at the crossing */
+static uint32_t s_mla_zc_hits;      /* zero-crossing corrections applied      */
+static uint32_t s_mla_armed;        /* picDIV re-arms, for telemetry */
+/* Seconds to ignore the detector after a picDIV re-arm: the divider lands the
+ * phase at a quantised offset (~±3 µs on this build), and that jump must not
+ * enter the accumulator or the noise estimate. */
+static uint32_t s_mla_post_arm;
+/* Was the PREVIOUS second a usable, contiguous phase reading? The noise
+ * estimate below works on consecutive differences, so a difference taken
+ * ACROSS a gap (NOPH, SYNC, a re-arm) is not a measurement of noise — it is
+ * the gap. Tracking this structurally is what lets the outlier gate stop
+ * being self-referential; see the estimator block. */
+static bool     s_mla_prev_valid;
+static int32_t  s_mla_last_slope;
+static int32_t  s_mla_last_phase;
+
+/* Scale from phase error to DAC counts. Zero means derive it from the CT
+ * calibration, which is what algorithm 11 does and what most users want. */
+float   g_mlacc_gain = 0.0f;
+/* Force a correction once this level is reached, whatever the limits say —
+ * otherwise a slow drift under every limit would never be acted on. */
+uint8_t g_mlacc_run_level = 9;
+/* Zero-crossing correction on/off. On by default because Alan calls it essential,
+ * but switchable: it has been the source of two separate faults here and a tester
+ * needs to be able to take it out of the picture without recompiling. */
+
+/* Published for telemetry: the last count error seen, and the state of the
+ * hierarchy. The tuner plots the offset, so it has to leave the algorithm. */
+/* int16_t, not int8_t: this now carries phase in nanoseconds, and the detector
+ * band alone spans several hundred. The first version held the count error in
+ * whole hertz, where int8_t was ample — the type had to grow with the meaning. */
+int16_t g_last_offset = 0;
+
+/* Outside the GPSDO_LTIC guard, like mlacc_get_stats() below it and like every
+ * g_mlacc_* global: the accessors and the settings fields exist on any build so
+ * that the CLI and the flash ring do not need a guard of their own. Only the
+ * loop itself is conditional. */
+void mlacc_get_fit(mlacc_fit_t *out)
+{
+    if (out) *out = s_mla_fit;
+}
+
+void mlacc_get_stats(mlacc_stats_t *out)
+{
+    out->last_action  = s_mla_last_level;
+    out->corrections  = s_mla_corrections;
+    out->arms         = s_mla_armed;
+    out->sigma_ns     = (int32_t)sqrt(s_mla_ms_phase);
+    out->zero_cross   = s_mla_zc_hits;
+    out->seconds      = s_mla_count;
+    out->last_slope   = s_mla_last_slope;
+    out->last_phase   = s_mla_last_phase;
+}
+
+static void mlacc_reset(void)
+{
+    /* Clears the accumulator hierarchy only. The zero-crossing flag deliberately
+     * survives: it is set BY a correction and has to outlive the reset that
+     * correction performs, or the crossing it is waiting for never gets noticed. */
+    for (int i = 0; i < MLACC_LEVELS; i++) s_mla_val[i] = 0;
+    s_mla_count = 0;
+}
+
+#ifdef GPSDO_LTIC
+/* Algorithm 12 requires the phase detector. It once had a fallback that
+ * integrated the TIM2 count error on boards without one; that fallback
+ * accumulated a random walk of quantisation noise rather than phase and
+ * destroyed the lock, so it is gone and the whole function is guarded instead.
+ * LA 12 refuses at the CLI when this is not defined. */
+
+/* Standard normal quantile by bisection on erf(). Called eleven times every
+ * 300 s, so the cost does not matter and a closed-form approximation would only
+ * add a second thing to be wrong about. */
+static double mlacc_probit(double p)
+{
+    if (p <= 0.5) return 0.0;
+    double lo = 0.0, hi = 8.0;
+    for (int i = 0; i < 60; i++) {
+        double m = 0.5 * (lo + hi);
+        if (0.5 * (1.0 + erf(m / sqrt(2.0))) < p) lo = m; else hi = m;
+    }
+    return 0.5 * (lo + hi);
+}
+
+/* How many sigma at this level, from the interval the user is willing to see
+ * between corrections that noise alone triggered.
+ *
+ * This is the term the formula's hard-coded 8 was doing by hand. Its comment
+ * says as much — "the hierarchy tests level 0 twice as often as level 1 and
+ * eight times as often as level 3, so a threshold that is merely unlikely per
+ * test still fires constantly at the bottom" — and then picks a single number
+ * for every level anyway. The test rate IS the level, so the multiplier can be
+ * derived rather than chosen: level L is evaluated every 2^(L+1) seconds, so
+ * allowing one false fire per tgt seconds fixes the tail probability. */
+static double mlacc_level_q(int L, double tgt_s)
+{
+    double p = (double)(1u << (L + 1)) / tgt_s;
+    if (p > 0.5) p = 0.5;              /* at the top the hierarchy is MR's job */
+    return mlacc_probit(1.0 - 0.5 * p);
+}
+
+/* Which source is actually driving the table. MLACC_THR_FOLLOW keeps the old
+ * welding of limits to gain, so an installation that never touches MF sees the
+ * behaviour it has always had. */
+static uint8_t mlacc_thr_source(void)
+{
+    if (g_mlacc_thr_src != MLACC_THR_FOLLOW) return g_mlacc_thr_src;
+    return (g_mlacc_gain <= 0.0f) ? MLACC_THR_SIGMA : MLACC_THR_STORED;
+}
+
+/* The white-noise table, unchanged in arithmetic and moved out of the control
+ * path so MF can select it independently of the gain. */
+static void mlacc_build_sigma(void)
+{
+            double sigma = sqrt(s_mla_ms_phase);
+            /* Floor: this detector plus the sawtooth cannot honestly resolve
+             * below a few ns, and a sigma under that only means the estimator
+             * has been starved, not that the board got quiet. */
+            if (sigma < 5.0) sigma = 5.0;
+            if (sigma > 1.0 && sigma < 20000.0) {
+                /* The threshold applies to the TEST EXPRESSION, not to the
+                 * average phase — a distinction that cost a full round of
+                 * measurement to notice.
+                 *
+                 * The test is |(a+b) + 2*(b-a)| = |3b - a|, where a and b are
+                 * each sums of 2^L samples. So sd(a) = sd(b) = sigma*sqrt(2^L),
+                 * and sd(3b - a) = sigma*sqrt(2^L)*sqrt(10). Setting the
+                 * threshold from sigma/sqrt(N) instead — the standard error of
+                 * the mean — makes it 4.5x too low at level 0 and worse above,
+                 * so noise crossed it constantly and the hierarchy reset before
+                 * it could climb. Simulated: level 0 firing 1040 times in 4000 s
+                 * with levels 3 and above never reached.
+                 *
+                 * Five sigma on the correct quantity fires on noise about once in
+                 * 3.5 million tests. Real drift accumulates in both terms and
+                 * crosses far sooner, because it does not cancel the way noise
+                 * does. */
+                for (int L = 0; L < MLACC_LEVELS; L++) {
+                    double sd_test = sigma * sqrt((double)(1u << L)) * sqrt(10.0);
+                    /* Eight sigma, not the usual three or four.
+                     *
+                     * The hierarchy tests level 0 twice as often as level 1 and
+                     * eight times as often as level 3, so a threshold that is
+                     * merely "unlikely" per test still fires constantly at the
+                     * bottom. Six sigma settled the loop — phase to 10 ns RMS
+                     * about a zero mean over seven hours — but was still applying
+                     * a correction every 50 s once the noise had fallen to 9 ns,
+                     * which is the loop reacting to its own noise floor rather
+                     * than to drift. Eight quiets that without loosening the
+                     * response to anything real: drift accumulates in both terms
+                     * of the test and crosses far sooner than noise, which
+                     * largely cancels.
+                     *
+                     * Adjustable per level with MLP if a board wants otherwise. */
+                    int32_t units  = (int32_t)(8.0 * sd_test);
+                    if (units < 100) units = 100;
+                    g_mlacc_lim[L] = units;
+                }
+            }
+    s_mla_fit.valid = false;
+}
+
+/* The measured table. Fits log2(sd of the level-L test) against L and builds
+ * the whole table from the fit — amplitude and exponent both measured, and the
+ * per-level multiplier derived from MFT rather than chosen. See the block above
+ * MLACC_MIN_HORIZON for why every constant the formula version carries is gone
+ * and what stops the estimate chasing its own tail. */
+static void mlacc_build_measured(void)
+{
+    double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+    int n = 0;
+    for (int L = 0; L < MLACC_LEVELS; L++) {
+        s_mla_fit.tests[L] = s_mla_test_n[L];
+        if (s_mla_test_n[L] < MLACC_FIT_MIN_N) continue;
+        if (s_mla_ms_test[L] <= 0.0) continue;
+        double y = log(sqrt(s_mla_ms_test[L])) / log(2.0);
+        sx += L; sy += y; sxx += (double)L * L; sxy += (double)L * y; n++;
+    }
+    s_mla_fit.levels_used = (uint8_t)n;
+    if (n < MLACC_FIT_MIN_LVL) { s_mla_fit.valid = false; return; }
+
+    double den = (double)n * sxx - sx * sx;
+    if (den <= 0.0) { s_mla_fit.valid = false; return; }
+    double slope = ((double)n * sxy - sx * sy) / den;
+    double inter = (sy - slope * sx) / (double)n;
+
+    /* The clamp is physics, not taste. Below 0.5 would mean averaging removes
+     * more than white noise allows; above 1.0 the spread is growing faster than
+     * flat-in-ns, which is a phase RAMP rather than a noisier board — and
+     * letting a ramp raise the threshold is the failure this file already
+     * recorded once, where sigma climbed 165 -> 746 ns and the loop froze. */
+    if (slope < MLACC_ALPHA_WHITE) slope = MLACC_ALPHA_WHITE;
+    if (slope > MLACC_ALPHA_FLAT)  slope = MLACC_ALPHA_FLAT;
+
+    double tgt = (g_mlacc_thr_tgt_s > 0u) ? (double)g_mlacc_thr_tgt_s
+                                          : (double)MLACC_THR_TGT_DEFAULT;
+    for (int L = 0; L < MLACC_LEVELS; L++) {
+        double sd = pow(2.0, inter + slope * (double)L);
+        double u  = mlacc_level_q(L, tgt) * sd;
+        /* Same band MLP accepts, so a measured table and a hand-set one are
+         * always the same kind of number and ML can print them side by side. */
+        if (u < 1.0)      u = 1.0;
+        if (u > 500000.0) u = 500000.0;
+        g_mlacc_lim[L] = (int32_t)u;
+    }
+    s_mla_fit.exponent       = (float)slope;
+    s_mla_fit.intercept_log2 = (float)inter;
+    s_mla_fit.valid          = true;
+}
+
+uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
+{
+    FreqSnapshot_t s;
+    take_freq_snapshot(&s);
+    if (!s.have10) { s_mla_quiet = 0; set_trend("WAIT"); return pwm; }
+
+    /* INPUT: phase in nanoseconds, from the LTIC detector.
+     *
+     * The first port fed instant_offset — the TIM2 count error in whole hertz —
+     * and it was blind, for the reason above. Alan accumulates PHASE, and that is
+     * the difference: phase integrates, so an error of 1e-11 that is invisible in
+     * a one-second frequency count becomes 25 ns of phase in 2500 seconds. He
+     * asked why I had said 100 ns when a TIC resolves 1 ns; he was right, I had
+     * quoted the counter's resolution rather than the detector's. The detector is
+     * 25x finer than the design this comes from. */
+    bool    ph_valid = false;
+    double  ph       = ltic_phase_error_ns(&ph_valid, ppscount);
+    bool    have_phase = (ph_valid && g_ltic.ns_per_volt > 1.0f);
+    int32_t phase_ns   = have_phase
+                       ? (int32_t)(ph + (ph < 0 ? -0.5 : 0.5))
+                       : 0;
+
+    /* TIM2 frequency estimate [Hz]. The 100 s average when it exists (0.01 Hz
+     * resolution), otherwise a ~50 s EMA of the 1-second count error. This is
+     * the one measurement Alan never had — his PIC had no counter gated by
+     * PPS — and it is what breaks the deadlock his design could only escape
+     * by restarting: while the phase detector is blind, the frequency still
+     * reads true. */
+    double  f_meas;
+    {
+        static double f_ema = 0.0;
+        f_ema += ((double)s.instant_offset - f_ema) * 0.02;
+        f_meas = s.have100 ? (s.avg100 - 10000000.0) : f_ema;
+    }
+
+    /* The picDIV has to be armed, or the detector never gives a valid reading.
+     *
+     * Algorithms 10 and 11 both arm it: algo 10 on entering ACQ, algo 11 through a
+     * hold-off bridge once the frequency has settled but the phase is still
+     * railed. Algorithm 12 did neither, and the consequence was quiet rather than
+     * loud — with the ramp parked against a rail nothing works and nothing says so.
+     *
+     * The gate is |f| < 0.5 Hz, read from the TIM2 estimate above. The earlier
+     * +/-10 Hz gate re-armed 87 times in one hour on the 14.08 log: each arm
+     * lands the phase at a divider-quantised offset (~±3 µs, mostly outside
+     * the ±1 µs band) while the uncorrected frequency keeps the phase ramping,
+     * so the detector rails again within seconds and the next arm rolls the
+     * same dice. Arming is only worth disturbing the divider once the
+     * frequency is close enough for the phase to STAY wherever it lands; until
+     * then the FLL below brings it there. */
+    {
+        static uint32_t railed_cnt  = 0;
+        static uint32_t arm_holdoff = 0;
+        bool freq_close = (f_meas > -0.5 && f_meas < 0.5);
+
+        if (arm_holdoff > 0) {
+            arm_holdoff--;
+            railed_cnt = 0;
+        } else if (!have_phase && freq_close) {
+            if (railed_cnt < 0xFFFFFFFFu) railed_cnt++;
+            if (railed_cnt >= 5u) {
+                ltic_arm_picdiv();
+                railed_cnt     = 0;
+                arm_holdoff    = 60u;   /* was 15: let the phase settle before another try */
+                s_mla_post_arm = 5u;    /* keep the ±3 µs landing jump out of the accumulator */
+                s_mla_armed++;
+            }
+        } else {
+            railed_cnt = 0;
+        }
+    }
+
+    /* Just re-armed: the divider output has jumped to a quantised offset and
+     * the first few readings are that jump, not the oscillator. Let it settle. */
+    if (s_mla_post_arm > 0) {
+        s_mla_post_arm--;
+        s_mla_quiet = 0;
+        set_trend("SYNC");
+        s_mla_count++;
+        s_mla_prev_valid = false;   /* the next reading is not contiguous */
+        return pwm;
+    }
+
+    if (!have_phase) {
+        /* Detector fitted but not reading — railed, saturated, or not yet armed.
+         *
+         * Alan's answer to this state was a full restart (RTquickAct: control
+         * voltage to zero, re-anchor, begin again). We can do better, because
+         * TIM2 measures the frequency directly: a gentle FLL step walks f
+         * toward zero, the phase ramp that was carrying it out of the band
+         * stops, and the detector recovers on its own — no dice roll needed.
+         *
+         * This is what the last 19 minutes of the 14.08 log were missing:
+         * f = +0.26 Hz (measured, printed every second as f100), the phase
+         * sweeping the band every ~20 s, PWM frozen at 41486, trend cycling
+         * NOPH/false-LOCK. Gate at 0.3 Hz so the fine loop owns anything
+         * smaller; step damped 0.1 and clamped so a mis-scaled CT constant
+         * cannot run away — the correction is proportional to the same
+         * lsb_per_hz it uses, so it converges at any scale, just slower. */
+        /* ONE COMPUTED STEP, THEN WAIT FOR THE AVERAGE TO REFRESH.
+         *
+         * This was a bang-bang loop and could not have been anything else: the
+         * step was -f*lsb_per_hz*0.10 clamped to +/-64, which saturates at
+         * |f| = 64/(2500*0.1) = 0.256 Hz, while the gate below it only opened
+         * at 0.3 Hz. The proportional part could never act at all. Driven once
+         * a second from a 100 s average — about 50 s of lag — that gives
+         * 64 LSB/s * 50 s = 3200 LSB of travel before the measurement even
+         * begins to respond, which at the measured 319.5 uHz/LSB is 1.0 Hz of
+         * overshoot.
+         *
+         * Both numbers are in the logs. 14.08 21:10: 462 of 655 consecutive
+         * steps exactly +/-64, PWM sweeping 12845 LSB, f100 swinging -1.29 to
+         * +1.55 Hz. 15.08 00:14, t=108..300: PWM 41289 -> 45897 -> 39241 in one
+         * cycle, f100 -5.79 -> -0.59 -> +1.26.
+         *
+         * So: apply the whole computed correction ONCE, then hold off for as
+         * long as the average it was computed from needs to refresh. Damped 0.5
+         * against a gain that CT knows only to about 25% (it derives 2500 LSB/Hz
+         * where the log measures 3130), which leaves the per-step loop gain near
+         * 0.4 — convergent for any gain error within a factor of two.
+         *
+         * TWO SPEEDS, because one window cannot do both jobs. While the error is
+         * large the 10 s average is used: ~5 s of lag, so a step every 10 s, and
+         * a cold start walks in briskly. Once it is small the 100 s average
+         * takes over, because it is the only one that resolves 0.01 Hz. The
+         * hold-off always matches the window in use, so no step is ever applied
+         * twice on the strength of a single measurement.
+         *
+         * GATE at 0.05 Hz, not 0.3. Above 0.147 Hz the phase crosses the whole
+         * +/-940 ns detector band inside one 64 s horizon, so the old gate left
+         * a dead zone from 0.147 to 0.3 Hz in which the phase loop could not get
+         * a long enough look and the FLL considered its work done. The 15.08
+         * log ended parked in it, at f = +0.27 Hz.
+         *
+         * Simulated on a model calibrated against that log, four seeds: over two
+         * hours this holds |f| at 0.001 Hz with 83% of seconds giving a usable
+         * phase reading and the hierarchy averaging level 3.1, against 0.200 Hz,
+         * 36% and level 0.3 for the loop as it stands. */
+        static uint32_t fll_holdoff = 0;
+        double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
+        if (fll_holdoff > 0u) {
+            fll_holdoff--;
+        } else if (lsb_per_hz > 0.0 && ppscount > 60u &&
+                   (f_meas > 0.05 || f_meas < -0.05)) {
+            double f_use = f_meas;
+            /* Far out: steer from the short window and step again sooner. */
+            if (s.have10) {
+                double f_fast = s.avg10 - 10000000.0;
+                if (f_fast > 1.0 || f_fast < -1.0) {
+                    f_use = f_fast;
+                    fll_holdoff = 10u;
+                } else {
+                    fll_holdoff = 100u;
+                }
+            } else {
+                fll_holdoff = 100u;
+            }
+            /* SIGN FROM THE BOARD, NOT FROM THIS LINE.
+             *
+             * This read -f_use, which is right only because LPOL is -1 here.
+             * The TIM2 frequency branch takes +polarity, the convention algo 11
+             * established from a cold-start runaway on this wiring (see the
+             * comment at its freq_lsb): TIM2 and the LTIC detector have
+             * opposite orientation, so the frequency branch and the phase
+             * branch carry opposite signs. With polarity == -1 this evaluates
+             * to exactly what it did before, so nothing changes on this board;
+             * on an LPOL +1 board the old line was positive feedback. */
+            double pol_f = (g_ltic.polarity == -1) ? -1.0 : 1.0;
+            int32_t d = (int32_t)(pol_f * f_use * lsb_per_hz * 0.5);
+            s_mla_quiet = 0;
+            set_trend("FLL ");
+            return clamp_pwm((int32_t)pwm + d);
+        }
+        s_mla_quiet = 0;
+        set_trend("NOPH");
+        s_mla_count++;
+        s_mla_prev_valid = false;   /* the next reading is not contiguous */
+        return pwm;
+    }
+    g_last_offset = (int16_t)phase_ns;
+
+    /* ZERO-CROSSING TEST.
+     *
+     * Alan calls this essential and the reason is worth stating: after a limit
+     * correction changes the frequency, the phase keeps moving in the direction
+     * it was already going. It sweeps through zero and out the other side, and
+     * usually fails the limit again — so the loop corrects, overshoots, corrects
+     * back, and settles slowly if at all.
+     *
+     * The moment the phase crosses zero is special. At that instant the phase
+     * error is nil, but the frequency error that carried it there is still
+     * present. Cancel the frequency error exactly then and the oscillator is left
+     * with both the right frequency AND no phase error — a clean state, rather
+     * than one the loop has to iterate towards.
+     *
+     * Measured against Alan's own logs: his loop corrects every 506 seconds where
+     * mine corrects every 130. Most of that difference is this test.
+     *
+     * The flag is set when a limit correction fires, and cleared here on the first
+     * sample whose phase has taken the sign the correction was pushing towards —
+     * which is the crossing. */
+    /* Give up waiting after a while. If the phase does not cross within a few
+     * minutes, the correction did not overshoot and there is nothing to cancel —
+     * holding the flag open would let a much later, unrelated crossing trigger a
+     * correction based on a stale slope. 300 s: a slew at the 64 s minimum
+     * horizon nulls its phase in ~64 s, so 5 horizons is generous. */
+    if (s_mla_returning && ++s_mla_wait > 300u) {
+        s_mla_returning = false;
+    }
+    if (s_mla_returning && phase_ns != 0) {
+        /* The phase has arrived: it has taken the opposite sign to the error that
+         * triggered the correction. Remove the deliberate slew and the oscillator
+         * is left at the right frequency AND no phase error — which is the point,
+         * and why Alan calls this essential rather than an optimisation. */
+        if ((phase_ns > 0) != (s_mla_ph_sign > 0)) {
+            s_mla_returning = false;
+            if (s_mla_slew_lsb != 0) {
+                int32_t dz = -s_mla_slew_lsb;
+                s_mla_slew_lsb = 0;
+                s_mla_zc_hits++;
+                mlacc_reset();
+                set_trend("ZC  ");
+                return clamp_pwm((int32_t)pwm + dz);
+            }
+        }
+    }
+
+    /* MEASURE THE PHASE NOISE, AND SET THE THRESHOLDS FROM IT.
+     *
+     * The limits were first taken from Alan's design and scaled by the ratio of
+     * counter steps. That was the wrong quantity to scale by. What a threshold
+     * has to clear is not the detector's resolution but the NOISE on the
+     * measurement — detector, sawtooth and the GPS signal's own wander together
+     * — and that differs between builds for reasons a step size does not capture.
+     *
+     * Measured here: mean phase -1 ns, standard deviation 462 ns. The oscillator
+     * was correctly tuned; all of that spread was noise. The level-0 threshold
+     * sat at 462 ns, so 41% of samples crossed it, each firing a correction of a
+     * couple of hundred DAC counts. 620 corrections in 1685 seconds, the loop
+     * resetting its hierarchy every 2.7 s and never reaching level 2 — the
+     * arithmetic was right and the threshold was meaningless.
+     *
+     * So it is measured instead. An exponential estimate of the mean-square phase
+     * gives sigma; averaging N samples divides it by sqrt(N); and a threshold of
+     * four sigma on that mean fires on noise about once in 16000 tests, which at
+     * level 0 is once in nine hours. Any real drift crosses it far sooner.
+     *
+     * MG > 0 keeps the stored table instead, for anyone who would rather set them
+     * by hand. */
+    /* The white-noise estimate runs whatever MG says. It used to live inside
+     * `if (g_mlacc_gain <= 0.0f)` together with the table build, which had two
+     * costs: MF could not offer the formula table with a hand-set gain, and
+     * `sig=` in telemetry read a flat zero on every board running MG > 0 — not
+     * because the board was quiet but because nothing was measuring. */
+    {
+        /* Noise from FIRST DIFFERENCES, not deviations about a tracked mean.
+         *
+         * Two estimators failed here before. Mean-square-of-phase counted a
+         * standing offset as noise (phase parked at -985 ns, 45 ns of real
+         * noise, "sigma" read 986). Deviations about a slow tracked mean fixed
+         * that but not the worse case: the phase RAMP that an uncorrected
+         * frequency error produces swept the estimate upward with it — over
+         * the 14.08 log sigma climbed 165 -> 746 ns while every threshold
+         * scaled with it, until no threshold was reachable inside the ±1 µs
+         * detector band and the loop froze outright. A threshold that grows
+         * with the error it is meant to catch can never catch it.
+         *
+         * Consecutive differences kill a linear ramp exactly (dp of a ramp is
+         * constant, and its contribution is (drift*dt)² which at GPSDO rates
+         * is nano-noise: 50 ns/s of drift gives dp = 50, vs sigma 165). They
+         * halve into the per-sample variance (E[dp²] = 2σ²), and do not care
+         * where the mean sits. A re-arm's ±3 µs landing is one huge
+         * difference — rejected by the outlier gate below and by the 5 s
+         * post-arm skip anyway. */
+        /* THE OUTLIER GATE MUST NOT BE ABLE TO SUPPRESS ITS OWN INPUT.
+         *
+         * The previous gate was dp_lim = 5*sigma, read from the estimate it was
+         * feeding. That is a one-way ratchet: once sigma is small, every
+         * difference big enough to raise it is rejected as an outlier, so it can
+         * only ever fall further. Measured on 14.08 21:10 — sig read exactly
+         * 2 ns for all 1020 samples of the run, and with the limits derived from
+         * it the whole hierarchy pinned at the 100-unit floor: 79 of 80
+         * corrections fired at level 0, one at level 1. A multi-level
+         * accumulator that never leaves level 0 is not one.
+         *
+         * Two changes. The gate is now ABSOLUTE (300 ns — well above any real
+         * per-second phase step, well below a re-arm's ±3 µs landing), so it
+         * cannot move with the estimate. And the genuine outliers it was really
+         * there to catch — differences taken across a NOPH/SYNC/re-arm gap — are
+         * excluded structurally by s_mla_prev_valid instead of statistically. */
+        static int32_t prev_ph = 0;
+        if (s_mla_prev_valid) {
+            double dp = (double)(phase_ns - prev_ph);
+            if (dp < 0.0) dp = -dp;
+            if (dp < 300.0) {
+                s_mla_ms_phase += 0.002 * (0.5 * dp * dp - s_mla_ms_phase);
+            }
+        }
+        prev_ph = phase_ns;
+        s_mla_prev_valid = true;
+        if (++s_mla_ms_n >= 300u) {          /* enough samples to mean something */
+            s_mla_ms_n = 0;                  /* re-measure every 300 s */
+            if (mlacc_thr_source() == MLACC_THR_MEASURED) mlacc_build_measured();
+            else if (mlacc_thr_source() == MLACC_THR_SIGMA) mlacc_build_sigma();
+        }
+    }
+
+    int32_t carry = 2 * phase_ns + 1;
+
+    uint32_t work = s_mla_count;
+    int level = 0;
+    int32_t applied = 0;
+
+    for (; level < MLACC_LEVELS; level++) {
+        int32_t a = s_mla_val[level];
+        s_mla_val[level] = carry;          /* the new value becomes the stored one */
+
+        if ((work & 1u) == 0u) {
+            /* First value at this level — nothing to compare against yet. */
+            if (work == 0u) break;         /* and nothing above holds anything */
+            break;
+        }
+
+        /* Two values at this level: A is the one just displaced, B the new one. */
+        int32_t b     = carry;
+        int32_t slope = b - a;
+        int32_t phase = (a + b) + 2 * slope;
+
+        int32_t pabs = phase < 0 ? -phase : phase;
+        int32_t sabs = slope < 0 ? -slope : slope;
+
+        /* MEASURE THIS LEVEL'S OWN SPREAD, before deciding anything with it.
+         *
+         * Updated on every evaluation, fired or not: an estimate that only saw
+         * the tests it let through would be censored by its own threshold,
+         * which is the shape of the dp_lim ratchet recorded above. Skipped
+         * while a slew is in flight, because during those seconds the test is
+         * measuring the loop's own deliberate action and not the board.
+         *
+         * The rate is the same wall-clock time constant at every level rather
+         * than the same number of samples — level 0 is evaluated 1024x more
+         * often than level 10, and an EMA in samples would give them adaptation
+         * spans four hours apart. The span is the depth of the hierarchy
+         * itself, so it is not a number anyone had to pick. */
+        /* Not while acquiring either. Same reason as s_mla_returning: during
+         * pull-in the phase is the loop travelling, not the board's noise. The
+         * 20.08 15:08 run measured what it costs — 102 ns rms over the first
+         * 300 s against 5.7 ns once settled, which is 321x in the mean SQUARE
+         * the estimator accumulates, and with a 4096 s span the pull-in would
+         * still be setting the thresholds an hour after boot.
+         *
+         * s_mla_quiet is the right gate rather than a timer: it counts seconds
+         * since control was genuinely absent (WAIT/SYNC/FLL/NOPH) and is NOT
+         * reset by corrections, so it says "the loop has the phase" and not
+         * "nothing has happened lately". It is the same test the LOCK lamp
+         * uses, so the estimator measures exactly the regime the operator is
+         * being shown. A board that never settles never fills the estimate,
+         * the table stays at whatever is stored, and ML says the fit is not
+         * ready — which is the honest outcome, not a silent bad table. */
+        if (!s_mla_returning && s_mla_quiet > 16u) {
+            double a_ema = (double)(1u << (level + 1)) / MLACC_FIT_TAU_S;
+            if (a_ema > 0.25) a_ema = 0.25;
+            if (s_mla_test_n[level] < 0xFFFFu) s_mla_test_n[level]++;
+            /* WARM-UP. The weight is the larger of the EMA rate and 1/n, so the
+             * first samples form a plain running mean and the EMA only takes
+             * over once it would average over more history than exists.
+             *
+             * Seeding the EMA from a single squared test instead — which is
+             * what the first version did — costs 1/a_ema samples to forget, and
+             * at level 0 that is 2048 evaluations. Caught on the 20.08 home
+             * record: eighteen minutes in, every level was still carrying its
+             * own first sample, the fit read 0.46 where the same data measured
+             * offline gives 0.92, and the clamp turned that into the white-noise
+             * exponent — the estimator would have reported exactly the
+             * assumption it exists to replace, and looked healthy doing it. */
+            double w = 1.0 / (double)s_mla_test_n[level];
+            if (w < a_ema) w = a_ema;
+            double t2 = (double)phase * (double)phase;
+            s_mla_ms_test[level] += w * (t2 - s_mla_ms_test[level]);
+        }
+
+        /* MR: force a correction once this level is reached, whatever the limits
+         * say. Without it a drift slow enough to stay under every limit would be
+         * accumulated forever and never acted on — Alan's SUrunLev serves the
+         * same purpose in the original. Suppressed while a slew is in flight,
+         * like every limit correction (see the act gate below). */
+        if (!s_mla_returning && level >= (int)g_mlacc_run_level) {
+            s_mla_last_level = (uint8_t)level;
+            s_mla_last_slope = slope;
+            s_mla_last_phase = phase;
+            applied = phase;
+            break;
+        }
+
+        /* Phase test only. Alan dropped the frequency test after using it for a
+         * while: "It was an experiment. The phase test can be slower to see a
+         * deviation, but what we want is a stable system where the tests always
+         * pass. So the frequency test is unnecessary." Keeping it would add a
+         * second path to a correction that the phase test reaches anyway.
+         *
+         * Suppressed while a correction's deliberate slew is still walking the
+         * phase home (s_mla_returning): stacking a second slew on top of the
+         * first is what turned the 14.08 pull-in into a +3800 LSB overshoot
+         * and the following minutes into a 4000-LSB limit cycle at one
+         * correction every two seconds. The zero-crossing test clears the
+         * flag when the phase arrives; the timeout abandons it if it never
+         * does. Accumulation continues — the state after the crossing is
+         * fresh, not stale. */
+        (void)sabs;
+        bool act = (!s_mla_returning) && (pabs >= g_mlacc_lim[level]);
+
+        if (act) {
+            s_mla_last_level = (uint8_t)level;
+            s_mla_last_slope = slope;
+            s_mla_last_phase = phase;
+            applied = phase;
+            break;
+        }
+
+        /* Passed both: promote the sum and test again over twice the span. */
+        carry = a + b;
+        work >>= 1;
+    }
+
+    s_mla_count++;
+
+    if (applied == 0) {
+        /* LOCK means: the phase has been readable since the last real
+         * anomaly (arm, railed detector, no data) AND the TIM2 frequency is
+         * home. Corrections and zero-crossings do NOT reset s_mla_quiet —
+         * this algorithm corrects on a schedule as a form of self-test, so
+         * a correction is evidence of health, not of acquisition. The old
+         * test (s_mla_count > 64) read the accumulator's bookkeeping
+         * instead of the loop's state of control and lit ACQ for 40% of a
+         * settled run. The frequency gate is two-tier: the 100 s average
+         * resolves 0.01 Hz, so when it exists 0.05 Hz is a real bound — the
+         * 16.08 band-edge cycle sat at 0.12 Hz and would have shown ACQ
+         * under it, as it should. Before have100 exists the EMA only
+         * resolves whole hertz; keep the loose 0.5 Hz bound there. */
+        bool freq_good = s.have100 ? (f_meas < 0.05 && f_meas > -0.05)
+                                   : (f_meas < 0.5  && f_meas > -0.5);
+        s_mla_quiet++;
+        set_trend((s_mla_quiet > 16u && freq_good) ? "LOCK" : "ACQ ");
+        return pwm;
+    }
+
+    /* Convert the accumulated phase into DAC counts.
+     *
+     * Two things were wrong here and both showed up in the same log.
+     *
+     * UNITS. `applied` is the sum of (2*phase_ns + 1) over `span` samples, so
+     * dividing by two and by the count gives the average phase error in
+     * NANOSECONDS. The first version then multiplied that by LSB-per-HERTZ, as
+     * though nanoseconds and hertz were the same quantity. Nulling P ns over T
+     * seconds needs a fractional offset of P/(T*1e9), which at 10 MHz is
+     * P/(100*T) Hz — so the correction was 100*T times too large, from 200x at
+     * level 0 to 102400x at level 9. Every correction slammed into the +/-2000
+     * clamp, which is exactly what the log showed.
+     *
+     * POLARITY. Algorithm 11 applies -polarity to its phase term; this did not
+     * apply it at all. On a board with LPOL -1 the correction therefore went the
+     * wrong way — positive feedback into a loop that was already over-correcting
+     * by four orders of magnitude. */
+    /* MG: a hand-set gain overrides the CT-derived one, in LSB per ns directly
+     * rather than per hertz — the units a user tuning against a scope actually
+     * has. Zero means derive it, which is the default and what most want. */
+    double lsb_per_ns = s_mla_lsb_ns;
+    if (g_mlacc_gain > 0.0f) {
+        lsb_per_ns = (double)g_mlacc_gain;
+    } else {
+        double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
+        if (lsb_per_hz <= 0.0) {
+            set_trend("NoCT");
+            return pwm;
+        }
+        /* Hz per ns of phase corrected over one second is 1/100 at 10 MHz, so the
+         * per-second gain in LSB per ns is lsb_per_hz/100. The span divides it
+         * again below, where the correction horizon is applied. */
+        lsb_per_ns = lsb_per_hz / 100.0;
+    }
+    /* Publish for the zero-crossing test, which runs earlier in the next pass and
+     * has no other way to know the scale. */
+    s_mla_lsb_ns     = lsb_per_ns;
+    lsb_per_ns_ready = (lsb_per_ns > 0.0);
+
+    /* TWO terms, applied together. This is what was missing, and the reason both
+     * zero-crossing attempts made things worse instead of better.
+     *
+     * State is phase p and frequency error f, with dp/dt = f. A limit correction
+     * has two separate jobs:
+     *
+     *     cancel the measured frequency error       df = -f
+     *     impose a deliberate slew to bring p back  df = -p/T
+     *
+     * which together leave f = -p/T exactly. Apply only the second — all this did
+     * — and the oscillator runs at f_old - p/T instead, so the phase neither
+     * returns cleanly nor stays put when it arrives. The loop hunts, which is what
+     * every log showed.
+     *
+     * With both terms the phase walks to zero along a KNOWN slope. That slope is
+     * deliberate, so it has to be removed when the phase arrives — which is what
+     * the zero-crossing test does. The three pieces are one mechanism; any one of
+     * them alone is worse than none, which is exactly what the measurements said.
+     *
+     * Simulated over 40000 s, 15 ns phase noise, drifting oscillator, four seeds:
+     *     phase only          33.6 ns RMS
+     *     phase + frequency   33.0 ns
+     *     all three           22.4 ns   */
+    double polarity = (g_ltic.polarity == -1) ? -1.0 : 1.0;
+    double span     = (double)(1u << (s_mla_last_level + 1));
+    if (span < (double)MLACC_MIN_HORIZON) span = (double)MLACC_MIN_HORIZON;
+
+    double p_ns  = (double)applied / 2.0 / (double)(1u << (s_mla_last_level + 1));
+    double f_nss = (double)s_mla_last_slope
+                 / (double)(1u << (2u * s_mla_last_level + 1u));
+
+    double slew_lsb = -polarity * (p_ns / span) * lsb_per_ns;
+
+    /* The frequency term, restored. Alan's cvPWM applies BOTH corrections
+     * (250321-O.asm 1293-1297: "add in the frequency correction"; total =
+     * phase_corr + freq_corr), and f_nss below is exactly his slope estimate
+     * — the pair's phase drift in ns/s, already divided by his 2^(2L+1).
+     *
+     * It was removed here after noise measurements, but those were made with
+     * a poisoned sigma: the estimator of the day counted an uncorrected
+     * frequency error's phase ramp as noise (sigma read 300+ ns), so the term
+     * amplified exactly the malfunction it was meant to cure. With the
+     * first-difference estimator above, the slope of a 2^(L+1)-second pair is
+     * a measurement again — a 50 ns/s drift stands out by construction, not
+     * luck. And without this term no correction ever cancels the phase ramp:
+     * the 14.08 log ended with f = +0.26 Hz, the phase sweeping the detector
+     * band every ~20 s, and the loop frozen for the last 19 minutes.
+     *
+     * Damped 0.5 rather than full cancellation: one pair over 2^(L+1) s is a
+     * single measurement, and half-strength converges in two corrections
+     * where full strength stakes everything on one. This is Alan's own k, the
+     * experimental divisor he mentions and never publishes. */
+    double f_ns   = f_nss;
+    if (f_ns >   5000.0) f_ns =   5000.0;   /* 0.5 µs/s is not a measurement, it is a fault */
+    if (f_ns <  -5000.0) f_ns =  -5000.0;
+
+    /* SIGN: -polarity, the same factor the phase term uses.
+     *
+     * It was +polarity, copied from algorithm 11's frequency branch. But algo
+     * 11's frequency branch reads TIM2, and this firmware's own algo-11 comment
+     * records the hardware finding that TIM2 and the LTIC detector have
+     * OPPOSITE orientation on this wiring. f_nss is not a TIM2 reading: it is
+     * the slope of the SAME accumulator values a and b that produce p_ns, from
+     * the SAME detector. A quantity and its own time derivative, measured by one
+     * sensor, cannot need opposite feedback signs. Alan's cvPWM agrees — it
+     * pushes phase and slope through one conversion and ADDs them
+     * (250321O.asm, correctit: "add in the frequency correction" -> CALL addm).
+     *
+     * With the plant now MEASURED rather than assumed — +319.5 uHz/LSB, from
+     * regressing the 100 s mean of PWM against the printed 100 s frequency
+     * average over the 14.08 21:10 log, correlation 0.999 at zero lag — the old
+     * sign works out to d(phase_rate) = +0.4*f_ns. That is positive feedback.
+     *
+     * LEVEL GATE: the slope's own noise is sd(f_nss) = sigma * 2^((1-3L)/2), so
+     * at level 0 it is 1.41*sigma of pure noise, scaled by 12.5 LSB per ns/s
+     * against the phase term's 0.39 LSB per ns. That is a 32:1 noise-to-signal
+     * advantage for the wrong quantity, and the log shows exactly what it buys:
+     * 46% of corrections slammed into the ±470 clamp, one of them with the
+     * phase reading 0 ns and the correction at full scale. By level 3 the same
+     * estimate is averaged over 16 s pairs and is a measurement again.
+     *
+     * Simulated, 20000 s, four seeds, locked start: with the sign fixed and the
+     * gate at L>=3 the loop holds 32 ns RMS with the hierarchy averaging level
+     * 3.7 and 100% of samples inside the detector band; without the gate,
+     * 4190 ns and level 2.1. */
+    double freq_lsb = 0.0;
+    /* TIM2 TRIM — the frequency term from the COUNTER, at any level.
+     *
+     * The 16.08 log is why this exists. A phase disturbance pushed the loop to
+     * the detector edge at 14:30; every NOPH re-armed the divider ~1.8 us from
+     * zero; the pair test fired immediately at level 0-1 (big phase, fresh
+     * hierarchy — the corrections and the zero-crossings had reset it twice
+     * over), where the slope term above is gated off. So every correction was
+     * pure slew, the crossing dutifully removed it, and the PWM returned to a
+     * baseline that TIM2 said was 0.12 Hz wrong — for hours, at "LOCK", while
+     * the phase rode the band edge every 4:45 min. The three-part mechanism
+     * (slew + frequency + cancel-at-crossing) only closes if the frequency
+     * part actually fires; pinning the hierarchy at level 0-1 amputated it.
+     *
+     * The counter is the one measurement Alan never had, and here it sees the
+     * error at twelve times its resolution. It REPLACES the slope term while
+     * it is open: both estimate the same quantity, and a 100 s gated count
+     * beats one pair of accumulator sums at any level the gate admits. The
+     * sign carries no LTIC polarity — TIM2 and the detector sit with opposite
+     * orientation on this wiring (the algo-11 finding), and this is the same
+     * -f*lsb*0.5 the NOPH FLL step uses, whose convergence the 16.08 15:00
+     * storm already demonstrated (-290/-224/-187 LSB steps walking f100 home).
+     * Damped 0.5, so a mis-scaled CT cannot make it runaway. */
+    bool tim2_trim = (s.have100 &&
+                      (f_meas > MLACC_TIM2_TRIM_GATE || f_meas < -MLACC_TIM2_TRIM_GATE));
+    if (tim2_trim) {
+        /* 1 Hz at 10 MHz is 100 ns of phase per second, and lsb_per_ns*100 is
+         * lsb_per_hz — stated that way so a hand-set MG gain divides through
+         * the same as the CT-derived one. */
+        /* +polarity, like every other TIM2-derived term — see the FLL branch
+         * above for why the frequency and phase branches differ in sign. With
+         * LPOL -1 this is identical to the -f_meas it replaces. */
+        freq_lsb = polarity * f_meas * (100.0 * lsb_per_ns) * 0.5;
+    } else if (s_mla_last_level >= MLACC_FREQ_MIN_LEVEL) {
+        freq_lsb = -polarity * f_ns * lsb_per_ns * 0.5;
+    }
+    /* Kept as a double to the end. The measured corrections in normal operation
+     * have a median size of 6 LSB, so truncating here discarded up to a sixth
+     * of each one, always toward zero. */
+    double dq = slew_lsb + freq_lsb;
+
+    {   /* Clamp against the detector band: a correction is only useful while the
+         * phase stays measurable. 1% of the band per second crosses it in 100 s,
+         * comfortably slower than the 64 s minimum horizon. */
+        double lim_lsb = 500.0;
+        if (g_ltic.range_ns > 100.0f && lsb_per_ns > 0.0) {
+            double l = (double)g_ltic.range_ns * 0.01 * lsb_per_ns;
+            if (l > 10.0 && l < lim_lsb) lim_lsb = l;
+        }
+        if (dq >  lim_lsb) dq =  lim_lsb;
+        if (dq < -lim_lsb) dq = -lim_lsb;
+    }
+    int32_t d = (int32_t)dq;
+
+    /* Remember the DELIBERATE part only. The crossing removes exactly this and
+     * nothing else — no second measurement, which is where the earlier attempts
+     * went wrong by cancelling a freshly measured slope unrelated to the slew
+     * actually imposed. */
+    s_mla_slew_lsb  = (int32_t)slew_lsb;
+    s_mla_returning = true;
+    /* RESET THE WAIT COUNTER. Without this line s_mla_wait is free-running: it
+     * appeared exactly twice in this file, at its declaration and at the ++ in
+     * the give-up test, and never went back to zero. So once it passed 300 —
+     * about five minutes into any run — the give-up test fired on the SAME
+     * second the flag was raised, and from then on `returning` was dead. That
+     * disables both things it gates: the zero-crossing correction, and the
+     * suppression of new corrections while a slew is still walking the phase
+     * home.
+     *
+     * Measured on 14.08 22:30, the run that found it: zc = 7 in 76 minutes (all
+     * of them inside the first five minutes), and 1072 of 1174 corrections
+     * exactly 2 seconds apart — which is the bare level-0 cadence with nothing
+     * holding it back (count resets to 0, even second skips, odd second fires).
+     * The hierarchy therefore never left level 0: 1133 corrections at level 0,
+     * 30 at level 1, 12 at level 2, none above.
+     *
+     * This is also why the simulation mispredicted: it reset the counter,
+     * because that is what the code was clearly meant to do. It modelled the
+     * intent, not the source. */
+    s_mla_wait      = 0;
+    s_mla_ph_sign   = (p_ns > 0.0) ? +1 : -1;
+
+
+    s_mla_corrections++;
+    mlacc_reset();
+    set_trend("CORR");
+    {
+        double target = fine_base(pwm) + dq;
+        g_vctl_fine       = target;
+        g_vctl_fine_valid = true;
+    }
+    return clamp_pwm((int32_t)pwm + d);
+#endif /* GPSDO_LTIC */
+}
+
 uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
 {
+    /* Invalidate first, so a fractional target can only ever come from THIS
+     * cycle. An algorithm that holds, or one that does no fractional
+     * arithmetic, simply never sets it and the control task writes 16 bits as
+     * it always did. This is the one line that makes the fine path safe to add
+     * to some algorithms and not others. */
+    g_vctl_fine_valid = false;
+
     switch (algo_no) {
         case 0:  return primitive_ctl_loop(prev_pwm, ppscount);
         case 1:  return forced_drift_Vctl (prev_pwm, ppscount);
@@ -1243,6 +2418,10 @@ uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
 #ifdef GPSDO_LTIC
         case 10: return ltic_three_stage  (prev_pwm, ppscount);
         case 11: return ltic_lars_pi      (prev_pwm, ppscount);
+        /* 12 belongs inside the guard with 10 and 11: it works on the detector's
+         * phase and there is no fallback, so without GPSDO_LTIC there is nothing
+         * for it to do. LA 12 refuses at the CLI for the same reason. */
+        case 12: return multi_level_accum (prev_pwm, ppscount);
 #endif
         default: return primitive_ctl_loop(prev_pwm, ppscount);
     }

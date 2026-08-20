@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v1.03
+# GPSDO FreeRTOS v1.05
 
 **English** | [Polski](README_PL.md) | [Español](README_ES.md)
 
@@ -19,6 +19,7 @@ on the STM32 BlackPill platform (WeAct F411CE / F401CCU6).
 | ILI9486 / ILI9488 support — the push to implement it | **lucido** (EEVBlog forum) |
 | v0.06c author — inspiration for the RTOS port | **André Balsa** — [repository](https://github.com/AndrewBCN/STM32-GPSDO) |
 | Continuous-PI loop (algorithm 11) — original design | **Lars Walenius** (in memoriam) — GPSDO controller shared on the [time-nuts](http://www.leapsecond.com/time-nuts.htm) community and EEVBlog. Extended here with CT auto-calibration, a frequency-led acquisition branch and a picDIV phase-capture bridge. |
+| Multi-level accumulator (algorithm 12) — original design | **Alan Cashin** (MIS42N, EEVBlog forum) — [profile](https://www.eevblog.com/forum/profile/?u=121386) — his Budget GPSDO is the origin of algorithm 12, the zero-crossing correction, the dithered PWM that reaches 24 bits from a short one, and the `CS` self-assessment idea. Implemented here on the LTIC phase detector, with per-level limits made editable because only the 128 s one was ever derived from a specification. |
 | PCB design (prototype) | **Scrachi** (EEVBlog forum) — [post with files](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/825/) · [profile](https://www.eevblog.com/forum/profile/?u=762266) |
 | Project thread | [Yet another DIY GPSDO](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/) — EEVBlog Forum |
 
@@ -71,6 +72,27 @@ of 10⁻¹⁰–10⁻¹², while preserving the OCXO's short-term stability.
   AHT  BMP  INA        │ ILI9488    │  480x320
                        └────────────┘
 ```
+
+The arrangement above is the same on both panels. It has not always been — the
+two branches drifted apart field by field until v1.05, when the small panel was
+brought back into line: qErr sits on the Alt row beside the fix data, the
+environmental sensors share the left column and the electrical ones the right,
+and Vcc and Vdd share the bottom sensor row.
+
+**If you edit the small panel's layout, measure — do not count characters.**
+Font 2 is proportional. `Vph:1.951V` is 70 px, not the 80 that ten characters at
+8 px suggests, and the overstatement runs to about a fifth across a row. Two
+fields had already been cut on the strength of that arithmetic and both fitted
+once measured. `tft_text_w()` asks the library, which is what the 480 branch does
+throughout; where a constant is used instead, the comment beside it gives the
+measured width it came from.
+
+Each field's padding is the width of its **widest** form, not of today's reading:
+`dtostrf()`'s width argument is a minimum, so a value gains a character when it
+crosses a power of ten, and a pad sized for the usual case lets that character
+land on the neighbour. The paddings in a row tile it exactly — no gaps, no
+overlap — so no background fill can erase an adjacent field's edge. On the small
+panel the right-hand column's fields are all anchored to x=314.
 
 **The control loop** operates as follows:
 
@@ -154,6 +176,7 @@ Eleven algorithms selectable via the `LA n` (0–10) command:
 | 9 | Neural net | e/∫e/de + temp | 10 s | 5-input MLP; learns oscillator tempco, thermally compensated holdover |
 | 10 | LTIC | TIC phase + freq | staged | Three-stage ACQ→DPLL→LOCK; hardware phase detector, self-calibrating |
 | 11 | LTIC-Lars | TIC phase | continuous | Single continuous PI, no state machine; gain auto-derived from `CT`. After Lars Walenius |
+| 12 | Multi-level accumulator | LTIC phase [ns] | adaptive | No time constant to set: the error picks its own averaging span. After Alan Cashin (MIS42N). **Untuned.** |
 
 PLL algorithms (4, 5, 7 and the PLL branch of 8) use a **two-timescale**
 design tuned for "fast capture, gentle phase-hold":
@@ -256,17 +279,21 @@ What differs is how the text is rendered, and that difference is large enough to
 matter.
 
 ```
- ┌──────────────────────────────────────────┐
- │  GPSDO v1.00-rtos            LOCK        │  status bar + loop trend
- │                                          │
- │        1 0 0 0 0 0 0 0   H z             │  frequency, large monospace
- │                                          │
- │  PWM  40849      Vctl  1.799 V           │  control output and voltage
- │  dph   -5.3 ns   Vphase 2.083 V          │  phase error and detector
- │  Sat 11  HDOP 0.77   Up 000d 01:42:12    │  GPS state and uptime
- │  BMP 51.1C  1006.7hPa   INA 4.92V 182mA  │  sensors
- │  14:32:45  Mon 28/07/2026                │  clock
- └──────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────┐
+ │ GPSDO v1.05-rtos                LMT 14:32:45 Mon │   header: version + local time
+ │                                                  │
+ │          1 0 0 0 0 0 0 0 . 0 0 0 0  H z          │   frequency, large font
+ │                                                  │
+ │ UTC: 12:32:45 Mon        Sat: 11 HDOP: 0.77      │
+ │ DATE: 28/07/2026         Lat:  52.229676         │
+ │ Uptime: 000d 01:42:12    Lon:  21.012229         │
+ │ Algo: 12 LOCK            Alt:118m     qEr:-4.2ns │   algorithm + trend  |  fix data + qErr
+ │ PWM:40849 Vct:1.799V     INA:4.920V     182.00mA │   control output     |  supply monitor
+ │ BMP: 51.1C 1006.7hPa     Vph:2.083V dp:     -5ns │   sensors            |  phase detector
+ │ AHT: 24.60C 41.20%rH     Vcc:5.012V    Vdd:3.29V │                      |  supply rails
+ │                                                  │
+ │               DISCIPLINED  FIX OK                │   status bar (colour = state)
+ └──────────────────────────────────────────────────┘
 ```
 
 **320×240 (ILI9341, ST7789)** uses the classic GLCD numeric fonts for the
@@ -630,6 +657,7 @@ Commands terminated by `\r\n` or `\n`. Command names are **case-insensitive**
 | `CT` | Calibrate + auto-tune: measure K, derive PID for algos 3-9 **and both LTIC loops (10 and 11)**; auto-saves the PID group on success |
 | `T [baud]` | GPS tunnel on USB for u-center — clean bidirectional NMEA/UBX (telemetry moves to Bluetooth if present, else muted); optional GPS-UART baud, kept after exit; exits after 300 s |
 | `SP <n>` | Set PWM DAC directly (1–65535), bypasses algorithm |
+| `DAC` | Control-voltage output: path, 24/16-bit/exact code, measured Vctl, step size in µHz and df/f (needs `CT` for the Hz figures) |
 | `RH` | Report mode: human-readable (default) |
 | `RD` | Report mode: tab-delimited |
 | `RP` | Pause serial/BT data stream |
@@ -643,7 +671,7 @@ Commands terminated by `\r\n` or `\n`. Command names are **case-insensitive**
 |---------|-------------|
 | `MH` | Enable holdover mode (manual) |
 | `MD` | Enable disciplined mode |
-| `LA [0-10]` | Select / show control algorithm |
+| `LA [0-12]` | Select / show control algorithm |
 | `AP` | Arm picDIV — stops output 1.0–1.2 s, resyncs to GPS 1PPS |
 
 ### Algorithm tuning
@@ -681,7 +709,7 @@ TZ Kolkata           → UTC+5:30, no DST
 ```
 
 City names are unique across the whole IANA database, so the region is
-optional — `TZ Australia/Adelaide` works too — and case is ignored. 407 zones
+optional — `TZ Australia/Adelaide` works too — and case is ignored. 503 zones
 are built in.
 
 The rule can also be given in full, which matters if a government changes the
@@ -1164,6 +1192,71 @@ A missing device reports `not found` and the firmware continues without it.
 
 ---
 
+## Algorithm 12 — multi-level accumulator
+
+After Alan Cashin's (MIS42N on EEVblog) Budget GPSDO. Every other loop here has
+one time constant, and that constant is a compromise nobody wins: measured
+against a rubidium reference, `LTC 60` is up to 1.58x better past 800 s while
+`LTC 240` is up to 1.44x better between 10 and 400 s. You pick one.
+
+This algorithm does not pick. Readings accumulate into levels — level n covering
+2^n seconds — and a correction is applied at the **lowest** level whose error
+exceeds that level's limit. A large error acts within two seconds; a small one
+waits for a longer average. There is no `LTC` to set.
+
+The levels come out of the bit pattern of the seconds counter rather than from an
+array of buffers: inspect from the least significant bit upward, stop at the first
+zero. Eleven levels — 2 s to 2048 s — cost 22 bytes.
+
+### What it measures
+
+**Phase in nanoseconds, from the LTIC detector.** The first port fed the TIM2
+count error in whole hertz and was blind: a disciplined oscillator sits far below
+1 Hz, so that field read zero in 83% and 95% of samples across two runs and the
+algorithm never corrected. Phase integrates where a one-second frequency count
+does not — an error of 1e-11 is invisible in the count but becomes 25 ns of phase
+in 2500 s.
+
+**The detector is required.** An earlier version fell back to integrating the
+count error on boards without one; that fallback did not recover phase, it
+accumulated a random walk of quantisation noise which crossed a level limit,
+fired a correction, hit the clamp and railed the detector — measured at 6000
+counts of PWM swing over 148 corrections with the detector railed 58% of the
+time. `LA 12` now refuses without `GPSDO_LTIC`, and holds rather than guessing
+whenever the detector is fitted but not reading.
+Like algorithms 10 and 11, it arms the picDIV. Without that the detector ramp sits
+against a rail, `ph_valid` never becomes true, and the algorithm falls through to
+integrating the count error — back to being blind, silently, in exactly the way
+using the detector was meant to fix. The bridge waits for several consecutive
+railed readings before disturbing the divider, then holds off while the phase
+settles. Trend shows `ARM` while it is doing this.
+
+### Commands
+
+| Command | Effect |
+|---------|--------|
+| `LA 12` | Select the algorithm |
+| `MG [v]` | Gain, LSB per ns. 0 derives it from the `CT` calibration |
+| `MR [n]` | Force a correction once level n is reached, whatever the limits say |
+| `MLP <n> [ns]` | Phase limit for level n; without a value, prints it |
+| `MF [0-3]` | Where the limits come from, independently of `MG`: 0 follow `MG`, 1 stored table, 2 sigma formula, 3 measured |
+| `MFT [s]` | `MF 3` only: target seconds between corrections triggered by noise alone (default 3600) |
+| `ML` | List gain, run level and all eleven limits |
+| `ES ALGO12` | Save the block to the flash ring |
+
+### Untuned, and why
+
+Only **one** limit was ever derived. Alan's specification was 10 MHz ±0.01 Hz,
+which is 125 ns of phase in 128 seconds — that fixes the 128 s entry. He could
+have used 64 ns at 64 s, but a cheap module with a poor signal wanders ±100 ns
+and would raise false errors. Of the rest he says plainly: *"they work most of
+the time but were not optimised in any way."*
+
+So there is nothing to reproduce faithfully beyond that one anchor, which is why
+the whole table is editable and saved per board.
+
+---
+
 ## Self-assessment without a reference — `CS`
 
 Algorithm 11 was validated against a rubidium standard on someone else's bench.
@@ -1210,6 +1303,80 @@ defined meaning.
 > until the loop made it worse. Nothing measured from inside the loop can see
 > that. Read a small figure as "not fighting anything" — necessary, not
 > sufficient. A growing figure is the useful signal.
+
+---
+
+## 24-bit control voltage — dithered PWM (`GPSDO_PWM_DITHER`)
+
+The idea is Alan Cashin's (MIS42N on EEVBlog), from his Budget GPSDO: run the PWM
+at fewer bits than you need and vary the duty cycle from one period to the next,
+so that the **average** carries the missing bits.
+
+**The gain is the carrier, not the extra bits.** Ripple has to be filtered below
+one output step, and how hard that is depends on how far the carrier sits above
+the filter's corner:
+
+| | carrier | filter corner | time constant |
+|---|---|---|---|
+| 16-bit PWM | 2 kHz | 0.7 Hz | 230 ms |
+| 13-bit dithered (shipped) | 12.2 kHz | 4.2 Hz | 38 ms |
+| 12-bit dithered | 24.4 kHz | 8.4 Hz | 19 ms |
+
+Filter delay goes straight into the loop as phase lag, so a six-fold shorter
+filter is worth more than the resolution is. The resolution comes along for free.
+
+**How it runs here.** Alan dithers in a timer interrupt, because a PIC has no
+DMA. That would be 12 000 interrupts a second on this part, competing with the
+1PPS capture — the one interrupt in this firmware that must not be delayed. But
+the dither pattern for a constant value is periodic: it repeats every
+2^(24−N) periods. So it is computed once into a table and replayed by DMA into
+the compare register, with the CPU touching nothing between value changes.
+
+The average is **exact**, not approximate: the table holds exactly Y entries of
+X+1 among 2^(24−N), so it averages X + Y/2^(24−N), which is the 24-bit value by
+construction. Replaying it cannot drift.
+
+| `GPSDO_PWM_DITHER_BITS` | table | RAM (two buffers) | carrier | CPU |
+|---|---|---|---|---|
+| 12 | 4096 entries | 16 KB | 24.4 kHz | 0.025% |
+| 13 (default) | 2048 entries | 8 KB | 12.2 kHz | 0.012% |
+
+Same pin as the plain PWM — **PB9, TIM4 CH4** — so the existing filter and wiring
+are unchanged. TIM4_UP drives DMA1 Stream 6 Channel 2; the 2 Hz tick is on TIM9
+and the 1PPS chain on TIM2/TIM3, so nothing else is disturbed. Two buffers in
+hardware double-buffer mode mean a value change never glitches the pin, and both
+are refilled on every write — filling only one leaves the other replaying the
+previous code until the next write, which puts a square wave on the output at
+about 3 Hz.
+
+**On** in the shipped `gpsdo_config.h` since v1.05 — it was off by default in
+v1.04, while the output path was still being proven. Comment out
+`GPSDO_PWM_DITHER` to fall back to the plain 16-bit PWM; the pin, the filter and
+the wiring are the same either way, so nothing outside the board changes. Needs
+`configUSE_MUTEXES` and `INCLUDE_xTaskGetSchedulerState`, which this project now
+sets explicitly. Mutually exclusive with `GPSDO_DAC_EXT` — enabling both is a
+compile error, since both drive the control voltage.
+
+### What the loop does with the low 8 bits
+
+Since v1.05, the control loop keeps the fraction of its correction instead of
+truncating it. On the plant measured here one 16-bit step is about 320 µHz —
+3.2e-11 of 10 MHz, coarser than the 4e-12 the loop holds over 10 000 s, which it
+reached by hunting between adjacent codes. With the fraction kept, the step is
+**1.25e-13** and the hunting goes away.
+
+The fraction is owned by the DAC layer, not by the loop. The control value is
+written from 21 places and twenty of them — the `CT` and `LC` sweeps, the
+acquisition ramps, holdover steering, `SP` — are deliberately coarse, and every
+one of them clears the fraction simply by calling `gpsdo_dac_write16()`. Nothing
+above that layer changed: the displays, the telemetry line, the flash ring and
+the settings block all still see a plain 16-bit code.
+
+Run `DAC` to see which path is compiled in, the code in all three views, and the
+step size in µHz and in fractional parts. A 24-bit code that is not a multiple of
+256 is the proof the fine path is driving the pin. The step figures need the
+plant gain from `CT`; without it the command says so rather than printing a
+number from a default.
 
 ---
 
@@ -1277,6 +1444,7 @@ The file `gpsdo_config.h` controls the build. Key switches:
 #define GPSDO_BLUETOOTH          // HC-06 on Serial2 (57600 Bd)
 
 // Other:
+#define GPSDO_PWM_DITHER        // 24-bit control voltage (dithered PWM, PB9)
 #define GPSDO_PICDIV             // picDIV support
 #define GPSDO_UBX_CONFIG         // NEO-6M/7M UBX configuration
 #define GPSDO_GEN_2kHz_PB5       // 2 kHz generator on PB5
@@ -1329,27 +1497,51 @@ compiler flags. The file is picked up automatically; nothing to enable.
 
 ### Planned
 
-**Two USB CDC ports.** One serial device is currently shared between the CLI and
-everything else, so tunnelling the receiver to u-center means giving up the
-console. Two composite CDC endpoints would separate them: the first stays the CLI
-exactly as now, the second becomes a transparent GPS tunnel, so u-center can
-configure the receiver while the console keeps reporting.
+**An external SPI DAC for the control voltage.** The 16-bit PWM gives about 50 µV
+per step at 3.3 V, near 2.7e-11 fractional on a 5.3 Hz/V oscillator. An 18-bit
+part with a reference designed for the job reaches roughly 17 µV, near 9e-12,
+with no filter delay inside the loop.
 
-**24-bit delta-sigma DAC on SPI + DMA.** The control voltage currently comes from
-a 16-bit PWM through an RC filter. At the tuning slopes typical of these
-oscillators one LSB is already a few parts in 10¹¹, so the quantisation is not
-the limit today — but it sets a floor, and the RC time constant needed to smooth
-a 16-bit PWM also delays the loop.
+The plumbing is in: `GPSDO_DAC_EXT` and a stub driver that refuses to compile
+until a device is chosen. No hardware SPI is needed or available — the DAC is
+written once per second, so bit-banging costs microseconds. Still to decide: the
+part, the reference, and the output span against the oscillator's EFC range.
 
-The intended replacement drives a **second-order delta-sigma modulator** out of
-SPI with DMA, shaping the quantisation noise away from the frequencies the loop
-cares about instead of merely filtering it. DMA does the work, so the modulator
-costs no CPU time and no interrupt latency. Effective resolution around 24 bits
-with a far shorter analogue time constant looks reachable.
+Worth knowing where the useful limit sits. At 24 bits the step is 197 nV;
+thermal noise in 10 kΩ over 1 Hz is about 13 nV, so Johnson noise is not the
+obstacle, but a good zero-drift amplifier contributes around 180 nV peak-to-peak
+over 0.1–10 Hz and a precision reference around 1 µV. **18 bits is the sweet spot
+and 20 the sensible ceiling** — beyond that the analogue chain cannot deliver
+what the converter promises.
 
-Alan (MIS42N)'s PIC-based design reaches the same end differently — a 10-bit PWM
-dithered by a 14-bit accumulator, giving 24 bits at 40 kHz — which is what
-prompted this line of thought.
+### Tried and abandoned
+
+Both of these were attempted properly, and both are recorded here because the
+reasons are more useful than the ideas.
+
+**A 24-bit sigma-delta DAC on a spare pin, DMA-fed.** Built, host-tested, then
+measured — at which point it stopped being attractive. The command is 24 bits,
+but the resolution reaching the oscillator is set by how long the analogue filter
+averages: 13.6 effective bits over 4 096 bits of averaging, 19.0 over 262 144,
+and 24.0 only after 16.7 million — 43 seconds at 390 kHz. A filter fast enough
+not to delay the loop yields about 18 bits, for 6% of the CPU running
+continuously plus a precision reference, a CMOS gate and a fourth-order active
+filter. Raising the bit rate does not rescue it: 24 bits inside a 32 ms filter
+would need 524 MHz.
+
+An earlier version of this document claimed a 320-fold improvement. That was
+wrong — it compared the command width against the PWM's step size, which compares
+nothing. The code remains in the tree, marked as a dead end: the modulator core is
+correct and host-tested, and a measured dead end is worth more than an untried
+idea.
+
+**Two USB CDC ports**, one for the CLI and one as a transparent GPS tunnel for
+u-center. Not possible without forking the core's USB layer: STM32duino's stack
+is single-class, the composite-device request has been open for years, and core
+3.0.0 changed nothing there. Hand-written descriptors would be a few hundred
+lines that break with every core update — exactly what happened to TFT_eSPI on
+3.0.0. The existing parallel-Bluetooth mode already achieves the same outcome:
+`T` tunnels GPS over USB while the CLI stays on Bluetooth, undisturbed.
 
 ### Not planned
 
