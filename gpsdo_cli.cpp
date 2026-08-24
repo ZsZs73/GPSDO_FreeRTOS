@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * Lightweight command parser (no external library).  Reads lines from
@@ -347,7 +347,7 @@ static void dispatch(char *line)
         cli_putln(PROGRAM_NAME " " PROGRAM_VERSION);
         cli_putln("FreeRTOS port & algorithms: J. M. Niewinski (jmnlabs)");
         cli_putln("https://github.com/jmnlabs/GPSDO_FreeRTOS");
-        cli_putln("Programming assistant: Claude AI (Anthropic)");
+        cli_putln("Programming assistants: Claude Opus 5, GLM-5.3 Max, Qwen3.8-Max");
         cli_putln("Inspired by v0.06c by Andre Balsa");
         cli_putln("https://github.com/AndrewBCN/STM32-GPSDO");
         cli_putln("");
@@ -1496,18 +1496,28 @@ static void dispatch(char *line)
              * holds 2^(level+1) samples of (2*phase + 1). Printing only the
              * former — and calling it "ns", as this did — invites tuning a
              * number nobody can relate to the oscilloscope. */
-            snprintf(t, sizeof(t), "lim[%ld]=%ld (%ld ns over %us)",
-                     n, (long)g_mlacc_lim[n],
-                     (long)(g_mlacc_lim[n] >> (n + 2)),
+            snprintf(t, sizeof(t), "lim[%ld]=%ldns (%ld units over %us)",
+                     n, (long)(g_mlacc_lim[n] >> (n + 2)),
+                     (long)g_mlacc_lim[n],
                      (unsigned)(1u << (n + 1)));
             cli_putln(t);
         } else {
+            /* The value is nanoseconds - the unit humans (and Alan's e-mails)
+             * speak. Stored as accumulator units = ns << (level+2): the level
+             * holds 2^(level+1) samples of (2*phase + 1). Units stay the
+             * storage format (settings block unchanged), ns is the CLI face. */
             long v = atol(p2);
-            if (v >= 1 && v <= 500000) {
-                g_mlacc_lim[n] = (int32_t)v;
-                snprintf(t, sizeof(t), "lim[%ld]=%ldns", n, v); cli_putln(t);
+            long u = v << (n + 2);
+            if (v >= 1 && u <= 500000) {
+                g_mlacc_lim[n] = (int32_t)u;
+                snprintf(t, sizeof(t), "lim[%ld]=%ldns (%ld units)", n, v, u);
+                cli_putln(t);
                 cli_manual_save("ES ALGO12");
-            } else cli_reject("MLP: 1..500000 accumulator units");
+            } else {
+                snprintf(t, sizeof(t), "MLP: 1..%ld ns at level %ld",
+                         (long)(500000L >> (n + 2)), n);
+                cli_reject(t);
+            }
         }
         return;
     }
@@ -1558,9 +1568,9 @@ static void dispatch(char *line)
         }
         cli_putln("  phase limits by averaging span (units = phase):");
         for (int i = 0; i < MLACC_LEVELS; i++) {
-            snprintf(line, sizeof(line), "    %2d: %5us  %7ld = %4ld ns%s",
-                     i, (unsigned)(1u << (i + 1)), (long)g_mlacc_lim[i],
-                     (long)(g_mlacc_lim[i] >> (i + 2)),
+            snprintf(line, sizeof(line), "    %2d: %5us  %4ld ns = %7ld units%s",
+                     i, (unsigned)(1u << (i + 1)),
+                     (long)(g_mlacc_lim[i] >> (i + 2)), (long)g_mlacc_lim[i],
                      (i == 6) ? "  <- the one derived value" : "");
             cli_putln(line);
         }

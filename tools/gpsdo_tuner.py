@@ -864,7 +864,7 @@ class GpsdoTuner(QMainWindow):
         if m:
             level, val = int(m.group(1)), int(m.group(2))
         else:
-            m = re.match(r"\s*(\d+):\s*\d+s\s+(\d+)\s*=\s*-?\d+\s*ns", line)
+            m = re.match(r"\s*(\d+):\s*\d+s\s+(\d+)\s*ns\s*=\s*-?\d+", line)
             if not m:
                 return False
             level, val = int(m.group(1)), int(m.group(2))

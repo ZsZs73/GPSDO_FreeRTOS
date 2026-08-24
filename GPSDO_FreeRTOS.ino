@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * setup() initialises all hardware peripherals, creates RTOS primitives
@@ -226,12 +226,38 @@ void setup()
 #endif
 
     OUT_SERIAL.println("\r\n================================================");
-    OUT_SERIAL.println(PROGRAM_NAME " " PROGRAM_VERSION);
-    OUT_SERIAL.println("FreeRTOS port by J. M. Niewinski  with Claude AI");
+    /* Build stamp in the banner: GPSDO vX.YY-rtos compiled YYYY-MM-DD HH:MM:SS.
+     * __DATE__ is "Mmm dd yyyy" (day space-padded), __TIME__ "HH:MM:SS" — both
+     * resolved at compile time, no RTC needed. Digits read by hand: sscanf is
+     * not guaranteed under Newlib Nano without scanf support enabled. */
+    {
+        static const char *MN[12] = { "Jan","Feb","Mar","Apr","May","Jun",
+                                      "Jul","Aug","Sep","Oct","Nov","Dec" };
+        int mo = 0;
+        for (int i = 0; i < 12 && mo == 0; i++)
+            if (__DATE__[0]==MN[i][0] && __DATE__[1]==MN[i][1] && __DATE__[2]==MN[i][2])
+                mo = i + 1;
+        int dy = (__DATE__[4]==' ' ? __DATE__[5]-'0'
+                                    : (__DATE__[4]-'0')*10 + (__DATE__[5]-'0'));
+        int yr = (__DATE__[7]-'0')*1000 + (__DATE__[8]-'0')*100
+               + (__DATE__[9]-'0')*10   + (__DATE__[10]-'0');
+        int hh = (__TIME__[0]-'0')*10 + (__TIME__[1]-'0');
+        int mi = (__TIME__[3]-'0')*10 + (__TIME__[4]-'0');
+        int ss = (__TIME__[6]-'0')*10 + (__TIME__[7]-'0');
+        OUT_SERIAL.print(PROGRAM_NAME " " PROGRAM_VERSION " compiled ");
+        OUT_SERIAL.printf("%04d-%02d-%02d %02d:%02d:%02d\r\n", yr, mo, dy, hh, mi, ss);
+    }
+    OUT_SERIAL.println("FreeRTOS port by J. M. Niewinski  with Claude, GLM-5.3 Max & Qwen3.8-Max AI");
     OUT_SERIAL.println("https://github.com/jmnlabs/GPSDO_FreeRTOS");
-    OUT_SERIAL.println("Inspired by GPSDO v0.06c by " AUTHOR_NAME);
+    OUT_SERIAL.println("Inspired by GPSDO v0.06c by " ORIG_AUTHOR_NAME);
     OUT_SERIAL.println("https://github.com/AndrewBCN/STM32-GPSDO");
+    OUT_SERIAL.println("Algos 0-2 original design by Andre Balsa");
+    OUT_SERIAL.println("Algos 3-9 by J. M. Niewinski");
+#ifdef GPSDO_LTIC
+    OUT_SERIAL.println("Algo 10 (LTIC 3-stage) inspired by Dan Wiering's measurements");
     OUT_SERIAL.println("Algo 11 (LTIC-Lars) after Lars Walenius' PI loop");
+    OUT_SERIAL.println("Algo 12 (multi-level accumulator) after Alan Cashin (MIS42N)");
+#endif
     OUT_SERIAL.println("Type H = help  SW = stack diagnostics");
     OUT_SERIAL.println("================================================\r\n");
     print_reset_cause();

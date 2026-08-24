@@ -14,9 +14,9 @@ Firmware en tiempo real (FreeRTOS) para un oscilador disciplinado por GPS
 | Rol | Persona / fuente |
 |-----|------------------|
 | Autor del port a FreeRTOS, algoritmos 3–11 | **J. M. Niewiński** — [repositorio](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
-| Asistente de programación (Anthropic) | **Claude AI** |
-| Medición y pruebas de campo, algoritmos 10 y 11 | **Dan Wiering** — series ADEV contra referencia de rubidio que hallaron el ciclo límite del algoritmo 10, resolvieron la cuestión de la amortiguación `FA`, informaron del bloqueo en ACQ y establecieron la comparación del algoritmo 11 |
-| Soporte de ILI9486 / ILI9488 — el empujón para implementarlo | **lucido** (foro EEVBlog) |
+| Asistentes de programación | **Claude Opus 5 (Anthropic) · GLM-5.3 Max (Z.ai) · Qwen3.8-Max** |
+| Medición y pruebas de campo, algoritmos 10–12 | **Dan Wiering** — series ADEV contra referencia de rubidio que hallaron el ciclo límite del algoritmo 10, resolvieron la cuestión de la amortiguación `FA`, informaron del bloqueo en ACQ y establecieron la comparación del algoritmo 11; ahora está probando el algoritmo 12 |
+| Soporte de ILI9486 / ILI9488 — el empujón para implementarlo; y el sintonizador de PC nació de un script de monitorización que montó con Claude | **lucido** (foro EEVBlog) |
 | Autor de v0.06c — inspiración del port RTOS | **André Balsa** — [repositorio](https://github.com/AndrewBCN/STM32-GPSDO) |
 | Lazo PI continuo (algoritmo 11) — diseño original | **Lars Walenius** (in memoriam) — controlador GPSDO compartido con la comunidad [time-nuts](http://www.leapsecond.com/time-nuts.htm) y EEVBlog. Ampliado aquí con autocalibración por CT, una rama de adquisición guiada por frecuencia y un puente de captura de fase picDIV. |
 | Acumulador multinivel (algoritmo 12) — diseño original | **Alan Cashin** (MIS42N, foro EEVBlog) — [perfil](https://www.eevblog.com/forum/profile/?u=121386) — su Budget GPSDO es el origen del algoritmo 12, la corrección por cruce por cero, el PWM con dithering que alcanza 24 bits desde uno corto y la idea de autoevaluación `CS`. Implementado aquí sobre el detector de fase LTIC, con los límites por nivel editables porque solo el de 128 s se dedujo alguna vez de una especificación. |
@@ -1202,7 +1202,7 @@ de oscilación del PWM en 148 correcciones, con el detector contra el raíl el 5
 del tiempo. `LA 12` ahora rechaza sin `GPSDO_LTIC`, y cuando el detector está
 montado pero no lee, el algoritmo se detiene en lugar de adivinar.
 
-Como los algoritmos 10 y 11, arma el picDIV. Sin eso la rampa del detector queda
+Como los demás algoritmos LTIC, arma el picDIV. Sin eso la rampa del detector queda
 contra el raíl, la lectura nunca es válida y el algoritmo vuelve en silencio a
 estar ciego. El puente espera varias lecturas inservibles consecutivas antes de
 tocar el divisor y luego hace una pausa mientras la fase se asienta. La tendencia

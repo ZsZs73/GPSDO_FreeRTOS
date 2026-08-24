@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * Defines the PidParams_t structure and the global g_pid[10] array
@@ -174,6 +174,23 @@ uint16_t hybrid_fll_pll(uint16_t pwm, uint32_t ppscount);
 
 /* 9 — Neural network MLP (3→8→1, tanh), pre-trained weights embedded */
 uint16_t nn_mlp_ctl_loop(uint16_t pwm, uint32_t ppscount);
+/* The two loops that need the hardware phase detector. Only the FUNCTIONS are
+ * guarded: everything below — the level count, the state and fit structs, the
+ * globals and the accessors — is declared unconditionally, because the .cpp
+ * defines all of it outside its own GPSDO_LTIC guard and the CLI reads it
+ * unconditionally too.
+ *
+ * That mismatch made the firmware impossible to BUILD with GPSDO_LTIC off:
+ * GPSDO_algorithms.cpp:1437 onwards and the ML/MLP/MG/MF handlers in
+ * gpsdo_cli.cpp all reference MLACC_LEVELS, mlacc_fit_t and the g_mlacc_*
+ * globals, and every one of those declarations used to sit inside this block.
+ * Nobody had hit it because every board of this design has the detector — the
+ * first person to build without one was Dave (Solder_Junkie) on EEVblog, whose
+ * M8N board has no TIC front end, and he got fourteen "was not declared in this
+ * scope" errors for his trouble.
+ *
+ * A declaration costs nothing when the definition is absent, so the guard
+ * belongs on the code, not on the vocabulary used to describe it. */
 #ifdef GPSDO_LTIC
 uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount);
 
@@ -182,8 +199,10 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount);
  * REQUIRES GPSDO_LTIC — it works on the detector's phase in nanoseconds. An early
  * version fed the TIM2 count error instead and was blind: a disciplined
  * oscillator sits far below 1 Hz, so that field reads zero. See the .cpp. */
-#define MLACC_LEVELS 11
 uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount);
+#endif
+
+#define MLACC_LEVELS 11
 
 /* Algorithm 12 state, for telemetry. last_action is the level that most recently
  * applied a correction: low means it is acting often, high that it has settled
@@ -245,7 +264,6 @@ typedef struct {
     bool     valid;                 /* a fit exists and is driving the table  */
 } mlacc_fit_t;
 void mlacc_get_fit(mlacc_fit_t *out);
-#endif
 
 /* ---- Helper exposed to ControlTask ---------------------------------- */
 void gpsdo_calc_averages(FreqData_t *f);

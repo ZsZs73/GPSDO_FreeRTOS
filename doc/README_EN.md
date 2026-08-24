@@ -14,9 +14,9 @@ on the STM32 BlackPill platform (WeAct F411CE / F401CCU6).
 | Role | Person / source |
 |------|-----------------|
 | FreeRTOS port author, algorithms 3–11 | **J. M. Niewiński** — [repository](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
-| Programming assistant (Anthropic) | **Claude AI** |
-| Measurement and field testing, algorithms 10 and 11 | **Dan Wiering** — rubidium-referenced ADEV runs that found the algorithm-10 limit cycle, settled the `FA` damping question, reported the ACQ lock-up, and established the algorithm-11 comparison |
-| ILI9486 / ILI9488 support — the push to implement it | **lucido** (EEVBlog forum) |
+| Programming assistants | **Claude Opus 5 (Anthropic) · GLM-5.3 Max (Z.ai) · Qwen3.8-Max** |
+| Measurement and field testing, algorithms 10–12 | **Dan Wiering** — rubidium-referenced ADEV runs that found the algorithm-10 limit cycle, settled the `FA` damping question, reported the ACQ lock-up, and established the algorithm-11 comparison; now shaking down algorithm 12 |
+| ILI9486 / ILI9488 support — the push to implement it; and the PC tuner grew out of a monitoring script he assembled with Claude | **lucido** (EEVBlog forum) |
 | v0.06c author — inspiration for the RTOS port | **André Balsa** — [repository](https://github.com/AndrewBCN/STM32-GPSDO) |
 | Continuous-PI loop (algorithm 11) — original design | **Lars Walenius** (in memoriam) — GPSDO controller shared on the [time-nuts](http://www.leapsecond.com/time-nuts.htm) community and EEVBlog. Extended here with CT auto-calibration, a frequency-led acquisition branch and a picDIV phase-capture bridge. |
 | Multi-level accumulator (algorithm 12) — original design | **Alan Cashin** (MIS42N, EEVBlog forum) — [profile](https://www.eevblog.com/forum/profile/?u=121386) — his Budget GPSDO is the origin of algorithm 12, the zero-crossing correction, the dithered PWM that reaches 24 bits from a short one, and the `CS` self-assessment idea. Implemented here on the LTIC phase detector, with per-level limits made editable because only the 128 s one was ever derived from a specification. |
@@ -1224,7 +1224,7 @@ fired a correction, hit the clamp and railed the detector — measured at 6000
 counts of PWM swing over 148 corrections with the detector railed 58% of the
 time. `LA 12` now refuses without `GPSDO_LTIC`, and holds rather than guessing
 whenever the detector is fitted but not reading.
-Like algorithms 10 and 11, it arms the picDIV. Without that the detector ramp sits
+Like the other LTIC algorithms, it arms the picDIV. Without that the detector ramp sits
 against a rail, `ph_valid` never becomes true, and the algorithm falls through to
 integrating the count error — back to being blind, silently, in exactly the way
 using the detector was meant to fix. The bridge waits for several consecutive
@@ -1549,7 +1549,7 @@ lines that break with every core update — exactly what happened to TFT_eSPI on
 settings already tuned for them are still honoured. But development has stopped:
 algorithm 11 measured 2–3× better than a properly tuned algorithm 10 at the
 averaging times where a GPSDO earns its keep, on independent hardware against a
-rubidium reference. Effort goes to algorithms 10 and 11.
+rubidium reference. Effort goes to the LTIC algorithms 10–12.
 
 They are kept rather than deleted because eleven documented approaches to the
 same control problem are worth more as a reference than a tidier source tree, and

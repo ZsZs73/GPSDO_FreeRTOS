@@ -7,7 +7,7 @@ storage for learned state.
 
 Project by **J. M. Niewiński** — based on **GPSDO v0.06c** by André Balsa
 ([STM32-GPSDO](https://github.com/AndrewBCN/STM32-GPSDO)), with the FreeRTOS
-port and algorithms 3–11 by the author, Claude AI as programming assistant, and
+port and algorithms 3–12 by the author, Claude Opus 5, GLM-5.3 Max and Qwen3.8-Max as programming assistants, and
 PCB design by Scrachi (EEVBlog forum). Algorithm 11 (continuous-PI loop) is
 based on the original GPSDO controller design by the late **Lars Walenius**,
 extended here with CT auto-calibration, a frequency-led acquisition branch and a
@@ -19,7 +19,8 @@ zero-crossing correction, the dithered PWM that reaches 24 bits from a short
 one, and the `CS` self-assessment idea. It is implemented here on the LTIC
 phase detector rather than a counter.
 
-Measurement and field testing of algorithms 10 and 11 by **Dan Wiering**, whose
+The algorithm-10 (LTIC 3-stage) concept, and the measurement and field
+testing of algorithms 10–12, by **Dan Wiering**, whose
 rubidium-referenced ADEV runs shaped both loops.
 
 ---

@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * Reads NMEA sentences from Serial1 (38400 Bd), feeds TinyGPS++, and
@@ -976,8 +976,42 @@ static const uint8_t UBX_POLL_PRT[] = {
  *   01     — port ID = 1 (UART1)
  *   08 22  — checksum (CK_A=0x08, CK_B=0x22)            */
 
+static uint32_t detect_nmea_baud(void)
+{
+    /* Passive sweep FIRST: listen for NMEA ('$') at every candidate baud
+     * before any poll is sent. Chinese clones auto-baud their RX onto
+     * whatever binary poll arrives and ACK it, while their NMEA TX keeps
+     * running at its own rate — the ACK then names the wrong baud and the
+     * display sits on "acquiring" forever (field report, Solder Junkie).
+     * Listening only disturbs nothing: no bytes leave the STM32. */
+    for (uint8_t i = 0; i < N_BAUD_CANDIDATES; i++) {
+        uint32_t baud = BAUD_CANDIDATES[i];
+        Serial1.end();
+        Serial1.begin(baud);
+        delay(50);
+        while (Serial1.available()) Serial1.read();
+        bool dollar = false;
+        uint32_t t0 = millis();
+        while ((millis() - t0) < 350) {
+            while (Serial1.available()) {
+                if (Serial1.read() == (int)'$') dollar = true;
+            }
+            if (dollar) {
+                OUT_SERIAL.print("GPS: NMEA traffic at "); OUT_SERIAL.println(baud);
+                while (Serial1.available()) Serial1.read();
+                return baud;
+            }
+            delay(1);
+        }
+    }
+    return 0;   /* no NMEA anywhere — caller may poll actively */
+}
+
 static uint32_t detect_gps_baud(void)
 {
+    uint32_t nmea = detect_nmea_baud();
+    if (nmea != 0) return nmea;
+
     for (uint8_t i = 0; i < N_BAUD_CANDIDATES; i++) {
         uint32_t baud = BAUD_CANDIDATES[i];
         Serial1.end();
@@ -1067,6 +1101,23 @@ void gpsdo_gps_init(void)
     Serial1.end();
     Serial1.begin(working_baud);
     flush_rx(150);   /* drain NMEA that arrived during port reopen */
+
+#ifdef GPSDO_FAKE_UBLOX
+    /* Chinese u-blox clones (navigation-grade M8N copies and friends)
+     * answer the baud probe but ignore CFG-MSG/CFG-NAV5, lack TMODE2
+     * survey-in and TIM-TP, and the stream of unanswered binary config
+     * frames can upset their auto-baud engine — the module then stops
+     * producing NMEA and the display sits on "acquiring" until a T-tunnel
+     * re-probe rescues it (field report, Solder Junkie). Here: probe the
+     * baud, send NOTHING else, and let NMEA do the talking. Discipline is
+     * unaffected — PPS capture and the counter/detector never needed UBX.
+     * Lost with the config: NMEA silencing, stationary mode, survey-in /
+     * Time Mode (position stays 3D-nav; the extra phase wander is exactly
+     * what the loose default algo-12 limits were sized for) and qErr. */
+    OUT_SERIAL.println("GPS: clone/compatible module — baud probe only, no UBX config");
+    OUT_SERIAL.println("GPS init done");
+    return;
+#endif
 
     /* ---- Step 2: silence noisy NMEA sentences ----
      *

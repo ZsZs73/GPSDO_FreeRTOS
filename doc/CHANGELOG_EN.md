@@ -16,6 +16,37 @@ The version suffix `-rtos` marks the FreeRTOS port lineage.
 
 ---
 
+## [v1.05-rtos SJ] — unreleased
+
+The build for Dave (Solder_Junkie), EEVblog: v1.05 plus the backported
+non-blocking report write (`doc/v105-usb-cdc-nonblocking.patch`), with his
+hardware configuration (SSD1306 OLED, no LTIC / PICDIV / GPS-TIMING / INA219,
+so algorithms 10–12 are compiled out).
+
+### Fixed
+- **The non-blocking report write silenced the 1 Hz telemetry on USB CDC.**
+  The original guard asked `availableForWrite()` once and dropped the WHOLE
+  report when it returned less than the report size. On USB CDC that is every
+  report: `USBSerial`'s transmit queue is
+  `USB_FS_MAX_PACKET_SIZE * CDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER` = 64 × 2 =
+  **128 bytes** (stm32duino 2.12.0 defaults) and the human report is 400+.
+  Boot output and the CLI kept working — short lines, a different path — so
+  the build that was meant to cure "USB in, display freezes" would have
+  delivered a board whose display never froze but whose telemetry never
+  appeared either. The write is now chunked to the room the port reports, with
+  a 25 ms budget: a draining host takes the whole report in a few iterations,
+  a host that is not reading has its tail dropped and the display keeps
+  living. `room == 0` means "full, wait" — never blind-write the rest, on a
+  full CDC queue `USBSerial::write()` loops as long as the host stays
+  connected, which is the freeze the guard exists to prevent. The CDC
+  transmit queue is also enlarged to 1 KB
+  (`-DCDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER=16` in `build_opt.h`; the macro
+  is `#ifndef`-guarded in the USBDevice library, verified on core 2.12.0), so
+  a healthy host has ~2.5 s of slack and nothing is dropped at all. The patch
+  file carries the corrected version.
+
+---
+
 ## [v1.05-rtos] — 2026-08-20
 
 Algorithm 12 made to work. It was shipped in v1.04 with the arithmetic right and

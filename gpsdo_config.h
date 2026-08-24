@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * All hardware features, pin assignments, display selection, RTOS task
@@ -39,7 +39,8 @@ extern "C" {
  * AFTER all feature switches — otherwise GPSDO_BLUETOOTH would not yet be
  * visible here and OUT_SERIAL would always resolve to USB. See the
  * "Derived macros" section below. */
-#define AUTHOR_NAME      "Andre Balsa"   /* v0.06c author — inspiration for the RTOS port (ASCII for serial) */
+#define AUTHOR_NAME      "J. M. Niewinski (jmnlabs)"   /* this firmware's author (ASCII for serial) */
+#define ORIG_AUTHOR_NAME "Andre Balsa"   /* author of the original GPSDO v0.06c (ASCII for serial) */
 
 /* ── Feature switches ────────────────────────────────────────────────── */
 
@@ -137,6 +138,17 @@ extern "C" {
 #define GPSDO_VCC
 #define GPSDO_VDD
 #define GPSDO_UBX_CONFIG
+
+/* Chinese u-blox CLONE (fake M8N etc.): talk NMEA only, configure nothing.
+ * Clones answer the baud probe but ignore CFG-MSG/CFG-NAV5 and lack
+ * survey-in and TIM-TP; the unanswered config stream can even upset their
+ * auto-baud (module goes silent → "acquiring" until a T-tunnel re-probe).
+ * With this defined the firmware probes the baud rate and sends NOTHING
+ * else. Discipline is unaffected (PPS never needed UBX); you lose NMEA
+ * silencing, stationary mode, survey-in/Time Mode and qErr.
+ * Leave commented out for genuine u-blox modules. */
+
+//#define GPSDO_FAKE_UBLOX
 
 /* ── GPS timing module (LEA-6T / LEA-M8T) ─────────────────────────────
  *

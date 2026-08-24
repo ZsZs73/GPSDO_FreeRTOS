@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * Ten algorithms (0-9) selectable at runtime via CLI command LA.
@@ -1541,7 +1541,7 @@ static int32_t  s_mla_last_phase;
 float   g_mlacc_gain = 0.0f;
 /* Force a correction once this level is reached, whatever the limits say —
  * otherwise a slow drift under every limit would never be acted on. */
-uint8_t g_mlacc_run_level = 9;
+uint8_t g_mlacc_run_level = 7;   /* 256 s: Alan's default — breadboard-friendly, stops limiting ~15 min after cold start */
 /* Zero-crossing correction on/off. On by default because Alan calls it essential,
  * but switchable: it has been the source of two separate faults here and a tester
  * needs to be able to take it out of the picture without recompiling. */
@@ -2392,8 +2392,8 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
         g_vctl_fine_valid = true;
     }
     return clamp_pwm((int32_t)pwm + d);
-#endif /* GPSDO_LTIC */
 }
+#endif /* GPSDO_LTIC */
 
 uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
 {

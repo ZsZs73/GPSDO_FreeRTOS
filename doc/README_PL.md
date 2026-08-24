@@ -14,9 +14,9 @@ na platformie STM32 BlackPill (WeAct F411CE / F401CCU6).
 | Rola | Osoba / źródło |
 |------|----------------|
 | Autor portu FreeRTOS i algorytmów 3–11 | **J. M. Niewiński** — [repozytorium](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
-| Asystent programowania (Anthropic) | **Claude AI** |
-| Pomiary i testy terenowe, algorytmy 10 i 11 | **Dan Wiering** — przebiegi ADEV względem wzorca rubidowego, które wykryły cykl graniczny algorytmu 10, rozstrzygnęły kwestię tłumienia `FA`, zgłosiły zablokowanie ACQ i ustaliły porównanie dla algorytmu 11 |
-| Obsługa ILI9486 / ILI9488 — impuls do implementacji | **lucido** (forum EEVBlog) |
+| Asystenci programowania | **Claude Opus 5 (Anthropic) · GLM-5.3 Max (Z.ai) · Qwen3.8-Max** |
+| Pomiary i testy terenowe, algorytmy 10–12 | **Dan Wiering** — przebiegi ADEV względem wzorca rubidowego, które wykryły cykl graniczny algorytmu 10, rozstrzygnęły kwestię tłumienia `FA`, zgłosiły zablokowanie ACQ i ustaliły porównanie dla algorytmu 11; teraz dociska algorytm 12 |
+| Obsługa ILI9486 / ILI9488 — impuls do implementacji; a tuner na PC wyrósł ze skryptu monitorującego, który skleił z Claude | **lucido** (forum EEVBlog) |
 | Autor v0.06c — inspiracja portu RTOS | **André Balsa** — [repozytorium](https://github.com/AndrewBCN/STM32-GPSDO) |
 | Ciągła pętla PI (algorytm 11) — projekt oryginalny | **Lars Walenius** (pamięci) — kontroler GPSDO udostępniony społeczności [time-nuts](http://www.leapsecond.com/time-nuts.htm) i EEVBlog. Rozwinięty tutaj o auto-kalibrację z CT, gałąź akwizycji prowadzoną częstotliwością i pomost przechwytywania fazy picDIV. |
 | Akumulator wielopoziomowy (algorytm 12) — projekt oryginalny | **Alan Cashin** (MIS42N, forum EEVBlog) — [profil](https://www.eevblog.com/forum/profile/?u=121386) — jego Budget GPSDO jest źródłem algorytmu 12, korekcji przejścia przez zero, ditherowanego PWM osiągającego 24 bity z krótkiego przebiegu oraz pomysłu na samoocenę `CS`. Zaimplementowane tutaj na detektorze fazy LTIC, z granicami poziomów pozostawionymi do edycji, bo tylko ta dla 128 s została kiedykolwiek wyprowadzona ze specyfikacji. |
@@ -1187,7 +1187,7 @@ korekcję, uderzało w ogranicznik i wyrzucało detektor na szynę — zmierzone
 `LA 12` odmawia teraz bez `GPSDO_LTIC`, a gdy detektor jest, ale nie czyta,
 algorytm wstrzymuje się zamiast zgadywać.
 
-Tak jak algorytmy 10 i 11, zbroi picDIV. Bez tego rampa detektora stoi na szynie,
+Tak jak pozostałe algorytmy LTIC, zbroi picDIV. Bez tego rampa detektora stoi na szynie,
 odczyt nigdy nie staje się poprawny, a algorytm po cichu wraca do bycia ślepym.
 Pomost czeka na kilka kolejnych nieudanych odczytów, zanim ruszy dzielnik, potem
 robi przerwę na ustalenie fazy. Trend pokazuje wtedy `ARM`.
@@ -1529,7 +1529,7 @@ nietknięte.
 dostrojone dla nich ustawienia są respektowane. Ale rozwój się zatrzymał:
 algorytm 11 wypadł 2–3× lepiej niż poprawnie dostrojony algorytm 10 przy czasach
 uśredniania, dla których GPSDO w ogóle ma sens — na niezależnym sprzęcie,
-względem wzorca rubidowego. Wysiłek idzie w algorytmy 10 i 11.
+względem wzorca rubidowego. Wysiłek idzie w algorytmy LTIC 10–12.
 
 Zostają, a nie znikają, bo jedenaście udokumentowanych podejść do tego samego
 problemu regulacji jest warte więcej jako materiał poznawczy niż schludniejsze

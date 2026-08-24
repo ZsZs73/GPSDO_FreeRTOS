@@ -25,6 +25,30 @@ El sufijo de versión `-rtos` marca el linaje del port a FreeRTOS.
 
 ---
 
+## [v1.05-rtos SJ] — sin publicar
+
+Build para Dave (Solder_Junkie), EEVblog: v1.05 más el retroporte de la
+escritura no bloqueante del informe (`doc/v105-usb-cdc-nonblocking.patch`),
+con la configuración de su hardware (OLED SSD1306, sin LTIC / PICDIV /
+GPS-TIMING / INA219 — los algoritmos 10–12 quedan fuera de la compilación).
+
+### Corregido
+- **La escritura no bloqueante del informe silenciaba la telemetría de 1 Hz
+  por USB CDC.** El guard original preguntaba `availableForWrite()` una vez y
+  descartaba el informe ENTERO cuando devolvía menos que su tamaño. Por USB
+  CDC eso es todos: la cola TX de `USBSerial` mide 64 × 2 = **128 bytes**
+  (valores por omisión de stm32duino 2.12.0) y el informe ocupa 400+. El
+  arranque y la CLI seguían funcionando — así que el build que debía curar
+  «enchufas el USB y la pantalla se congela» habría entregado una placa sin
+  congelación… y sin telemetría. La escritura va ahora por trozos del tamaño
+  que el puerto declara, con un presupuesto de 25 ms; `room == 0` significa
+  «llena, espera», nunca escribir a ciegas. La cola TX CDC se amplía además a
+  1 KB (`-DCDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER=16` en `build_opt.h`,
+  macro con `#ifndef` en la librería USBDevice, verificado en el core 2.12.0).
+  El parche lleva la versión corregida.
+
+---
+
 ## [v1.05-rtos] — 2026-08-20
 
 El algoritmo 12, hecho funcionar. Salió en v1.04 con la aritmética correcta y

@@ -5,7 +5,7 @@
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
- * AI:       Claude (Anthropic)
+ * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
  * vSensorTask   — reads AHT/BMP/INA sensors every 2 s under xWireMutex
@@ -52,13 +52,24 @@ float  g_bmp_temp = 0.0f, g_bmp_pres = 0.0f;
 float  g_aht_temp = 0.0f, g_aht_humi = 0.0f;
 float  g_ina_volt = 0.0f, g_ina_curr = 0.0f;
 
+/* ---- Damping-window sizes (FA / FAD / FAL) -----------------------------
+ *
+ * NOT under GPSDO_LTIC, although only the LTIC loops read them. They are part
+ * of the persisted settings block and the CLI prints and sets them
+ * unconditionally, so with the detector compiled out settings_store.cpp and
+ * gpsdo_cli.cpp still reference them and the LINK fails:
+ *   undefined reference to `g_freq_damp_win_dpll'
+ * from snapshot_full(), settings_recall(), settings_save_partial() and
+ * dispatch(). Four bytes of RAM against a firmware that cannot be built
+ * without a phase detector is not a trade worth making. */
+uint16_t      g_freq_damp_win_dpll = 100; /* FAD: DPLL damping average window */
+uint16_t      g_freq_damp_win_lock = 100; /* FAL: LOCK damping average window */
+
 /* ---- LTIC globals (Lars TIC) ------------------------------------------ */
 #ifdef GPSDO_LTIC
 volatile bool g_ltic_must_read = false;
 int16_t       g_ltic_adc_raw   = 0;
 int16_t       g_ltic_adc_avg   = 0;
-uint16_t      g_freq_damp_win_dpll = 100; /* FAD: DPLL damping average window */
-uint16_t      g_freq_damp_win_lock = 100; /* FAL: LOCK damping average window */
 float         g_ltic_voltage   = 0.0f;
 
 /* ltic_read_fast — read PA1 (the TIC ramp) ~50 µs after the PPS edge, from
@@ -360,6 +371,63 @@ static int s2(char *buf, int pos, uint8_t v)
     return pos;
 }
 
+/* Write a report only if it can go out WITHOUT BLOCKING.
+ *
+ * STM32duino's USBSerial::write() spins while the endpoint is busy for as long
+ * as the host is connected. A host that has enumerated the CDC port but is not
+ * draining it — a closed terminal, a Windows box that opened the port and
+ * walked away, a `screen` session someone suspended — therefore stops the
+ * calling task dead, inside the write, after the mutex is taken. The 30 ms
+ * mutex timeout does not help: the block is on the far side of it.
+ *
+ * The task that calls this is vDisplayTask, which also drives the OLED, the
+ * LCD, the TM1637 and the TFT. So the visible symptom of "USB connected, host
+ * not reading" is that the DISPLAY FREEZES, which reads as a crashed board and
+ * is nothing of the kind — the frequency and control tasks never touch serial
+ * and keep disciplining the oscillator throughout. Reported from the field by
+ * Dave (Solder_Junkie) on EEVblog, whose board ran fine until a USB cable went
+ * in. The blue LED keeps blinking through it, because PC13 is toggled in the
+ * 2 Hz timer ISR and owes nothing to any task.
+ *
+ * Telemetry is a live stream, not a log: a report nobody is reading is worth
+ * dropping, and the next one is a second away. So ask first, and skip the
+ * whole line if it will not fit. */
+static bool report_write(const uint8_t *buf, int n)
+{
+    if (n <= 0) return true;
+    /* Write in CHUNKS no larger than what the port can take now, with a time
+     * budget. Asking once and dropping the WHOLE report when it did not fit
+     * silenced the 1 Hz telemetry on USB CDC entirely: the CDC transmit queue
+     * is USB_FS_MAX_PACKET_SIZE * CDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER
+     * = 64 * 2 = 128 bytes (stm32duino 2.12.0 defaults) and the report is
+     * 400+, so room was always less than n. A draining host empties the queue
+     * in under a millisecond of polling, so the whole report still goes out;
+     * a host that is not reading stalls the first chunk and the tail is
+     * dropped after the budget — the intended behaviour.
+     *
+     * room == 0 is ambiguous: a FULL CDC queue reports 0, and so would a port
+     * that cannot answer. Never blind-write the rest on 0: on a full CDC
+     * queue USBSerial::write() loops for as long as the host stays connected,
+     * which is the freeze this wrapper exists to prevent. Yield and let the
+     * budget decide. */
+#define REPORT_WRITE_BUDGET_MS 25u
+    uint32_t t0 = millis();
+    int off = 0;
+    while (off < n) {
+        int room = REPORT_SERIAL.availableForWrite();
+        if (room > 0) {
+            int chunk = (room < (n - off)) ? room : (n - off);
+            REPORT_SERIAL.write((uint8_t *)buf + off, (size_t)chunk);
+            off += chunk;
+        } else {
+            taskYIELD();
+        }
+        if (off < n && (millis() - t0) >= REPORT_WRITE_BUDGET_MS)
+            return false;               /* tail dropped, display must live */
+    }
+    return true;
+}
+
 /* ---- Tab-delimited report -------------------------------------------- */
 static void print_tab_report(const GpsData_t *g, const FreqSnap_t *f,
                               const CtrlData_t *c, const Uptime_t *u)
@@ -407,7 +475,7 @@ static void print_tab_report(const GpsData_t *g, const FreqSnap_t *f,
     buf[p++] = '\r';  buf[p++] = '\n';
 
     if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
-        REPORT_SERIAL.write((uint8_t *)buf, p);
+        report_write((const uint8_t *)buf, p);
         xSemaphoreGive(xSerialMutex);
     }
 }
@@ -572,7 +640,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
     buf[p++]='\r'; buf[p++]='\n';
 
     if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
-        REPORT_SERIAL.write((uint8_t *)buf, p);
+        report_write((const uint8_t *)buf, p);
         xSemaphoreGive(xSerialMutex);
     }
 }
@@ -1164,7 +1232,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       s_tft.setTextFont(1);
       s_tft.setTextSize(1);
       s_tft.setTextColor(0x8410, TFT_COL_BG);
-      s_tft.drawString("jmnlabs with Claude (Anthropic)", TFT_W/2, TFT_SY(206));
+      s_tft.drawString("jmnlabs + Claude, GLM-5.3, Qwen3.8 AI", TFT_W/2, TFT_SY(206));
       s_tft.drawString("inspired by STM32-GPSDO v0.06c by Andre Balsa",
                        TFT_W/2, TFT_SY(218));
 
@@ -2777,7 +2845,7 @@ void vDisplayTask(void *pvParameters)
               int vcol = (16 - vlen) / 2; if (vcol < 0) vcol = 0;
               s_oled.drawString(vcol, 3, PROGRAM_VERSION); (void)vl; }
             s_oled.drawString(0, 5, "~~~~~~~~~~~~~~~~");
-            s_oled.drawString(1, 7, "jmnlabs+Claude");   /* 14 ch, fits 16 col */
+            s_oled.drawString(1, 7, "jmnlabs+AI");   /* 10 ch, fits 16 col */
             /* Row 0 not cached → forced redraw to clock after splash */
         }
         xSemaphoreGive(xWireMutex);
@@ -2829,7 +2897,7 @@ void vDisplayTask(void *pvParameters)
             snprintf(l, sizeof(l), "  GPSDO %s", PROGRAM_VERSION);
             lcd_set_line(1, l);
             lcd_set_line(2, "GPS Disciplined OCXO");
-            lcd_set_line(3, " jmnlabs  +  Claude ");
+            lcd_set_line(3, " jmnlabs  +  AI x3   ");
             xSemaphoreGive(xWireMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(4500));

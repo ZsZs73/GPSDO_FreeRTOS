@@ -39,6 +39,27 @@ public:
         return n;
     }
 
+    /* ---- How much can be written without blocking ----
+     *
+     * Stream's default returns 0, and a caller that treats 0 as "not now"
+     * would silence a tee build completely — which is why this override has
+     * to exist the moment anything starts asking. The answer for a tee is the
+     * SMALLER of the two: a write goes to both ports, so the one with less
+     * room is the one that decides whether the call blocks.
+     *
+     * A port that reports 0 room but is genuinely absent (an unopened CDC)
+     * would otherwise veto output on the port that IS there, so treat "no
+     * room at all" on one side as no constraint from that side. Neither
+     * HardwareSerial nor USBSerial reports 0 when it is working and idle. */
+    int availableForWrite(void) override
+    {
+        int a = _a.availableForWrite();
+        int b = _b.availableForWrite();
+        if (a <= 0) return b;
+        if (b <= 0) return a;
+        return (a < b) ? a : b;
+    }
+
     /* ---- Input path: read from whichever port has data ----
      * Poll A first, then B. available() reports the sum so callers that
      * loop `while (available())` drain both. peek()/read() service A before
