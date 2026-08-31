@@ -960,8 +960,24 @@ void vGpsTask(void *pvParameters)
  * Called from setup() before vTaskStartScheduler().
  */
 
-/* Candidate baud rates to probe, in preference order */
-static const uint32_t BAUD_CANDIDATES[] = { 38400, 9600, 57600, 115200 };
+/* Candidate baud rates, most likely first.
+ *
+ * 19200 was missing: it is one of the rates u-blox modules ship configured to
+ * and a board on it would have fallen through the whole sweep.
+ *
+ * ORDER IS NOT LOAD-BEARING — but only because of the checksum test in
+ * nmea_sentence_ok() below, and that is worth recording. With the earlier
+ * criterion of "a single 0x24 arrived", it WAS: simulated across every pair of
+ * these five rates, a module at 38400 listened to to at 57600 produces a '$' out
+ * of framing garbage in 24 runs out of 24, so a list with 57600 ahead of 38400
+ * would have mis-detected every 38400 board. Requiring a whole sentence with a
+ * valid checksum removes every false positive in the 5x5 matrix, which is what
+ * frees the order to be about boot speed alone. Do not weaken the test back to
+ * a byte match and keep the order.
+ *
+ * 38400 first because that is what the boards in the field are set to; 9600
+ * second because it is the u-blox factory default. */
+static const uint32_t BAUD_CANDIDATES[] = { 38400, 9600, 19200, 57600, 115200 };
 static const uint8_t  N_BAUD_CANDIDATES = sizeof(BAUD_CANDIDATES)/sizeof(BAUD_CANDIDATES[0]);
 
 /* UBX-CFG-PRT poll (port 1 = UART1) — asks module to reply with its
@@ -976,32 +992,101 @@ static const uint8_t UBX_POLL_PRT[] = {
  *   01     — port ID = 1 (UART1)
  *   08 22  — checksum (CK_A=0x08, CK_B=0x22)            */
 
+/* One NMEA sentence must fit inside the listening window, and the stream is
+ * 1 Hz, so the window has to span a whole period plus the longest sentence.
+ * Computed and then simulated: at 350 ms a complete sentence lands inside the
+ * window 35-60% of the time depending on rate and how chatty the module is —
+ * meaning the sweep missed the TRUE rate about half the time and fell through
+ * to the active probe. At 1100 ms it is 100% for every rate from 9600 to
+ * 115200 and for both a GGA+RMC-only module and one with all six sentences on.
+ *
+ * Cost at boot: a wrong candidate burns the full window, so a module at the
+ * last candidate costs about 4.4 s before it is found. The OCXO needs 300 s to
+ * warm up, so this is not a number worth optimising against correctness. */
+#define NMEA_SWEEP_WINDOW_MS  1100u
+
+static int nmea_hexdig(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+/* Is the port carrying REAL NMEA — a complete sentence whose checksum agrees?
+ *
+ * "A '$' arrived" is a different and much weaker question, and the difference
+ * is the whole point. Bytes read at the wrong baud are not random: at an
+ * integer ratio every transmitted bit becomes several received bits, so the
+ * garbage is dominated by runs (0x80, 0xE0, 0xFE) and a '$' — 0b00100100,
+ * which needs alternation — essentially cannot appear. At 1.5:1 it can, and
+ * does: 38400 heard at 57600 yields one every time. The checksum closes that
+ * door, because garbage agreeing with its own XOR is a 1-in-256 accident that
+ * also has to arrive wrapped in $...* with two hex digits.
+ *
+ * Simulated over all 25 transmit/listen pairs of the five candidate rates,
+ * feeding real sentence text through an 8N1 transmitter and a bit-sampling
+ * receiver: 25/25 correct, 0 false positives. The simulator lives in the
+ * v1.06 tree under tools/uartsim/ if you want to re-run it. */
+static bool nmea_sentence_ok(uint32_t window_ms)
+{
+    char    body[84];          /* NMEA caps a sentence at 82 incl. $ and CRLF */
+    uint8_t n  = 0;
+    bool    in = false;
+
+    uint32_t t0 = millis();
+    while ((millis() - t0) < window_ms) {
+        while (Serial1.available()) {
+            int ci = Serial1.read();
+            if (ci < 0) break;
+            char c = (char)ci;
+
+            if (c == '$') { in = true; n = 0; continue; }
+            if (!in) continue;
+
+            if (c == '\r' || c == '\n') {
+                /* body + '*' + two hex digits */
+                if (n >= 4 && body[n - 3] == '*') {
+                    uint8_t sum = 0;
+                    for (uint8_t k = 0; k < (uint8_t)(n - 3); k++)
+                        sum ^= (uint8_t)body[k];
+                    int hi = nmea_hexdig(body[n - 2]);
+                    int lo = nmea_hexdig(body[n - 1]);
+                    if (hi >= 0 && lo >= 0 &&
+                        sum == (uint8_t)((hi << 4) | lo))
+                        return true;
+                }
+                in = false; n = 0;
+            } else if (n < (uint8_t)sizeof(body)) {
+                body[n++] = c;
+            } else {
+                in = false; n = 0;      /* over-long: not a sentence */
+            }
+        }
+        delay(1);
+    }
+    return false;
+}
+
 static uint32_t detect_nmea_baud(void)
 {
-    /* Passive sweep FIRST: listen for NMEA ('$') at every candidate baud
-     * before any poll is sent. Chinese clones auto-baud their RX onto
-     * whatever binary poll arrives and ACK it, while their NMEA TX keeps
-     * running at its own rate — the ACK then names the wrong baud and the
-     * display sits on "acquiring" forever (field report, Solder Junkie).
-     * Listening only disturbs nothing: no bytes leave the STM32. */
+    /* Passive sweep FIRST: listen at every candidate baud before any poll is
+     * sent. Chinese clones auto-baud their RX onto whatever binary poll
+     * arrives and ACK it, while their NMEA TX keeps running at its own rate —
+     * the ACK then names the wrong baud and the display sits on "acquiring"
+     * forever (field report, Solder Junkie). Listening disturbs nothing: no
+     * bytes leave the STM32. */
     for (uint8_t i = 0; i < N_BAUD_CANDIDATES; i++) {
         uint32_t baud = BAUD_CANDIDATES[i];
         Serial1.end();
         Serial1.begin(baud);
         delay(50);
         while (Serial1.available()) Serial1.read();
-        bool dollar = false;
-        uint32_t t0 = millis();
-        while ((millis() - t0) < 350) {
-            while (Serial1.available()) {
-                if (Serial1.read() == (int)'$') dollar = true;
-            }
-            if (dollar) {
-                OUT_SERIAL.print("GPS: NMEA traffic at "); OUT_SERIAL.println(baud);
-                while (Serial1.available()) Serial1.read();
-                return baud;
-            }
-            delay(1);
+
+        if (nmea_sentence_ok(NMEA_SWEEP_WINDOW_MS)) {
+            OUT_SERIAL.print("GPS: NMEA traffic at "); OUT_SERIAL.println(baud);
+            while (Serial1.available()) Serial1.read();
+            return baud;
         }
     }
     return 0;   /* no NMEA anywhere — caller may poll actively */

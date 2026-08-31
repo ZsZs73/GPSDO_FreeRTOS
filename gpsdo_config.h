@@ -189,10 +189,11 @@ extern "C" {
  * Default is the 16-bit PWM on PIN_VCTL_PWM: about 50 uV per step at 3.3 V,
  * near 2.7e-11 fractional on a 5.3 Hz/V oscillator.
  *
- * GPSDO_DAC_EXT switches to an external SPI DAC. NOT IMPLEMENTED - dac_ext.cpp
- * is a stub that refuses to compile until a device is chosen, so enabling this
- * is a compile error by design. An 18-bit part with a reference designed for the
- * job reaches about 17 uV per step, near 9e-12, with no filter delay in the loop.
+ * GPSDO_DAC_EXT switches to the external AD5680 SPI DAC (18-bit, external
+ * REF5045 reference): about 17 uV per step, near 9e-12 fractional, with no
+ * filter delay in the loop. Bit-banged on PIN_DAC_SCK/MOSI/CS (PB0/PB2/PB4,
+ * Dan Wiering's PCB routing; PB2 is BOOT1 - keep the MOSI trace pull-up free).
+ * TM1637 and the 2 kHz generator are skipped at compile time when this is on.
  *
  * No hardware SPI is needed: the DAC is written once per second, so bit-banging
  * costs microseconds. See dac_ext.h for the pin proposal and the reasoning. */
@@ -213,7 +214,8 @@ extern "C" {
 
 //#define GPSDO_DAC_EXT
 
-#define GPSDO_GEN_2kHz_PB5
+/* Historical bring-up aid; OFF by default per the v1.06 policy. */
+/* #define GPSDO_GEN_2kHz_PB5 */
 
 
 /* ── Sanity checks ───────────────────────────────────────────────────── */
@@ -242,8 +244,15 @@ extern "C" {
 #if defined(GPSDO_PWM_DITHER) && defined(GPSDO_DAC_EXT)
   #error "GPSDO_PWM_DITHER and GPSDO_DAC_EXT both drive the control voltage. Pick one."
 #endif
-#if defined(GPSDO_DAC_EXT) && (defined(GPSDO_TM1637) || defined(GPSDO_TM1637_6))
-  #error "GPSDO_DAC_EXT and TM1637 both claim PB4. Disable the TM1637 (the HT16K33 on I2C is the maintained clock display), or redefine PIN_DAC_CS."
+/* With the external DAC on, TM1637 and the 2 kHz generator yield their pins
+ * instead of failing the build: TM1637's data line is the DAC's chip-select
+ * (PB4), and both options are historical anyway — the HT16K33 on I2C is the
+ * maintained clock display, and the generator was a bring-up aid. The v1.06
+ * policy keeps both OFF by default regardless (see the defines above). */
+#if defined(GPSDO_DAC_EXT)
+  #undef GPSDO_TM1637
+  #undef GPSDO_TM1637_6
+  #undef GPSDO_GEN_2kHz_PB5
 #endif
 /* exactly one TFT driver */
 #if (defined(GPSDO_TFT_ILI9341) + defined(GPSDO_TFT_ST7789) + defined(GPSDO_TFT_ILI9488)) > 1
