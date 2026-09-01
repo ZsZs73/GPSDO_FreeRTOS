@@ -2,14 +2,20 @@
 
 [English](MANUAL_EN.md) | [Polski](MANUAL_PL.md) | **Español**
 
+📄 PDF: [English](MANUAL_EN.pdf) · [Polski](MANUAL_PL.pdf) · [Español](MANUAL_ES.pdf)
+
+📖 [Inicio del proyecto](../README.md) · [README](README_ES.md) · [Changelog](CHANGELOG_ES.md) · [Tuner](README_TUNER_ES.md)
+
 **Firmware:** GPSDO v1.06-rtos de jmnlabs (sobre el GPSDO original de André
-Balsa, el lazo PI de Lars Walenius y el acumulador multinivel de Alan Cashin)
+Balsa, el lazo PI de Lars Walenius, el acumulador multinivel de Alan Cashin y el
+filtro de Kalman propio del autor)
 **Placa:** WeAct BlackPill STM32F411CE · **OCXO:** 10 MHz (p. ej. Vectron C4550)
 **GPS:** receptor u-blox en Serial1 (LEA-M8T / NEO-M8T / ZED-F9T o NEO-6M/7M)
 
 
-**Autor:** Jarosław Marek Niewiński (jmnlabs) — **Asistente:** GLM-5.3 Max (Z.ai),
-incluidas las versiones polaca y española de este manual
+**Autor:** Jarosław Marek Niewiński (jmnlabs)
+**Asistentes:** Claude Opus 5 (Anthropic) · GLM-5.3 Max (Z.ai) · Qwen3.8-Max —
+las versiones polaca y española de este manual son de GLM-5.3 Max
 Este manual no presupone **nada**. Si nunca ha compilado firmware, nunca ha
 grabado un microcontrolador y nunca ha usado un terminal serie, empiece en la
 Parte 1 y haga exactamente lo que ahí se dice, en orden. Cada paso indica qué
@@ -31,7 +37,7 @@ lector».
 - [Parte 1 — Compilación del firmware](#parte-1--compilación-del-firmware)
 - [Parte 2 — Grabar el firmware, y la regla del sector 7](#parte-2--grabar-el-firmware-y-la-regla-del-sector-7)
 - [Parte 3 — Primer arranque: calibración, algoritmo, guardado](#parte-3--primer-arranque-calibración-algoritmo-guardado)
-- [Parte 4 — Los trece algoritmos (0–12) y sus parámetros](#parte-4--los-trece-algoritmos-012-y-sus-parámetros)
+- [Parte 4 — Los catorce algoritmos (0–13) y sus parámetros](#parte-4--los-catorce-algoritmos-013-y-sus-parámetros)
 - [Parte 5 — Pantallas: qué significa cada campo](#parte-5--pantallas-qué-significa-cada-campo)
 - [Parte 6 — Telemetría serie (el informe de 6 líneas)](#parte-6--telemetría-serie-el-informe-de-6-líneas)
 - [Parte 7 — Referencia de comandos (todos)](#parte-7--referencia-de-comandos-todos)
@@ -40,6 +46,7 @@ lector».
 - [Parte 10 — Resolución de problemas](#parte-10--resolución-de-problemas)
 - [Apéndice A — Cómo funciona un GPSDO, en palabras llanas](#apéndice-a--cómo-funciona-un-gpsdo-en-palabras-llanas)
 - [Apéndice B — PID para reacios](#apéndice-b--pid-para-reacios)
+- [Apéndice C — Glosario](#apéndice-c--glosario)
 
 ---
 
@@ -111,10 +118,10 @@ grande + todos los sensores); adáptela a la realidad.
 | `GPSDO_FAKE_UBLOX` | **clon** chino de u-blox: solo sonda de baudrate, cero configuración UBX (véase la Parte 3.2) |
 | `GPSDO_GPS_TIMING` | soporte de receptores de tiempo (LEA-6T/M8T/NEO-M8T/ZED-F9T): survey-in, qErr |
 | `GPSDO_PICDIV` | salida de armado del divisor picDIV en PB3 |
-| `GPSDO_LTIC` | **el detector de fase por hardware** (rampa TIC en PA1) — necesario para los algoritmos 10, 11 y 12 |
+| `GPSDO_LTIC` | **el detector de fase por hardware** (rampa TIC en PA1) — necesario para los algoritmos 10, 11 y 12. Actívelo SOLO si el detector está físicamente montado: sin él PA1 queda flotante y el lazo disciplina el OCXO con ruido del ADC |
 | `GPSDO_LTIC_ACTIVE_RESET` | variante del detector con descarga activa del condensador (apagada para el detector RC clásico de Kaashoek) |
 | `GPSDO_PWM_DITHER` | tensión de control de 24 bits desde un PWM de 13 bits con dither (no lo apague — este es el buen DAC) |
-| `GPSDO_DAC_EXT` | DAC SPI externo — **un stub que se niega a compilar a propósito** |
+| `GPSDO_DAC_EXT` | DAC AD5680 externo, 18 bits, bit-bang en PB4/PB0/PB2 — mutuamente excluyente con `GPSDO_PWM_DITHER` |
 | `GPSDO_GEN_2kHz_PB5` | onda cuadrada de prueba de 2 kHz en PB5 |
 | `GPSDO_BLUETOOTH` | módulo HC-06 en PA2/PA3 |
 | `GPSDO_BLUETOOTH_PARALLEL` | USB **y** Bluetooth a la vez (activo por defecto) |
@@ -124,7 +131,7 @@ tipo o dos elementos que se pelean por los mismos pines. Lea el mensaje `#error`
 — nombra el conflicto.
 
 **Deje activos `GPSDO_LTIC` y `GPSDO_PWM_DITHER`**, salvo que de verdad no tenga
-el hardware del detector: sin LTIC pierde los algoritmos 10–12, que son todo el
+el hardware del detector: sin LTIC pierde los algoritmos 10–13, que son todo el
 sentido de la v1.06.
 
 ### 1.4 Configurar TFT_eSPI (solo pantallas TFT)
@@ -234,6 +241,21 @@ Sketch → Verify/Compile. Al terminar, lea la línea `Sketch uses NNNNNN bytes`
 > 512 KB completos del chip, así que una compilación que «cabe» en
 > porcentaje puede invadir el sector 7. La propia v1.06 ocupa unos
 > 250 KB — margen de sobra, pero no ignore un salto repentino.
+
+> **¿Qué binario está corriendo realmente?** El banner imprime la hora de
+> compilación — y esa hora pertenece al **sketch**, no al firmware. El compilador
+> de Arduino no rehace una unidad cuyas fuentes no han cambiado, así que editar
+> `GPSDO_algorithms.cpp` y subir deja intacto el objeto del sketch con una fecha
+> anterior dentro. El banner imprime además `image CRC32`, calculado al arrancar
+> desde la propia flash: no puede salir de una caché de compilación, cambia si
+> cambia un solo byte de cualquier unidad, y dos placas con el mismo binario
+> imprimen el mismo número. Cuando un registro y un recuerdo no coinciden, ése es
+> el que vale. `V` lo vuelve a imprimir en cualquier momento.
+>
+> Si quiere que la marca de tiempo también sea correcta, ejecute
+> `python3 tools/bumpbuild.py` antes de compilar — toca `build_id.h`, que el
+> sketch incluye sólo por eso, y con ello el compilador rehace el sketch y nada
+> más. El número aparece en el banner como `build N`.
 
 ---
 
@@ -364,6 +386,7 @@ Algos 3-9 by J. M. Niewinski
 Algo 10 (LTIC 3-stage) inspired by Dan Wiering's measurements
 Algo 11 (LTIC-Lars) after Lars Walenius' PI loop
 Algo 12 (multi-level accumulator) after Alan Cashin (MIS42N)
+Algo 13 (Kalman filter) by J. M. Niewinski - original to this project
 Type H = help  SW = stack diagnostics
 ================================================
 Reset cause: POWER-ON/BROWN-OUT PIN/NRST
@@ -384,7 +407,7 @@ Starting FreeRTOS scheduler
 HW: AHT10/AHT20 sensor    OK  (I2C 0x38)
 HW: BMP280 sensor         OK  (I2C 0x77)
 HW: INA219 sensor         OK  (I2C 0x40)
-HW: LTIC phase input      OK  (PA1 analog)
+HW: LTIC phase input      enabled (PA1) - needs the ramp detector hw
 TFT: init start (SPI1 PA5/PA7, CS=PB13 DC=PB12 RST=PB15)
 TFT: freq-band sprite (4-bit) created
 TFT: header sprite (4-bit) created
@@ -409,7 +432,7 @@ Después arranca el informe de 1 Hz (Parte 6). Lo que dice cada línea:
 | `LEA-T: accepted CFG-TMODE2` | un receptor de tiempo (clase LEA-M8T) quedó configurado en survey-in / Time Mode — solo aparece con `GPSDO_GPS_TIMING` y receptor de tiempo |
 | `Hardware configured… / Timers started / Starting FreeRTOS scheduler` | arranque interno; las tres deben aparecer siempre |
 | `HW: <sensor> OK (I2C …)` / `HW: <sensor> not found` | el escaneo del bus I2C: cada sensor informa presente o ausente. Un sensor ausente no es fatal — la unidad funciona sin él, solo ese campo queda vacío en los informes |
-| `HW: LTIC phase input OK (PA1 analog)` | la entrada del detector de fase quedó configurada (los algoritmos 10–12 dependen de ella) |
+| `HW: LTIC phase input enabled (PA1)` | el firmware se COMPILÓ con la ruta del detector de fase y PA1 está configurado para ella — no puede distinguir un detector montado de un pin flotante, así que esto no es una comprobación de hardware (los algoritmos 10–13 dependen del detector real) |
 | `TFT: init start (…)` | comienza el arranque de la pantalla. **Si tras esta línea no sigue nada**, el cableado TFT o el `User_Setup.h` está mal (Parte 1.4) — es el caso «pantalla blanca/muerta pero el serie vive» |
 | `TFT: … sprite FAILED — direct-draw fallback` | la pantalla funciona pero redibuja más despacio (faltó RAM para los sprites antiparpadeo) — cosmético, no fatal |
 
@@ -437,6 +460,17 @@ ver la cuenta atrás de calibración antes que cualquier otra cosa.
   de un número. El survey-in solo debe completarse una vez; se repite tras
   perder alimentación. (`SV 0` lo apaga, `SV 1` lo reactiva, en el siguiente
   arranque.)
+
+  **Cómo dejar el survey fijo.** El survey de 300 s / 5 m que el firmware corre
+  al arrancar es un compromiso: bastante largo para servir, bastante corto para
+  que nadie lo espere. Si puede dejar el receptor encendido durante horas, haga
+  el survey una vez en u-center y guárdelo en la configuración del módulo
+  respaldada por batería — u-center **V8.29** tiene los comandos adecuados
+  (UBX-CFG-TMODE2 para el survey y luego UBX-CFG-CFG → *Save current
+  configuration*). Un survey largo da una posición fija mejor y sobrevive a los
+  cortes de alimentación: el firmware comprueba el Time Mode al arrancar y se
+  salta el suyo cuando el receptor ya informa de uno. Es la recomendación de
+  Alan Cashin, y la precisión más barata de todo el montaje.
 - El calentamiento del OCXO tarda 300 s (`WU 0` lo salta; déjelo activo).
 - El LED amarillo está **apagado sin fix GPS, fijo con fix** — cuando algo se
   vea mal, mire ahí primero.
@@ -487,11 +521,19 @@ cuántos microhercios vale un paso de salida.
 
 ### 3.4 Elegir el algoritmo
 
-- **`LA 12`** — el acumulador multinivel (según Alan Cashin). El buque insignia
-  de la v1.06: sujeta la fase a unos pocos ns RMS, corrige de promedio cada
-  pocos minutos. **Es la recomendación.**
+- **`LA 12`** — el acumulador multinivel (según Alan Cashin). La opción
+  probada: sujeta la fase a unos pocos ns RMS, corrige de promedio cada pocos
+  minutos. **Es la recomendación.**
 - **`LA 11`** — el lazo PI continuo de Lars Walenius. El clásico maduro y suave;
   excelente comportamiento a largo plazo con una sola perilla (`LTC`).
+- **`LA 13`** — el filtro de Kalman (parte 4.6). El más nuevo: decide cuánto
+  creer a cada lectura a partir de las varianzas y no de una constante, y toma
+  cada número que necesita de `CT` y `LC`. No hay nada que ajustar. **El
+  simulador lo aduló** — en el banco real lo limita la deriva lenta del cero
+  de su propio detector y en la métrica de lectura de fase queda tras el
+  algoritmo 11 (véase 4.6a, por qué esa métrica puede ser injusta con él y
+  qué pregunta queda abierta). Más nuevo que el 12, menos horas de hardware —
+  la recomendación de arriba sigue en pie; el 13 es el que vigilar.
 - `LA 10` — lazo de fase en tres etapas (ACQ→DPLL→LOCK). Sólido, con más
   parámetros.
 - Los algoritmos 0–9 son la colección histórica — funcionan, están congelados,
@@ -553,7 +595,7 @@ directo los números serán peores — eso es física, no un fallo.
 
 ---
 
-## Parte 4 — Los trece algoritmos (0–12) y sus parámetros
+## Parte 4 — Los catorce algoritmos (0–13) y sus parámetros
 
 Una idea subyace a todo esto: el firmware cuenta la frecuencia del OCXO con un
 contador enventanado (TIM2), mide la fase GPS-contra-OCXO con el detector LTIC y
@@ -590,11 +632,12 @@ de ahí la familia de gráficas automáticamente.
 | 9 | NN-MLP | red neuronal pequeña + conducción térmica aprendida en holdover | clásico |
 | 10 | LTIC-3stage | máquina de estados ACQ→DPLL→LOCK sobre el detector de fase | línea recomendada |
 | 11 | LTIC-Lars | lazo PI continuo de Lars Walenius | línea recomendada |
-| 12 | multi-level | acumulador multinivel de Alan Cashin | **buque insignia** |
+| 12 | multi-level | acumulador multinivel de Alan Cashin | **la recomendación** |
+| 13 | kalman | filtro de Kalman de tres estados — fase, frecuencia, envejecimiento | el más nuevo |
 
 Los algoritmos 0–9 están **congelados**: permanecen porque funcionan y porque el
 hueco de ajuste del 7 almacena además la calibración CT. El desarrollo nuevo es
-solo 10/11/12.
+solo 10/11/12/13.
 
 Selección: `LA <n>` (persistente con `ES ALGO`). Una unidad recién flasheada
 arranca siempre con el algoritmo 0 — elija el suyo una vez, guarde, y queda para
@@ -669,18 +712,18 @@ automática por frecuencia, con un rearmado de picDIV permitido.
 | `LD` | amortiguación | >0..1000, por defecto 3 |
 | `LTC` | constante de tiempo del lazo — **la única perilla** | 1..600 s, por defecto 60 |
 | `LFD` | divisor del prefiltro (prefiltro = LTC/esto) | 1..100, por defecto 2 |
-| `LTO` | objetivo de fase, cuentas ADC del detector | 0..4095, por defecto 2620 |
+| `LTO` | objetivo de fase en el detector | 0..3,300 V, por defecto 2,111 V |
 | `LPL` | ventana de fase del lock | 1..10000 ns, por defecto 100 |
 | `LPF` | factor de retención del lock (hold = LPF × LTC) | 1..100, por defecto 5 |
 | `LTK` | coeficiente térmico, pasos DAC por paso ADC | −32000..32000, 0 = apagado |
-| `LTR` | referencia de temperatura, cuentas ADC | 0..4095 |
+| `LTR` | referencia de temperatura | 0..3,300 V |
 
 El ajuste en una frase: deje `LG 0`, ponga `LTC` según lo suave que quiera el
 lazo (60 s es buen arranque; 240 s apacigua un sitio ruidoso; más corto solo
 añade ruido), y el resto por omisión. Todo con `ES LTIC`. La pestaña
 **LTIC-Lars** del sintonizador expone exactamente estos campos.
 
-### 4.5 Algoritmo 12 — el acumulador multinivel (buque insignia)
+### 4.5 Algoritmo 12 — el acumulador multinivel
 
 Puerto del GPSDO de Alan Cashin (MIS42N), refinado durante v1.04–v1.06. Sin
 ciclo fijo: **el tamaño del error elige el tiempo de promediación.**
@@ -698,7 +741,7 @@ error grande se corrija con suavidad»; el suelo original de Alan es 16 s,
 elegido para que una corrección en caliente no exija una tensión de control
 fuera del rango del DAC — un suelo menor da pasos mayores, uno mayor da una
 recuperación de fase más lenta). Independientemente de eso, alcanzar el nivel
-`MR` (por defecto 9 = 1024 s) fuerza una corrección aunque todo esté bajo los
+`MR` (por defecto 7 = 256 s) fuerza una corrección aunque todo esté bajo los
 límites — si no, una deriva lenta jamás recibiría respuesta.
 
 Cada corrección lleva hasta tres partes, y es a propósito: cancelar el error de
@@ -707,6 +750,13 @@ Después, el truco que Alan llama esencial: el empuje deliberado queda apuntado,
 y a la primera lectura de fase que cruza cero en la dirección esperada se retira
 exactamente ese empuje (**ZC**, cancelación en el cruce por cero) — el oscilador
 queda con la frecuencia correcta *y* sin error de fase.
+
+La prueba de cruce por cero se arma **solo tras una corrección disparada por un
+límite**, que es la regla de Alan. Una corrección programada (el nivel `MR`)
+salta por reloj, con la fase donde esté, así que no hay sobreoscilación que
+esperar; y un ZC no se rearma a sí mismo, porque el ZC *es* la cancelación.
+Armarla en cualquiera de esos dos casos dejaría que un cruce ajeno, minutos
+después, sacara un paso de una pendiente ya caduca.
 
 Tendencias propias del 12: `WAIT` (aún sin datos) → `SYNC` (5 s de asentamiento
 tras armar el divisor) → `FLL` (detector al riel, captura por frecuencia) →
@@ -723,10 +773,10 @@ hasta que ponga `LPOL -1` o `1`.
 | Comando | Significado | Rango / omisión |
 |---|---|---|
 | `MG` | ganancia, LSB por ns de fase. **0 = auto desde CT** | 0..10000, por defecto 0 (auto) |
-| `MR` | nivel que fuerza una corrección | 0..10, por defecto 9 (1024 s) |
+| `MR` | nivel que fuerza una corrección | 0..10, por defecto 7 (256 s) |
 | `MF` | origen de los límites por nivel: 0=seguir MG, 1=tabla guardada, 2=fórmula sigma, 3=ajuste medido | 0..3, por defecto 0 |
 | `MFT` | con MF 3: segundos objetivo entre correcciones por ruido | 0 (=3600) o 2048..65535 s |
-| `MLP n v` | una fila de la tabla de límites de 11 niveles | nivel 0..10, valor 1..500000 u. de acumulador |
+| `MLP n v` | una fila de la tabla de límites de 11 niveles | nivel 0..10, valor en nanosegundos |
 
 La tabla de límites por omisión es la del propio Alan (reescalada de su detector
 de 25 ns a este de ~1 ns). En nanosegundos por tramo: L0 462, L1 400, L2 331, L3
@@ -768,7 +818,155 @@ escalares y la tabla completa de límites de 11 filas con botones Send/Read/List
 y las gráficas en vivo cambian solas a la familia del algo-12 (`ph` error de
 fase, nivel, contador de correcciones, sigma, contador de ZC).
 
+### 4.6 Algoritmo 13 — el filtro de Kalman (original de este proyecto)
+
+Los algoritmos 10, 11 y 12 responden a la misma pregunta — *¿cuánto de la lectura
+de fase de este segundo debo creer?* — con un número decidido de antemano: la
+etapa de una máquina de estados, una constante de tiempo, un nivel en una tabla
+de umbrales. Éste la responde a partir de las varianzas, y la vuelve a responder
+cada segundo.
+
+Lleva tres estados — **fase**, **frecuencia**, **envejecimiento** — cada uno con
+su covarianza. Sabe cuánto ruido tiene su detector porque lo mide, y con qué
+rapidez deriva su oscilador porque también lo mide, así que el peso que da a cada
+lectura es el que esos dos números digan en ese momento. A tiempos de promediado
+cortos, donde el detector es ruidoso y el OCXO está tranquilo, se apoya en el
+oscilador; a tiempos largos, donde el OCXO camina, cede ante el GPS.
+
+**Lo que cuesta.** Tres estados y una medida **escalar**, así que la inversión de
+matrices de los libros es una sola división: unas 140 multiplicaciones-acumulación
+y 36 bytes, una vez por segundo — aproximadamente un microsegundo del M4F. La
+afirmación de que Kalman exige un Cortex-A o una FPGA se refiere a filtros GNSS
+de veinte estados, no a éste.
+
+**El holdover sale gratis.** El estado lleva frecuencia y envejecimiento con sus
+covarianzas, así que perder la fase no es un caso especial: deja de actualizar,
+sigue prediciendo y sigue gobernando. La tendencia muestra `HOLD`.
+
+**Usa dos medidas.** La fase del detector LTIC y la frecuencia del contador
+enventanado TIM2. Esta segunda no es un refinamiento: con el picDIV sin
+sincronizar no hay ninguna fase válida, y un filtro con sólo medida de fase se
+queda entonces **sin** medida — predice desde un estado todavía en cero y el
+oscilador se va. TIM2 es además lo que hace verificable al detector: fase y
+frecuencia son la misma magnitud derivada, así que en una ventana la fase
+**tiene** que moverse lo que suma el error de frecuencia. Un detector que no se
+mueve cuando TIM2 dice que debe no está midiendo nada, y el lazo rearma el picDIV
+y gobierna sólo con la frecuencia hasta que se comporte.
+
+**Todo se deriva de `CT` y `LC`.** Nada en él es una constante medida en el banco
+de otro: el cuanto propio del detector (`ns_per_volt × 3,3/4096`) fija la semilla
+del ruido de medida y su suelo, media banda del detector fija la covarianza de
+arranque en frío, la banda cruzada en un horizonte fija la de frecuencia, y
+`R/KT³` siembra el ruido de proceso. Vuelva a ejecutar `CT` o `LC` y los números
+siguen en un segundo. Al arrancar, el filtro imprime una línea con lo que
+concluyó:
+
+```
+KAL: from CT/LC  res 1.01ns  R0 2.52ns  Q0 0.000006600  P0 1500ns  lim 939LSB  arm<0.25Hz
+```
+
+**Parámetros** — los cuatro son opcionales y los valores por defecto son los que
+se usan:
+
+| Comando | Por defecto | Significado |
+|---|---|---|
+| `KR [ns]` | `0` = medir | Ruido de medida. Cero significa "mídalo de las diferencias del propio detector a un retardo de dieciséis segundos" — ruido blanco y deriva lenta del cero juntas, que es lo que quiere. Fíjelo sólo para inmovilizar el filtro en un experimento. |
+| `KQ [v]` | `0` = adaptar | Ruido de proceso, (ns/s)² por segundo. Cero significa "adáptalo de la secuencia de innovaciones". |
+| `KT [s]` | `100` | Horizonte de fase: con qué rapidez el control anula la fase estimada. Más corto sigue más al GPS, más largo se apoya en el oscilador. Fija también la paciencia de la prueba de bloqueo: cinco horizontes lejos y se rearma el picDIV. |
+| `KL` | — | Lista el estado: fase, frecuencia y envejecimiento, cuánto cree cada uno, la R y la Q en uso, y cuántas lecturas descartó la compuerta de innovación. |
+
+`KR`, `KQ` y `KT` se guardan en el momento de teclearlos, en su propio registro
+del flash ring — sin `ES`, y un firmware más antiguo sencillamente nunca pide ese
+registro.
+
+**La línea Learn** dice
+
+```
+Learn: algo=13 (kalman) ph=-12.4ns f=-118.30ps/s sig=2.48ns R=2.64 rej=3 arm=1
+```
+
+— la fase y la frecuencia que el filtro **cree** (no la lectura de este segundo,
+que es justamente el sentido de tener un filtro), cuánto cree la fase, el ruido
+de medida que ha medido, cuántas lecturas rechazó la compuerta de innovación y
+cuántas veces ha rearmado el divisor. `HOLD=<s>` aparece cuando funciona sólo con
+el modelo.
+
+**En el sintonizador:** la gráfica superior muestra la estimación de fase del
+filtro con `Vphase` y sus guías de banda debajo — porque la pregunta que este
+lazo plantea más a menudo es si el detector está vivo.
+
+**Medido en el simulador** (`tools/loopsim`, cinco semillas de ruido, dos
+plantas, ruido blanco del detector): sd de fase **0,81 / 1,20 ns**, frente a
+3,07 / 4,20 del algoritmo 12 y 3,62 / 7,39 del algoritmo 11. **El banco no
+está de acuerdo, y el banco tiene razón**: repetir esas mismas plantas con
+deriva lenta del cero invierte el orden (11: 7,45 → 10,07 ns; 13: 1,22 →
+7,23), y en hardware real del 29–30.08 la misma placa dio 2,96 ns (11)
+frente a 5,2–5,9 ns (13) con un suelo plano en los tiempos medios de
+promediado — el nivel de la deriva del propio detector, independiente del
+ancho de banda del lazo. El ruido del simulador era demasiado blanco; trate
+sus cifras como relativas, nunca absolutas (4.6a).
+
 ---
+
+### 4.6a Cómo transcurre un segundo del lazo — y qué mueven las perillas
+
+**Un segundo, en orden.** *Predicción*: el estado (fase, frecuencia,
+envejecimiento) avanza un segundo. Después hasta dos *mediciones* lo
+corrigen — la fase del detector LTIC (salvo en raíl, congelada o fuera de
+banda) y la frecuencia del TIM2 (siempre; mantiene vivo el lazo cuando el
+detector está ciego). Finalmente el *control*: `u = -(freq + fase/T)` —
+cancelar el error de frecuencia estimado y anular la fase estimada sobre el
+horizonte `T`, con pinza a la banda del detector; el resto sub-LSB pasa al
+segundo siguiente. Lo que realmente llegó al pin se contabiliza de vuelta
+en el estado de frecuencia. Alrededor del núcleo: la puerta de innovación
+4σ, la prueba de confianza (¿se mueve la fase como TIM2 exige?), el arm de
+referencia de arranque y el holdover.
+
+**La visión del R honesto.** El ruido del detector se mide de sus propias
+diferencias a un retardo de dieciséis segundos — ve el ruido *blanco*
+(~2,5 ns) **y** la deriva lenta del cero (~5,9 ns) juntas, R ≈ 6,5 ns. Ese
+número es todo el carácter del lazo: por eso el algoritmo 13 se niega a
+perseguir la estructura lenta del detector que el 11 sigue sin preguntar.
+Medido: con el lazo quieto, dph muestra un suelo plano de 5–9 ns de 10 s a
+600 s de promediado **con independencia del ancho de banda del lazo** —
+ancho, adaptado y rígido aterrizaron en el mismo nivel, el nivel de la
+deriva del propio detector. Si seguir esa deriva (11) o negarse (13) da
+mejor *salida* sólo lo puede responder un patrón independiente.
+
+**`KR [ns]`** (por defecto 0 = medir). Fijarlo al suelo blanco (`KR 2.5`)
+hace que el filtro siga al detector por completo: el sd@600 mejoró ~30% en
+horas tranquilas, pero la puerta 4σ se estrecha con R y los eventos GPS
+reales (decenas de ns) se rechazan — los rechazos subieron de 163 a 5021
+por noche. Fíjelo sólo para acotar un experimento; `KR 0` es el mejor
+omiso.
+
+**`KQ [v]`** (por defecto 0 = adaptar). La adaptación ve innovaciones
+coloreadas por el propio control, así que **Q dispara hacia arriba** —
+medido 195× la semilla tras una noche (tope en 1000×). Conocido y
+tolerado: el lazo adaptado pasó los episodios GPS nocturnos claramente
+mejor. Fijar en la semilla (`KQ 0.000006359` — la semilla exacta está en
+la línea `KAL: from CT/LC`) rigidiza el lazo ~14× y casi congela el PWM;
+en la comparación medida no cambió nada en los tau medios y manejó los
+episodios algo peor. **KQ se guarda al teclearlo** — devuélvalo con
+`KQ 0`.
+
+**`KT [s]`** (por defecto 100). Con qué rapidez anula el control la fase
+estimada: más corto sigue al GPS con más fuerza (y copia más ruido del
+detector), más largo se apoya en la estabilidad propia del oscilador. Es
+también la paciencia del detector de estancamiento — cinco horizontes
+lejos de casa y el picDIV se rearma. En un sitio con deriva del detector
+decide cuánta de esa deriva llega al oscilador.
+
+**`KL` — lea el estado** antes, durante y después de cada experimento:
+estimaciones, sigma de la creencia en la fase, la R y la Q realmente en
+uso (Q frente a la semilla es la velocidad del cohete), la última
+innovación, el contador de rechazos. El hábito más informativo: `KL`,
+luego `SW`, luego un log de una hora.
+
+**Tendencias:** `KAL` (normal), `REJ` (la puerta rechazó una lectura),
+`ARM` (re-arm del divisor — arranque, raíl o estancamiento), `HOLD` (sin
+fase, gobierno desde el modelo), `NoPL`/`NoCT` (falta calibración),
+`WAIT` (aún sin datos).
 
 ## Parte 5 — Pantallas: qué significa cada campo
 
@@ -778,7 +976,13 @@ la misma verdad con distinto nivel de detalle.
 ### 5.1 La TFT (480x320 o 320x240)
 
 ```
-y=  0..23   barra de título: "GPSDO v1.06"              LMT 14:32:45 Thu
+y=  0..23   barra de título: "GPSDO v1.06"   CPU 58%   LMT 14:32:45 Thu
+
+El `CPU 58%` de la barra de cabecera es la carga total del procesor,
+siempre activa (la medición corre en la tarea de uptime; `TL` en la
+línea serie añade el desglose por tarea). Aparece desde el segundo
+segundo tras el arranque — la ventana de promediado de 100 s aún no
+tiene veredicto.
 y= 30..62   FREQUENCY — dígitos grandes, con color
 y= 70..151  rejilla de datos, dos columnas
 y=156..195  fila de sensores
@@ -853,7 +1057,7 @@ Lat: 51.477928 Lon: -0.001531 Alt: 46.5m Sat:10 HDOP:TIME
 Freq: 10000000.0000 Hz  10s:0.0  100s:0.02  1ks:0.000  10ks:0.0000
 PWM:44653  Vctl:1.970V hit
 Learn: algo=11 (LTIC-Lars) gain=auto scale=46 phase=12.3ns LOCK qErr=-8.2ns
-BMP:23.4C 1013.2hPa  AHT:22.1C 45.3%rH  INA:12.05V 250mA  Vphase:3.077V dph:1390.5ns
+BMP:23.4C 1013.2hPa  AHT:22.1C 45.3%rH  INA:12.05V 250mA  Vphase:3.077V dph:1390.5ns  CPU:31%
 
 ```
 
@@ -869,9 +1073,9 @@ Línea a línea:
 | 1 | uptime (contado desde el PPS, fiable desde la v1.06) + fecha/hora UTC del GPS |
 | 2 | posición (6 decimales), altitud (altitud GPS **más su `AO`**), satélites, HDOP — o la palabra `TIME` cuando el receptor de tiempo está en modo de posición fija; sin fix → `GPS: no position fix yet` |
 | 3 | frecuencia contada en bruto (o `---` antes del primer conteo) y las ventanas promediadas de error 10 s / 100 s / 1 ks / 10 ks — cada una aparece solo cuando su búfer se ha llenado |
-| 4 | código PWM de 16 bits, tensión de control medida, palabra de tendencia (`hit`, `ACQ`, `DPLL`, `LOCK`, `PLL`, `CORR`, `ZC`, `NOPH`, `NoCT`, …) — en holdover, `[HOLDOVER]` sustituye a la tendencia |
+| 4 | código PWM de 16 bits, tensión de control medida, palabra de tendencia (`hit`, `ACQ`, `DPLL`, `LOCK`, `PLL`, `CORR`, `ZC`, `NOPH`, `NoCT`, `ARM`, `NoPL`, …) — en holdover, `[HOLDOVER]` sustituye a la tendencia |
 | 5 | línea Learn según el algoritmo (abajo) + `qErr` cuando `SAW 1` está activo |
-| 6 | temperatura/presión BMP280 (**bruta + su `PO`**), temperatura/humedad AHT, tensión/corriente INA, tensión del detector `Vphase`, fase `dph` en ns (con el diente de sierra restado, igual que el propio lazo) |
+| 6 | temperatura/presión BMP280 (**bruta + su `PO`**), temperatura/humedad AHT, tensión/corriente INA, tensión del detector `Vphase`, fase `dph` en ns (con el diente de sierra restado, igual que el propio lazo) y `CPU:` — la parte del último segundo que el procesador no pasó ocioso. Con `TL 1` le sigue un campo `TL:` que lo desglosa por tarea. |
 
 La línea Learn por familia:
 
@@ -879,6 +1083,8 @@ La línea Learn por familia:
 - algo 12: `ph=<ns> level=<n> corr=<n> arm=<n> sig=<ns> zc=<n> secs=<n>` — fase
   acumulada, último nivel que actuó, correcciones, armados, estimación de ruido
   en vivo, cruces por cero, segundos
+- algo 13: `ph=<ns> f=<ps/s> sig=<ns> R=<ns> rej=<n> arm=<n>` y `HOLD=<s>` en
+  holdover — las estimaciones del filtro, no la lectura de este segundo
 - algo 10: `state=ACQ|DPLL|LOCK`
 - algos 3–9: deriva/pendiente/amortiguación aprendidas; el 9 añade el
   coeficiente térmico aprendido
@@ -910,16 +1116,18 @@ de tocar:
 ### Versión, ayuda, estado
 | Comando | Qué hace |
 |---|---|
-| `V` | versión, autores, créditos |
+| `V` | versión, autores, créditos — y el **CRC-32 de la imagen de flash**, calculado al arrancar desde la propia flash. A diferencia de la marca de compilación no puede quedar obsoleto: el compilador de Arduino reutiliza objetos, así que un sketch que no ha editado conserva una fecha anterior. Cuando un registro y un recuerdo no coinciden, fíese del CRC. |
 | `H` / `?` | lista de comandos · `H TZ` = detalles de zonas horarias |
-| `SW` | marcas de agua de pila, heap libre, uptime + su origen, ppm del MCU contra el GPS |
+| `SW` | marcas de agua de pila, heap libre, uptime + su origen, ppm del MCU contra el GPS — y **carga de CPU por tarea**, de mayor a menor, promediada sobre una ventana real de 100 s de cubos de un segundo. Medida con el contador de ciclos del Cortex-M4 en cada cambio de contexto, así que es exacta y no muestreada. El tiempo de interrupción recae sobre la tarea interrumpida: léalo como "el procesador estuvo aquí", no "esta tarea consumió esto". |
+| `TL 0\|1` | las mismas cifras por tarea en la línea de telemetría, como campo `TL:`. Apagado en cada arranque y nunca guardado — es un diagnóstico de banco, no un ajuste. |
+| (nada) | `RP` / `RR` pausan y reanudan la telemetría — un conmutador de una tecla TAB/ESC se probó y se eliminó: los terminales reales y el sintonizador envían líneas terminadas en CR/LF y nunca un TAB o ESC suelto, así que era inalcanzable desde las herramientas que la gente usa de verdad. |
 
 ### Salida (el DAC)
 | Comando | Rango | Qué hace |
 |---|---|---|
 | `SP [n]` | 1..65535 (sin argumento = 32767, punto medio ≈1,65 V) | fija el DAC de control directamente — mando manual para experimentos |
 | `up1`/`up10`/`dp1`/`dp10` | — | empujones de PWM ±1/±10 (rechazados durante una calibración) |
-| `DAC` | — | informe: ruta de salida, códigos de 24 y 16 bits, Vctl medido, un paso en µHz (requiere CT) |
+| `DAC` | `PWM`/`DITH`/`EXT` | sin argumento: informe — ruta de salida, códigos de 24 y 16 bits, Vctl **ordenado y medido**, un paso en µHz (requiere CT). Con argumento: selecciona la ruta de salida activa — **se guarda solo**. El puente de la placa conmuta la señal; esto le dice al firmware qué ruta gobierna. Sin fijar = `DITH`. |
 
 ### Calibración
 | Comando | Duración | Qué hace |
@@ -935,6 +1143,7 @@ de tocar:
 |---|---|
 | `RH` / `RD` | informe legible / con tabuladores |
 | `RP` / `RR` | pausar / reanudar el informe de 1 Hz |
+| `TL 0\|1` | carga de CPU por tarea en la línea de telemetría (`SW` la muestra una vez; la barra del TFT muestra el CPU% total siempre) |
 | `MH` / `MD` | holdover (congelar el PWM, volar solo) / disciplinado |
 | `F` | purgar los búferes de anillo del promediado de frecuencia |
 | `T [baud]` | túnel GPS transparente por USB para u-center, 300 s (baud 4800..921600) |
@@ -942,7 +1151,7 @@ de tocar:
 ### Selección de algoritmo y PID clásico (véase la Parte 4)
 | Comando | Rango | Qué hace |
 |---|---|---|
-| `LA [n]` | 0..12 | elegir / mostrar el algoritmo del lazo |
+| `LA [n]` | 0..13 | elegir / mostrar el algoritmo del lazo |
 | `LP [n]` | algo 0..9 | listar parámetros PID |
 | `KP/KI/KD n val` | algo 3..7, 0..100000 | fijar ganancias |
 | `IL n val` | algo 3..9, 100..100000 | pinza del integrador |
@@ -965,15 +1174,19 @@ de tocar:
 
 ### LTIC-Lars (algo 11) — guardar con `ES LTIC`
 `LG` (0..10000, 0=auto), `LD` (por defecto 3), `LTC` (1..600 s, por defecto 60),
-`LFD` (1..100, por defecto 2), `LTO` (0..4095 ADC, por defecto 2620), `LPL`
+`LFD` (1..100, por defecto 2), `LTO` (0..3,300 V, por defecto 2,111 V), `LPL`
 (1..10000 ns, por defecto 100), `LPF` (1..100, por defecto 5), `LTK` (±32000,
-0=apagado), `LTR` (0..4095) — significados en la Parte 4.4.
+0=apagado), `LTR` (0..3,300 V) — significados en la Parte 4.4.
 
 ### Algo 12 (acumulador multinivel) — guardar con `ES ALGO12`, listar con `ML`
-`MG` (0..10000 LSB/ns, 0=auto desde CT), `MR` (0..10, por defecto 9), `MF` (0..3
+`MG` (0..10000 LSB/ns, 0=auto desde CT), `MR` (0..10, por defecto 7), `MF` (0..3
 origen de límites, por defecto 0), `MFT` (0=3600 s, o 2048..65535 s),
-`MLP <nivel> <unidades>` (nivel 0..10, valor 1..500000) — significados en la
+`MLP <nivel> <ns>` (nivel 0..10) — significados en la
 Parte 4.5.
+
+### Algo 13 (Kalman) — guardado al teclearlo, sin `ES`
+`KR` (0..1000 ns, 0 = medir), `KQ` (0..1, 0 = adaptar), `KT` (10..10000 s, por
+defecto 100), `KL` (listar el estado del filtro) — significados en la parte 4.6.
 
 ### GPS, hora, sensores
 | Comando | Rango | Qué hace |
@@ -1002,17 +1215,8 @@ Parte 4.5.
 
 ### Peculiaridades conocidas de v1.06 (lista honesta)
 
-1. **`MZ` aparece en el help pero no tiene manejador** — la cancelación en el
-   cruce por cero está siempre activa en el código; no hay nada que conmutar.
-2. **`LRN` queda eclipsado:** la tabla de flotantes de LTIC lo reclama primero,
-   así que `LRN` fija el *rango del detector en ns*. El conmutador de
-   autoaprendizaje `LRN 0|1|R` del help es inalcanzable en esta compilación.
-3. `FR 0|1` del help del firmware está caducado — el anillo está siempre activo;
-   `FR` ignora los argumentos.
-4. `H CS`, mencionado por la salida de `CS`, no existe como subpágina; `H` a
-   secas imprime la lista completa.
-
----
+1. La línea de ayuda `H` para `ES` no menciona `ALGO12` — el comando sí lo
+   acepta (`ES ALGO12` guarda el bloque del algoritmo 12).
 
 ## Parte 8 — El sintonizador en el PC
 
@@ -1138,7 +1342,7 @@ La lista práctica, una última vez:
 | `CT` falla / rechaza K | cableado EFC o sensibilidad del oscilador fuera de 0,02–2 mHz/LSB — revise el búfer del DAC y el rango EFC |
 | `LC` falla | ejecute `CT` primero; no mueva la unidad durante los 5 minutos |
 | Tendencia clavada en `NoCT` (algo 12) | ganancia en auto pero CT nunca corrió → `CT` |
-| Tendencia clavada en `ACQ` / `NoPL`, algoritmos 10–12 | `LPOL` sin fijar (el lazo imprime el aviso y espera) — ponga `LPOL -1` o `1`, luego `ES LTIC` |
+| Tendencia clavada en `ACQ` / `NoPL`, algoritmos 10–13 | `LPOL` sin fijar (el lazo imprime el aviso y espera) — ponga `LPOL -1` o `1`, luego `ES LTIC` |
 | El algo 12 corrige sin parar en el nivel 0 | sitio ruidoso — `MF 1` (la tabla de Alan), véase la Parte 4.5 |
 | La fase se va de rampa tras `SAW 1` | no hay receptor de tiempo / qErr no válido — `SAW 0` |
 | Las líneas del informe se congelan cuando un programa abre el CDC y no lee | arreglado en v1.06 (escrituras no bloqueantes + cola de 1 KB); si lo ve, está en firmware antiguo |
@@ -1149,6 +1353,38 @@ La lista práctica, una última vez:
 Si nada de eso ayuda: capture un registro completo con el sintonizador (Parte
 8.5), anote la versión de `V` y pregunte — con el registro adjunto. Una semana
 de CSV a 1 Hz es la diferencia entre adivinar y saber.
+
+### 10.1 Cómo informar de un problema
+
+Casi todas las preguntas sobre este firmware se han resuelto con cuatro cosas, y
+sin ellas se resuelven a base de días de conjeturas en vez de minutos de
+lectura. Envíe las cuatro:
+
+1. **El registro de arranque** — todo desde el reset hasta `GPS init done`,
+   copiado como texto, no fotografiado. Dice qué placa es, qué velocidad de GPS
+   se detectó, qué sensores respondieron, qué tramas UBX fueron confirmadas y
+   cuál fue la causa del reset.
+2. **Su `gpsdo_config.h` compilado** — o al menos la lista de interruptores que
+   cambió. La mayoría de las sorpresas son diferencias de configuración, no
+   fallos: una placa sin detector de fase, un segundo display en los mismos
+   pines, `SAW 1` en un receptor de navegación.
+3. **Qué módulo GNSS** — un u-blox de tiempo auténtico, uno de navegación
+   auténtico, o un clon (Parte 3.2). Los clones se comportan de otro modo y
+   saber cuál tiene elimina la mitad de las posibilidades de entrada.
+4. **La antena y cuánto cielo ve.** «En casa, en el alféizar» es una respuesta
+   perfectamente válida y a menudo la explicación entera.
+
+Una comprobación antes de enviarlo: el banner debe contener una línea
+`compiled <fecha> <hora>`. Si no está, tiene un build anterior a v1.05 y lo
+primero que hay que probar es uno actual — varios informes resultaron ser fallos
+ya corregidos. Esa línea la imprime el propio firmware, así que no puede quedar
+desfasada respecto al binario como sí ocurre con un número de versión recordado.
+
+Si la placa **se congela**, añada una observación que no cuesta nada: ¿sigue
+parpadeando el LED azul de PC13? Lo conmuta la interrupción de temporizador de
+2 Hz y no depende de ninguna tarea, así que si parpadea el MCU está vivo y lo
+que se ha bloqueado es una tarea — un fallo completamente distinto al de una
+placa que no está funcionando en absoluto.
 
 ---
 
@@ -1406,3 +1642,35 @@ ajuste (si alguna vez) al final.
 10. Si le pelea un día entero, sospeche del hardware antes que del ajuste: vista
     del cielo de la antena, temperatura (radiadores, puertas, sol), cableado
     EFC. A los lazos de este firmware es difícil romperlos y fácil culparlos.
+
+---
+
+## Apéndice C — Glosario
+
+Términos que aparecen por todo este manual, la telemetría y el changelog, en el
+sentido en que los usa este proyecto. Sugerencia de Alan Cashin, que señaló que
+la mitad de ellos se usan de otro modo en otras partes.
+
+| Término | Qué significa aquí |
+|---|---|
+| **ADEV** | Desviación de Allan — la medida estándar de estabilidad de un oscilador: cuánto cambia la frecuencia fraccional entre ventanas de promediado contiguas de longitud τ. Se lee como «a 100 s, este reloj llega a 1e-11». |
+| **ACQ / DPLL / LOCK** | Las tres etapas del algoritmo 10. ACQ acerca la frecuencia usando el contador; DPLL asienta fase y frecuencia deprisa; LOCK corrige despacio y en banda estrecha para acercarse al error mínimo. |
+| **BBR** | RAM respaldada por batería en un módulo GNSS — donde una configuración guardada del receptor sobrevive a un corte de alimentación, si hay pila de respaldo. |
+| **DAC** | Convertidor digital-analógico: lo que convierte un número en la tensión de control. En este montaje normalmente no es un chip — véase PWM y dither. |
+| **código DAC / LSB** | El número que se escribe en la salida de tensión de control, y un paso suyo. Todas las ganancias se expresan por LSB, porque es el movimiento más pequeño que el lazo puede hacer. |
+| **dither** | Variar a propósito los bits bajos del ciclo de trabajo del PWM de periodo en periodo para que el *promedio* caiga entre dos pasos del hardware. 13 bits físicos reproducidos sobre una tabla de 2048 entradas dan unos 24 bits efectivos. |
+| **EFC** | Control electrónico de frecuencia — la entrada de ajuste del OCXO. Voltios dentro, hercios fuera. |
+| **holdover** | Funcionar sin GPS: el lazo deja de corregir y el OCXO corre libre con su última tensión de control. |
+| **LTIC** | El contador de intervalos de tiempo de Lars — el detector de fase por rampa en PA1 (un condensador cargado entre el flanco del PPS y el del OCXO dividido). «TIC» a secas es el mismo detector. |
+| **NMEA** | Las frases de texto que envía un módulo GNSS (`$GPRMC,…`): posición, hora, número de satélites — todo salvo la configuración binaria. |
+| **OCXO** | Oscilador de cristal con horno: un cristal mantenido a temperatura constante, por eso es estable y por eso necesita calentamiento. |
+| **picDIV** | Un divisor pequeño que convierte 10 MHz en un flanco de 1 Hz para el detector de fase. Hay que *armarlo* (resincronizarlo) para que su flanco caiga cerca del PPS. |
+| **PID / PI** | El regulador: **P** reacciona al error de ahora, **I** al error acumulado, **D** a lo rápido que cambia. Casi todos los lazos aquí son PI — véase el Apéndice B. |
+| **PPS** | La salida de un pulso por segundo del receptor GNSS — la referencia de tiempo contra la que se mide todo. |
+| **PWM** | Modulación por ancho de pulso: una onda cuadrada cuyo ciclo de trabajo, tras un filtro RC, se convierte en la tensión de control. Barato y, con dither, mejor que la mayoría de los chips DAC. |
+| **qErr / diente de sierra** | La propia estimación del receptor, en picosegundos, de cuánto falló su flanco de PPS respecto al tiempo verdadero. Los receptores de tiempo la informan (`UBX-TIM-TP`); corregirla elimina un error con forma de diente de sierra. |
+| **survey-in** | Un receptor de tiempo midiendo su propia posición durante mucho rato para poder luego fijarla y dedicar todo su cálculo al *tiempo*. |
+| **Time Mode** | El estado en el que entra un receptor de tiempo tras el survey-in: posición fija, tiempo optimizado. La pantalla muestra `HDOP:TIME`. |
+| **trend** | La palabra de cuatro caracteres en la telemetría y en la pantalla que nombra lo que el lazo está haciendo ahora mismo: `ACQ`, `DPLL`, `LOCK`, `CORR`, `ZC`, `NOPH`, … |
+| **Vctl / Vphase** | Vctl es la tensión de control que va *hacia* el oscilador; Vphase es la tensión del detector que vuelve *desde* la medida de fase. Dos pines distintos, fáciles de confundir. |
+| **ZC** | Cancelación en el cruce por cero (algoritmo 12): retirar un empuje deliberado justo cuando la fase cruza cero, dejando frecuencia y fase correctas a la vez. |

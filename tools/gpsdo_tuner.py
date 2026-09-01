@@ -33,6 +33,7 @@ visualiser are new here.
                                  correction, the dithered PWM and the CS
                                  self-assessment idea. The Multi-level (algo 12)
                                  tab drives his design, so his name belongs on it.
+  Algorithm 13 (Kalman filter) . J. M. Niewiński — original to this project
   Measurements, algos 10 & 11 .. Dan Wiering (rubidium reference)
   This tuning tool ............. built for the jmnlabs GPSDO project
 
@@ -54,8 +55,10 @@ import math
 # against newer firmware silently mis-parses telemetry and writes commands the
 # board no longer understands, which is a confusing way to lose an evening.
 # Bump this whenever the firmware version changes, even if nothing here moved.
-TOOL_VERSION = "1.05"
+TOOL_VERSION = "1.06"
 from collections import deque, defaultdict
+from array import array
+from bisect import bisect_left
 
 # Force pyqtgraph to use the same Qt binding as the rest of this file (PySide6).
 # pyqtgraph auto-detects a binding, and if PyQt5/PyQt6 is also installed it may
@@ -133,12 +136,12 @@ LTIC_STAGE_VERBS = {
 
 # LTIC calibration verbs and their sensible ranges (lo, hi, decimals)
 LTIC_CAL = {
-    "LNV": ("ns_per_volt", 0.0, 1e6, 3),
-    "LZO": ("zero_offset V", 0.0, 3.3, 4),
-    "LRN": ("range_ns (not self-learn)", 0.0, 1e9, 2),
-    "LCV": ("centre_v", 0.0, 3.3, 3),
-    "LAT": ("acq_thresh ns", 1.0, 5000.0, 2),
-    "LIV": ("lock_interval s", 1.0, 3600.0, 0),
+    "LNV": ("ns_per_volt (ns/V)", 0.0, 1e6, 3),
+    "LZO": ("zero_offset (V)", 0.0, 3.3, 4),
+    "LRN": ("range_ns (ns) — not self-learn", 0.0, 1e9, 2),
+    "LCV": ("centre_v (V)", 0.0, 3.3, 3),
+    "LAT": ("acq_thresh (ns)", 1.0, 5000.0, 2),
+    "LIV": ("lock_interval (s)", 1.0, 3600.0, 0),
 }
 
 FA_VALUES = ["10", "100", "1000"]
@@ -171,21 +174,34 @@ PLOT_SERIES = {
     # actually accumulating.
     "mlacc": [("ph",     "Phase error (ns, LTIC detector)",        "#22aa44"),
               ("Vctl",   "Control voltage Vctl (V)",               "#2277cc")],
+    # Algorithm 13 fell through to "pid" and so showed the LRN feed-forward
+    # drift, a series it never emits: an empty pane labelled as if it meant
+    # something. What it has instead is an ESTIMATE of the phase, which is the
+    # one number the filter exists to produce. Vphase underneath it, with the
+    # band guides, because the question this loop most often raises is whether
+    # the detector is alive at all.
+    "kalman": [("ph",     "Phase estimate (ns) - Kalman state",     "#22aa44"),
+               ("Vphase", "Detector Vphase (V) - ramp position",    "#2277cc")],
 }
 
 # Algorithm 11 (LTIC-Lars) parameters: verb -> (label, lo, hi, decimals).
 # These share the LTIC tab, shown when algorithm 11 is active. Saved by ES LTIC
 # alongside the algo-10 block. gain is board-specific (see firmware note).
+# Every label carries its unit, or says plainly that the value has none. Half
+# of them used to leave it to the reader, and "LTO — tic_offset ADC" beside
+# "LZO — zero_offset V" is how the same physical point ended up held in two
+# units that disagreed by 37 ns. LTO and LTR are VOLTS now (the firmware still
+# stores ADC counts; only the face changed).
 LARS_PARAMS = {
-    "LG":  ("gain (DAC/ns)",   0.0, 10000.0, 3),
-    "LD":  ("damping",         0.0, 1000.0,  3),
-    "LTC": ("time_const s",    1.0, 600.0,   0),
-    "LFD": ("filter_div",      1.0, 100.0,   0),
-    "LTO": ("tic_offset ADC",  0.0, 4095.0,  0),
-    "LPL": ("lock_ns_lim",     1.0, 10000.0, 0),
-    "LPF": ("lock_factor",     1.0, 100.0,   0),
-    "LTK": ("temp_coeff",  -32000.0, 32000.0, 0),
-    "LTR": ("temp_ref ADC",    0.0, 4095.0,  0),
+    "LG":  ("gain (LSB/ns)",   0.0, 10000.0, 3),
+    "LD":  ("damping (ratio)", 0.0, 1000.0,  3),
+    "LTC": ("time_const (s)",  1.0, 600.0,   0),
+    "LFD": ("filter_div (x)",  1.0, 100.0,   0),
+    "LTO": ("tic_offset (V)",  0.0, 3.3,     4),
+    "LPL": ("lock_ns_lim (ns)",1.0, 10000.0, 0),
+    "LPF": ("lock_factor (x)", 1.0, 100.0,   0),
+    "LTK": ("temp_coeff (LSB/ADC step)", -32000.0, 32000.0, 0),
+    "LTR": ("temp_ref (V)",    0.0, 3.3,     4),
 }
 
 # Firmware prints each algo 11 parameter as "<field>=<value>" when queried with
@@ -232,6 +248,49 @@ MLACC_LEVEL_SECS = [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 # so the algo-12 boxes never filled and neither did anything after them in the
 # same pass. Two commands answering to the same field name is a trap worth
 # avoiding rather than ordering around.
+# ------------------------------------------------------------------------------
+# Position redaction for saved logs.
+#
+# A telemetry log is the thing you end up posting on a forum or mailing to
+# whoever offered to measure your board, and every second of it carries the
+# receiver's fix to six decimal places — about ten centimetres. Redacting after
+# the fact works but depends on remembering, and the one time it is forgotten is
+# the time the file is already sent. Doing it at the moment of writing means
+# there is nothing to remember.
+#
+# Two formats carry a position, both from gpsdo_tasks.cpp:
+#   human report   "Lat: 52.766907 Lon: 23.207619 Alt: 149.7m Sat:10 HDOP:TIME"
+#   rotating line  "La 52.76691" / "Lo 23.20762"   (compact displays / RD mode)
+#
+# Altitude goes too. On its own it is weak, but combined with a timezone and a
+# forum post it is not nothing, and nobody reading a phase log needs it.
+# Everything after the coordinates — satellite count, HDOP, the TIME flag — is
+# kept, because that is diagnostic and says nothing about where you are.
+#
+# The substitution keeps the field WIDTH so anything that parses by column still
+# lines up, and it is visibly a redaction rather than a plausible wrong number:
+# a log that quietly claims the wrong position is worse than one that says it
+# was scrubbed.
+_RX_POS_HUMAN = re.compile(
+    r"^(Lat:\s*)-?\d+\.\d+(\s+Lon:\s*)-?\d+\.\d+(\s+Alt:\s*)-?\d+\.?\d*(m\b)")
+_RX_POS_SHORT = re.compile(r"^(La|Lo)\s*-?\d+\.\d+\s*$")
+_RX_POS_ALT   = re.compile(r"^(Al)\s*-?\d+\.?\d*(m\b)")
+
+
+def redact_position(line):
+    """Return the line with any GPS coordinates replaced by placeholders."""
+    m = _RX_POS_HUMAN.match(line)
+    if m:
+        return _RX_POS_HUMAN.sub(
+            lambda k: f"{k.group(1)}--.------{k.group(2)}--.------{k.group(3)}---{k.group(4)}",
+            line)
+    if _RX_POS_SHORT.match(line):
+        return _RX_POS_SHORT.sub(lambda k: f"{k.group(1)} --.-----", line)
+    if _RX_POS_ALT.match(line):
+        return _RX_POS_ALT.sub(lambda k: f"{k.group(1)} ---{k.group(2)}", line)
+    return line
+
+
 MLACC_FIELD_NAMES = {
     "MG":  "m_gain",
     "MR":  "m_run_level",
@@ -243,6 +302,243 @@ MLACC_FIELD_NAMES = {
 # ------------------------------------------------------------------------------
 # Telemetry parser
 # ------------------------------------------------------------------------------
+class RingBuffer:
+    """Fixed-capacity buffer of doubles, stored in one array('d').
+
+    A deque of Python floats costs about 32 bytes a sample once the object
+    header and the pointer are counted. That was invisible at 30 h and 17
+    fields; at a week it measures 406 MB, which is enough to matter on a laptop
+    and simply will not fit a 32-bit interpreter. An array('d') holds the same
+    numbers in 8 bytes each - 82 MB for the same seventeen week-long series.
+
+    The second reason is speed, and it is the one the operator would actually
+    have noticed. refresh_plots ran `list(deque)` on three series every second
+    and scanned the whole time buffer linearly to find the visible window. At
+    108 000 samples that is tolerable; at 604 800 it is roughly 2.4 million
+    Python object touches a second, once a second, forever. Here `tail` slices
+    the array in C and `count_since` is a binary search, because the timestamps
+    are sorted by construction.
+
+    Only what this tool needs is implemented: append, len, logical indexing,
+    tail and clear. It is not a general deque replacement.
+    """
+
+    __slots__ = ("maxlen", "_a", "_start")
+
+    def __init__(self, maxlen):
+        self.maxlen = int(maxlen)
+        self._a = array("d")
+        self._start = 0        # logical index 0 sits here once the ring is full
+
+    def append(self, v):
+        if len(self._a) < self.maxlen:
+            self._a.append(float(v))
+        else:
+            self._a[self._start] = float(v)
+            self._start = (self._start + 1) % self.maxlen
+
+    def clear(self):
+        self._a = array("d")
+        self._start = 0
+
+    def __len__(self):
+        return len(self._a)
+
+    def __bool__(self):
+        return len(self._a) > 0
+
+    def __getitem__(self, i):
+        """Logical index: 0 is the oldest sample held, -1 the newest."""
+        n = len(self._a)
+        if n == 0:
+            raise IndexError("empty")
+        if i < 0:
+            i += n
+        if not (0 <= i < n):
+            raise IndexError(i)
+        return self._a[(self._start + i) % n] if self._start else self._a[i]
+
+    def tail(self, n):
+        """The n newest samples as a list, oldest first."""
+        L = len(self._a)
+        n = max(0, min(int(n), L))
+        if n == 0:
+            return []
+        if self._start == 0:                       # not wrapped: one slice
+            return self._a[L - n:].tolist()
+        end = self._start                          # one past the newest
+        first = end - n
+        if first >= 0:
+            return self._a[first:end].tolist()
+        return self._a[L + first:].tolist() + self._a[:end].tolist()
+
+    def count_since(self, value):
+        """How many of the newest samples are >= value.
+
+        Only meaningful on a non-decreasing series - which the time buffer is,
+        by construction. Binary search over the LOGICAL order, so it costs the
+        same whether the ring has wrapped or not.
+        """
+        n = len(self._a)
+        if n == 0:
+            return 0
+        if self._start == 0:
+            return n - bisect_left(self._a, value)
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self[mid] < value:
+                lo = mid + 1
+            else:
+                hi = mid
+        return n - lo
+
+
+# CSV columns, in the order they are written. This is not "everything the
+# firmware prints" - it is what every analysis of these logs has actually
+# needed, which is a shorter list. Vctl is left out because it is PWM through an
+# RC network and PWM is the exact number; the humidity, pressure and INA rails
+# are left out because across every capture so far they have never moved enough
+# to explain anything. Position is not here at all, so a CSV is redacted by
+# construction whatever the checkbox says.
+CSV_COLUMNS = [
+    # USE utc AS THE TIME AXIS, not up_s. Measured over 75 055 telemetry
+    # blocks: UTC advanced by exactly one second 75 054 times out of 75 054,
+    # while the firmware's uptime counter repeated or skipped a second 118
+    # times (0.16%). The two are printed on the same line by the same task, so
+    # this is the uptime accumulator drifting against the PPS, not a capture
+    # artefact. Both columns are written as received; neither is repaired here,
+    # because a logger that quietly fixes its input is a logger you cannot use
+    # to find this kind of thing.
+    "utc",        # ISO-8601 as the receiver reported it, not the host clock
+    "up_s",       # firmware uptime, seconds - see above
+    "algo",
+    "state",      # ACQ/DPLL/LOCK for algo 10, the trend word otherwise
+    "dph_ns",     # detector phase, sawtooth-corrected
+    "cpu_pct",    # CPU load [%], from the idle-task counter
+    "qerr_ns",    # UBX-TIM-TP sawtooth for this second
+    "vphase_v",   # raw ramp voltage: the only field that shows a railed detector
+    "pwm",
+    "f10", "f100",
+    "ph_ns", "level", "corr", "sig_ns", "zc",   # algorithm 12 diagnostics
+    "bmp_c",      # board sensor, nearest the OCXO
+    "sat", "hdop",
+]
+
+
+class CsvRowBuilder:
+    """Turns the firmware's multi-line telemetry block into one CSV row.
+
+    The block is six lines per second, but its ORDER is not fixed: the sensor
+    line is printed by a different task from the loop line, so a capture from
+    20.08 has BMP last and one from 21.08 has it first. Anything that keyed off
+    "the block starts with X" would silently mis-assign a field the first time
+    the task scheduling shifted.
+
+    So there is no assumed order. Each line type contributes a disjoint set of
+    keys, and a row is closed the moment a line tries to write a key that is
+    already set - which can only mean the next second has begun. Lines that
+    carry no telemetry (banners, CLI replies) contribute nothing and cannot
+    close a row.
+    """
+
+    def __init__(self):
+        self.row = {}
+
+    # -- per-line extraction, one method's worth of regexes ------------------
+    @staticmethod
+    def _parse(line):
+        got = {}
+        m = re.search(r"Up:\s*(\d+)d\s*(\d+):(\d+):(\d+)", line)
+        if m:
+            d, h, mi, sec = (int(x) for x in m.groups())
+            got["up_s"] = d * 86400 + h * 3600 + mi * 60 + sec
+            u = re.search(r"UTC:\s*(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+)", line)
+            if u:
+                dd, mm, yy, hh, mn, ss = (int(x) for x in u.groups())
+                got["utc"] = "%04d-%02d-%02dT%02d:%02d:%02dZ" % (yy, mm, dd, hh, mn, ss)
+            return got
+        if line.startswith("Lat:"):
+            m = re.search(r"Sat:\s*(\d+)", line)
+            if m: got["sat"] = int(m.group(1))
+            # HDOP is not always a number: a LEA-T that has finished survey-in
+            # prints HDOP:TIME, and that is the more useful of the two facts —
+            # it is the mode in which the 1PPS is worth trusting. Written
+            # through as the firmware said it, so a reader gets the flag rather
+            # than a blank; parse this column with errors="coerce".
+            m = re.search(r"HDOP:\s*(\S+)", line)
+            if m: got["hdop"] = m.group(1)
+            return got
+        if line.startswith("Freq:"):
+            m = re.search(r"\b10s:\s*([\d.]+)", line)
+            if m: got["f10"] = m.group(1)
+            m = re.search(r"\b100s:\s*([\d.]+)", line)
+            if m: got["f100"] = m.group(1)
+            return got
+        if line.startswith("PWM:"):
+            m = re.search(r"PWM:\s*(\d+)", line)
+            if m: got["pwm"] = m.group(1)
+            # The trend word sits at the end of this line. "___" means the loop
+            # has nothing to say, and an empty cell says that better.
+            m = re.search(r"V\s+(\S+)\s*$", line)
+            if m and m.group(1) != "___":
+                got["_trend"] = m.group(1)
+            return got
+        if line.startswith("Learn:"):
+            m = re.search(r"algo=(\d+)", line)
+            if m: got["algo"] = m.group(1)
+            m = re.search(r"state=(\w+)", line)
+            if m: got["_state"] = m.group(1)
+            for key, pat in (("qerr_ns", r"qErr=(-?[\d.]+)ns"),
+                             ("ph_ns",   r"\bph=(-?[\d.]+)ns"),
+                             ("level",   r"\blevel=(\d+)"),
+                             ("corr",    r"\bcorr=(\d+)"),
+                             ("sig_ns",  r"\bsig=([\d.]+)ns"),
+                             ("zc",      r"\bzc=(\d+)")):
+                m = re.search(pat, line)
+                if m: got[key] = m.group(1)
+            # A Learn line with qErr=(wait) still marks a second; keep the key
+            # so the row closes on the next one.
+            if "algo" in got or "_state" in got:
+                got.setdefault("_learn", "1")
+            return got
+        if line.startswith("BMP:"):
+            m = re.search(r"BMP:\s*(-?[\d.]+)C", line)
+            if m: got["bmp_c"] = m.group(1)
+            m = re.search(r"Vphase:\s*([\d.]+)V", line)
+            if m: got["vphase_v"] = m.group(1)
+            m = re.search(r"dph:\s*(-?[\d.]+)ns", line)
+            if m: got["dph_ns"] = m.group(1)
+            m = re.search(r"CPU:\s*(\d+)%", line)
+            if m: got["cpu_pct"] = m.group(1)
+            return got
+        return got
+
+    def feed(self, line):
+        """Consume one telemetry line; return a finished row, or None."""
+        got = self._parse(line)
+        if not got:
+            return None
+        out = None
+        if any(k in self.row for k in got):
+            out = self.flush()
+        self.row.update(got)
+        return out
+
+    def flush(self):
+        """Close the row in hand. Returns a list of strings, or None if empty."""
+        r = self.row
+        self.row = {}
+        if not r:
+            return None
+        # The state column has two possible sources and they do not overlap:
+        # algorithm 10 names its stage on the Learn line, everything else only
+        # has the trend word on the PWM line.
+        state = r.get("_state") or r.get("_trend") or ""
+        r["state"] = state
+        return [str(r.get(c, "")) for c in CSV_COLUMNS]
+
+
 class TelemetryParser:
     """Pulls numeric fields out of the firmware's serial lines.
 
@@ -253,7 +549,7 @@ class TelemetryParser:
     """
 
     # Live telemetry fields -> label used on plots / spin boxes
-    LIVE_FIELDS = ["Vphase", "Vctl", "dph", "qErr", "PWM", "drift", "damp",
+    LIVE_FIELDS = ["CPU", "Vphase", "Vctl", "dph", "qErr", "PWM", "drift", "damp",
                    "scale", "phase",
                    # Algorithm 12: the phase it accumulates (ns), which level
                    # last acted, and the cumulative correction count.
@@ -268,41 +564,82 @@ class TelemetryParser:
         m = re.search(pattern, line, re.IGNORECASE)
         return float(m.group(1)) if m else None
 
-    # What each loop state means, shown beside the label so the reader does not
-    # have to know the firmware. Algorithm 12 has its own vocabulary: it holds in
-    # several distinct ways and saying which one matters when nothing is moving.
+    # What each trend word means, shown beside the label so the reader does not
+    # have to know the firmware. Not a filter — see parse_state: a word missing
+    # from this table is displayed without a hint, never dropped.
     STATE_HINT = {
-        "LOCK":   "locked",
-        "DPLL":   "phase tracking",
-        "PLL":    "phase tracking",
-        "ACQ":    "acquiring",
-        "SURVEY": "survey-in",
-        "WARMUP": "OCXO warming",
-        "HOLD":   "holdover",
-        "CORR":   "correction applied",
-        "NOPH":   "holding - detector not reading",
-        "NoCT":   "holding - run CT first",
-        "NoLT":   "algo 12 needs the LTIC detector",
-        "WAIT":   "waiting for frequency data",
+        # LTIC loops (algorithms 10 and 11)
+        "ACQ":      "acquiring",
+        "DPLL":     "phase tracking (algo 10)",
+        "PLL":      "phase tracking (algo 11)",
+        "LOCK":     "locked",
+        # algorithm 12 holds in several distinct ways and saying which one
+        # matters when nothing is moving
+        "WAIT":     "waiting for frequency data",
+        "SYNC":     "settling after the divider armed",
+        "FLL":      "detector railed - frequency pull-in",
+        "NOPH":     "holding - detector not reading",
+        "NoPL":     "holding - set LPOL first",
+        "NoCT":     "holding - run CT first",
+        "CORR":     "correction applied",
+        "ZC":       "zero-crossing cancellation",
+        "STAL":     "phase not answering - divider re-armed",
+        # algorithm 13 (Kalman)
+        "KAL":      "filter tracking",
+        "ARM":      "detector not following - divider re-armed",
+        "REJ":      "reading rejected by the innovation gate",
+        "HOLD":     "holdover - steering from the model",
+        # algorithms 0-9
+        "hit":      "on target",
+        "HYB":      "hybrid FLL+PLL blend",
+        "f+":       "frequency high - stepping down",
+        "f-":       "frequency low - stepping up",
+        "c+":       "coarse step up",
+        "c-":       "coarse step down",
+        "p+":       "phase step up",
+        "p-":       "phase step down",
+        "uf+":      "micro step up",
+        "uf-":      "micro step down",
+        "vf+":      "very fine step up",
+        "vf-":      "very fine step down",
+        # not a loop state at all
+        "HOLDOVER": "no GPS - free running",
     }
 
     def parse_state(self, line):
         """Loop state from the PWM/Vctl telemetry line, e.g. '... LOCK'.
 
-        The algorithm-12 states were missing here, so parse_state returned None
-        for them and the display kept showing whatever it had last recognised —
-        the telemetry said NOPH while the tuner still read ACQ. A state the
-        firmware can report and the tuner cannot name is worse than no state at
-        all, because it looks like information.
+        READ THE FIELD, DO NOT SEARCH FOR A VOCABULARY. This used to scan the
+        whole line for a list of known words, and the list could not keep up:
+        the firmware emits SYNC, FLL, ZC, HYB, NoPL, hit and ten direction words
+        like 'uf+' that were never in it, so on those seconds parse_state
+        returned None and the label went on showing whatever it had last
+        recognised. Under algorithm 12 that meant the panel read LOCK through
+        every CORR and ZC second — a stale state that looks like information,
+        which is exactly the failure the previous version of this docstring
+        claimed to have fixed for a different set of words.
+
+        Worse, the search was not anchored, so any of those words appearing
+        anywhere in any line could set the state.
+
+        The trend is a FIELD: it is the last token of the PWM line, and in
+        holdover the firmware replaces it with [HOLDOVER] outright. Taking it
+        by position means a word the firmware invents tomorrow is displayed
+        verbatim instead of being silently dropped, and nothing else on the wire
+        can be mistaken for it. Returns None for any other line, so the caller
+        keeps the last value exactly as before.
         """
-        # DPLL must be tested before PLL: "DPLL" contains "PLL", and \b would
-        # otherwise let the shorter algo-11 label match an algo-10 line. NoCT and
-        # NoLT differ only in one letter, so both are listed explicitly.
-        for st in ("LOCK", "DPLL", "PLL", "ACQ", "SURVEY", "WARMUP", "HOLD",
-                   "NOPH", "NoCT", "NoLT", "CORR", "WAIT"):
-            if re.search(r"\b" + st + r"\b", line):
-                return st
-        return None
+        if not line.startswith("PWM:"):
+            return None
+        if "[HOLDOVER]" in line:
+            return "HOLDOVER"
+        m = re.search(r"V\s+(\S+)\s*$", line)
+        if not m:
+            return None
+        st = m.group(1)
+        # "___" is the firmware saying it has nothing to report; an empty label
+        # says that better than three underscores do.
+        return "" if st.startswith("_") else st
 
     def parse_freq(self, line):
         """Best available frequency estimate from a 'Freq:' line."""
@@ -409,10 +746,23 @@ class SerialWorker(QThread):
         self._running = False
 
     def run(self):
-        try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
-        except serial.SerialException as e:
-            self.connection_changed.emit(False, str(e))
+        # Windows: after a board RESET the USB CDC device re-enumerates, and
+        # the first port open inside that window fails (access denied / stale
+        # name) — the user had to press Connect twice. Three attempts with a
+        # pause covers the whole re-enumeration; a genuinely absent port
+        # still fails on the third try with the real error.
+        self.ser = None
+        err = None
+        for attempt in range(3):
+            try:
+                self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+                break
+            except serial.SerialException as e:
+                err = e
+                if attempt < 2:
+                    self.msleep(1000)
+        if self.ser is None:
+            self.connection_changed.emit(False, str(err))
             return
         self._running = True
         self.connection_changed.emit(True, self.port)
@@ -450,10 +800,18 @@ class SerialWorker(QThread):
 # Main window
 # ------------------------------------------------------------------------------
 class GpsdoTuner(QMainWindow):
-    # 30 h at 1 Hz telemetry: enough headroom to scroll back through a full
-    # 24-hour acquisition and still hold the run-up to it. Costs a few MB of
-    # host RAM, which is free on a PC; the firmware is unaffected either way.
-    MAXPTS = 108000
+    # One week at 1 Hz telemetry. This began as a tuning tool and 30 h was
+    # chosen to cover an overnight acquisition, but it is being used as a
+    # logger, and a stability run that ends because the buffer wrapped is a run
+    # that has to be repeated. A week covers a full thermal cycle of a room,
+    # a weekend of nobody touching the bench, and the tau=100 000 s end of an
+    # ADEV plot.
+    #
+    # It is affordable only because the buffers are arrays of doubles rather
+    # than deques of Python floats: 82 MB for seventeen full week-long series
+    # against 406 MB measured for the same data as objects. See RingBuffer.
+    # Nothing is preallocated, so a five-minute session still costs kilobytes.
+    MAXPTS = 604800
 
     def __init__(self):
         super().__init__()
@@ -470,13 +828,18 @@ class GpsdoTuner(QMainWindow):
 
         # rolling data buffers
         self.t0 = time.time()
-        self.data = defaultdict(lambda: deque(maxlen=self.MAXPTS))
-        self.tbuf = deque(maxlen=self.MAXPTS)
+        self.data = defaultdict(lambda: RingBuffer(self.MAXPTS))
+        self.tbuf = RingBuffer(self.MAXPTS)
         self.last_state = "?"
         self._active_algo = None   # set from telemetry; toggles LTIC tab sections
         self._logfile = None       # open handle while logging to file, else None
+        self._log_redacting = True # latched from the checkbox when a file opens
         self._log_path = ""
         self._log_lines = 0
+        self._csvfile = None       # open handle while writing CSV, else None
+        self._csv_path = ""
+        self._csv_rows = 0
+        self._csv = CsvRowBuilder()
         self._monitor_lines = 0
         self._ll_buf = []
         self._ll_active = False
@@ -591,9 +954,12 @@ class GpsdoTuner(QMainWindow):
         for p in (self.plot_phase, self.plot_vph, self.plot_freq):
             p.showGrid(x=True, y=True, alpha=0.3)
             p.setLabel("bottom", "time", units="s")
-        self.curve_phase = self.plot_phase.plot(pen=pg.mkPen("#22aa44", width=2))
-        self.curve_vph = self.plot_vph.plot(pen=pg.mkPen("#2277cc", width=2))
-        self.curve_freq = self.plot_freq.plot(pen=pg.mkPen("#cc7722", width=2))
+        self.curve_phase = self.plot_phase.plot(
+            pen=pg.mkPen("#22aa44", width=2), connect="finite")
+        self.curve_vph = self.plot_vph.plot(
+            pen=pg.mkPen("#2277cc", width=2), connect="finite")
+        self.curve_freq = self.plot_freq.plot(
+            pen=pg.mkPen("#cc7722", width=2), connect="finite")
 
         # Dragging or wheeling a plot means the operator wants to look at
         # something, so stop following rather than fighting them for the axis.
@@ -674,12 +1040,31 @@ class GpsdoTuner(QMainWindow):
             g.addWidget(QLabel(stage), row, 0)
             for c, k in enumerate(("Kp", "Ki", "Kd", "IL"), start=1):
                 box = self._spin(0.0, 100000.0, 4, 0.1)
+                # ACQ reads Kp and I-limit and nothing else: its branch in
+                # ltic_three_stage() never touches Ki or Kd, and the centring
+                # pull is a separate global set by ACG. Greyed rather than
+                # hidden, so the readback still shows what the board holds —
+                # you can see the number, you just cannot be misled into
+                # tuning it. Apply still sends all four, because the firmware
+                # accepts and stores them and a partial group would look like
+                # a fault here.
+                if stage == "ACQ" and k in ("Ki", "Kd"):
+                    box.setEnabled(False)
+                    box.setToolTip("ACQ does not read this — the centring "
+                                   "pull is the ACG command")
                 self.ltic_boxes[(stage, k)] = box
                 g.addWidget(box, row, c)
             btn = QPushButton("Apply")
             btn.clicked.connect(lambda _, s=stage: self.apply_ltic_stage(s))
             g.addWidget(btn, row, 5)
             row += 1
+            if stage == "ACQ":
+                n = QLabel("ACQ uses Kp and I-limit only — Ki/Kd are inert; "
+                           "the centring pull is the ACG command")
+                n.setStyleSheet(
+                    f"color:{theme_colours(w)['muted']}; font-size:11px;")
+                g.addWidget(n, row, 1, 1, 5)
+                row += 1
 
         read_btn = QPushButton("Read from device (LL)")
         read_btn.clicked.connect(lambda: self.worker.send("LL"))
@@ -854,10 +1239,15 @@ class GpsdoTuner(QMainWindow):
         return w
 
     def absorb_algo12_limit(self, line):
-        """Fill one limit box from 'lim[6]=32350 (126 ns over 128s)'."""
+        """Fill one limit box from 'lim[6]=126ns (32350 units over 128s)'."""
         # Two formats reach here, because MLP and ML print differently:
-        #   MLP n  ->  "lim[6]=32350 (126 ns over 128s)"
-        #   ML     ->  "     6:   128s    32350 =  126 ns"
+        #   MLP n  ->  "lim[6]=126ns (32350 units over 128s)"
+        #   ML     ->  "     6:   128s    126 ns =   32350 units"
+        # Both lead with the NANOSECONDS, which is what the boxes hold. The
+        # firmware printed the raw accumulator units first until the ns
+        # conversion; the patterns below take the first number after the "=",
+        # so they were right before and are right now, but the examples above
+        # described the old format for long enough to be worth correcting.
         # Matching only the first meant the ML reply — the one the tuner sends on
         # connect — filled nothing, and the table stayed at zeros.
         m = re.search(r"\blim\[(\d+)\]\s*=\s*(\d+)", line)
@@ -921,15 +1311,38 @@ class GpsdoTuner(QMainWindow):
 
         sections = [
             ("General", [
-                ("V",           "Version, authors and links"),
+                ("V",           "Version, authors and links - and the CRC-32 of"),
+                ("",            "  the flash image, computed at boot from the flash"),
+                ("",            "  itself. Unlike the compile timestamp it cannot be"),
+                ("",            "  stale: the Arduino builder reuses object files, so"),
+                ("",            "  a sketch that has not been edited keeps an older"),
+                ("",            "  date. When a log and a memory disagree, this is"),
+                ("",            "  the number to trust."),
                 ("H / ?",       "Firmware help (H TZ for timezone details)"),
-                ("SW",          "Stack watermarks (FreeRTOS diagnostic)"),
+                ("SW",          "Stack watermarks, heap, uptime source, MCU ppm -"),
+                ("",            "  and CPU load PER TASK, busiest first, averaged"),
+                ("",            "  over a real 100 s window of one-second buckets."),
+                ("",            "  Measured on the Cortex-M4 cycle counter at every"),
+                ("",            "  context switch, so it is exact rather than"),
+                ("",            "  sampled. Interrupt time lands on whichever task"),
+                ("",            "  was interrupted: read it as 'the processor was"),
+                ("",            "  here', not 'this task used this'."),
                 ("RB",          "Reboot (warm — settings kept)"),
                 ("CR YES",      "Cold restart: wipe the flash ring, factory defaults"),
             ]),
             ("Reporting", [
                 ("RH / RD",     "Report format: human readable / tab delimited"),
                 ("RP / RR",     "Report pause / resume"),
+                ("TAB / ESC",   "Pause or resume the telemetry with one key."),
+                ("",            "  Same as RP / RR, but you do not have to get a"),
+                ("",            "  command in edgeways while reports scroll past."),
+                ("",            "  A bare ESC toggles; ESC followed by [ or O is"),
+                ("",            "  an arrow key and is ignored."),
+                ("TL 0|1",      "Per-task CPU load on the telemetry line, as a"),
+                ("",            "  TL: field at the end of the sensor row. Off at"),
+                ("",            "  every boot and never stored - it is a bench"),
+                ("",            "  diagnostic, not a setting. SW shows the same"),
+                ("",            "  numbers once without turning the line on."),
                 ("F",           "Flush the frequency ring buffers"),
                 ("T [baud]",    "GPS tunnel on USB for u-center (300 s)"),
                 ("CS",          "Correction statistics: RMS of the loop's own"),
@@ -946,23 +1359,38 @@ class GpsdoTuner(QMainWindow):
             ]),
             ("Discipline mode", [
                 ("MH / MD",     "Mode holdover / mode disciplined"),
-                ("LA <0-12>",   "Loop algorithm select. 10 = LTIC 3-stage,"),
-                ("",            "  11 = LTIC-Lars, 12 = multi-level accumulator"),
+                ("LA <0-13>",   "Loop algorithm select. 10 = LTIC 3-stage,"),
+                ("",            "  11 = LTIC-Lars, 12 = multi-level accumulator,"),
+                ("",            "  13 = Kalman (phase, frequency, aging)"),
                 ("SP <n>",      "Set the PWM DAC directly (1-65535) — manual override."),
                 ("",            "  A whole-LSB intent, so it clears the fine fraction"),
                 ("",            "  (see DAC). CT, LC, the ramps and holdover do too."),
-                ("DAC",         "Control-voltage output: which path is driving the pin,"),
+                ("DAC",         "No argument: report. Which path is driving the pin,"),
                 ("",            "  the 24-bit code beside the 16-bit view the displays"),
                 ("",            "  and the flash ring use, the fraction between them,"),
-                ("",            "  and one step expressed in uHz and fractional"),
-                ("",            "  frequency for both widths."),
+                ("",            "  one step in uHz and fractional frequency for both"),
+                ("",            "  widths, and the commanded Vctl beside the measured"),
+                ("",            "  one. They are compared: more than half a volt apart"),
+                ("",            "  and it says so, because that is the only evidence"),
+                ("",            "  the firmware has that the jumper and the setting"),
+                ("",            "  disagree. It cannot see the jumper."),
+                ("DAC PWM",     "Select the output path. All three are compiled in;"),
+                ("DAC DITH",    "  the JUMPERS switch the signal and this tells the"),
+                ("DAC EXT",     "  firmware which path it is steering, so the step"),
+                ("",            "  size, the telemetry and the fine path describe what"),
+                ("",            "  is actually connected. Auto-saved (ES ALGO)."),
+                ("",            "  Unset defaults to DITH. PWM and DITH share PB9, so"),
+                ("",            "  choosing PWM does not tear the DMA down - it writes"),
+                ("",            "  the same code with the low 8 bits cleared, which is"),
+                ("",            "  the same voltage plain PWM gave. That makes a"),
+                ("",            "  dither on/off comparison a command, not a reflash."),
                 ("",            "  'fine: ACTIVE' means a correction smaller than one"),
                 ("",            "  16-bit step is applied rather than truncated away."),
                 ("",            "  That matters more than it sounds: the truncation it"),
                 ("",            "  replaces discarded such a correction ENTIRELY, not"),
                 ("",            "  partly, because rounding back to the same code also"),
-                ("",            "  skipped the write. Needs the dithered PWM or an"),
-                ("",            "  external DAC compiled in; on plain PWM it says so."),
+                ("",            "  skipped the write. It follows the ACTIVE path -"),
+                ("",            "  selecting PWM really does give the resolution up."),
                 ("",            "  The Hz figures need CT — without it the resolution"),
                 ("",            "  is real but its meaning in frequency is unknown,"),
                 ("",            "  and the command says that instead of guessing."),
@@ -976,7 +1404,13 @@ class GpsdoTuner(QMainWindow):
                 ("LL",          "List all LTIC parameters and state"),
                 ("LNV / LZO / LRN", "Calibration: ns per volt, zero-offset V, range ns"),
                 ("LPOL [-1/0/1]", "PWM->phase polarity (0 = auto-detect)"),
-                ("SAW 0|1",     "Sawtooth (qErr) correction on/off"),
+                ("SAW 0|1",     "Sawtooth (qErr) correction on/off. With no argument"),
+                ("",            "  it also reports the receiver's own mode bit and how"),
+                ("",            "  often the paired lookup found its pulse. A paired"),
+                ("",            "  count near the total means TIM-TP arrives before"),
+                ("",            "  the pulse it describes, as the datasheet says; near"),
+                ("",            "  zero means the frames are late on that module and"),
+                ("",            "  the correction is being SKIPPED, not misapplied."),
             ]),
             ("PID algorithms 3-9", [
                 ("LP [n]",      "List PID parameters (algo n, or the current one)"),
@@ -986,13 +1420,18 @@ class GpsdoTuner(QMainWindow):
                 ("IL n val",    "Set I_LIMIT for algo n"),
                 ("BC / BS",     "Algo 8 blend crossover / blend scale (Hz)"),
                 ("NS [val]",    "Algo 9 neural-net max step (LSB)"),
-                ("LRN 0|1|R",   "Self-learning drift/damping (R = reset)"),
             ]),
             ("Algorithm 10 — LTIC 3-stage", [
-                ("AQP/AQI/AQD/AQL", "ACQ stage PID: Kp / Ki / Kd / I_LIMIT"),
+                ("AQP / AQL",   "ACQ stage: Kp and I_LIMIT — the two it reads"),
+                ("AQI / AQD",   "ACQ Ki / Kd — STORED BUT INERT. The ACQ branch"),
+                ("",            "  uses Kp only; the centring pull is ACG."),
                 ("DPP/DPI/DPD/DPL", "DPLL stage PID: Kp / Ki / Kd / I_LIMIT"),
                 ("LKP/LKI/LKD/LKL", "LOCK stage PID: Kp / Ki / Kd / I_LIMIT"),
                 ("LAT / LDT / LIV", "ACQ threshold, DPLL->LOCK threshold, LOCK interval s"),
+                ("FA / FAD / FAL", "Damping average window, seconds: both stages / DPLL"),
+                ("",            "  only / LOCK only. 10, 100 or 1000; 100 is the"),
+                ("",            "  default and is bit-for-bit the raw frequency"),
+                ("",            "  error, so shortening one is a deliberate act."),
                 ("LCV [V]",     "ACQ centring target (0 = range middle)"),
                 ("ACG g [cap]", "ACQ centring drive: LSB per volt and max step"),
             ]),
@@ -1001,27 +1440,36 @@ class GpsdoTuner(QMainWindow):
                 ("LD [val]",    "Damping"),
                 ("LTC [s]",     "Loop time constant (1-600 s)"),
                 ("LFD [n]",     "Filter divisor — pre-filter constant = LTC / this"),
-                ("LTO [adc]",   "TIC offset: phase target in ADC counts"),
+                ("LTO [V]",     "TIC offset: phase target, in VOLTS. Stored as ADC"),
+                ("",            "  counts; the reply prints both. This is the same"),
+                ("",            "  physical point as LZO on algo 10 — if the two"),
+                ("",            "  disagree, the loops are aiming at different zeros."),
                 ("LPL [ns]",    "Lock phase limit — the window width"),
                 ("LPF [n]",     "Lock factor: window must hold for LPF x LTC seconds"),
                 ("LTK [val]",   "Temperature coefficient feed-forward (0 = off)"),
-                ("LTR [adc]",   "Temperature reference, ADC counts"),
+                ("LTR [V]",     "Temperature reference, in VOLTS (stored as counts)"),
                 ("",            "  Trend: ACQ = frequency-led, PLL = phase, LOCK = locked"),
             ]),
             ("Algorithm 12 — multi-level accumulator", [
                 ("MG [v]",      "Gain, LSB per ns. 0 = derive it from the CT"),
                 ("",            "  calibration, which is usually what you want."),
+                ("",            "  NOT the same quantity as algo 11's LG, even"),
+                ("",            "  though both print 'LSB per ns'. Copying LG"),
+                ("",            "  here cost a 2.3 h limit cycle on 26.08"),
+                ("",            "  (2.130 typed against a measured 31.3). The"),
+                ("",            "  board now says so if the two disagree."),
                 ("MR [n]",      "Force a correction once level n is reached,"),
-                ("",            "  whatever the limits say (default 9 = 1024 s)."),
+                ("",            "  whatever the limits say (default 7 = 256 s)."),
                 ("MLP <n> [ns]","Phase limit for level n. Without a value it"),
                 ("",            "  prints the current one."),
                 ("MF [0-3]",    "Where the limits come from, INDEPENDENTLY of MG:"),
-                ("",            "  0 follow MG (as before), 1 stored table,"),
+                ("",            "  0 default (= 2), 1 stored table,"),
                 ("",            "  2 sigma formula, 3 measured. The gain belongs"),
                 ("",            "  to the oscillator, the limits to the site's"),
-                ("",            "  phase noise; they were welded together until"),
-                ("",            "  now, so 'measured gain, hand-set limits' -"),
-                ("",            "  what a noisy install wants - was unaskable."),
+                ("",            "  phase noise. 0 used to mean 'follow MG', so"),
+                ("",            "  typing a gain silently swapped the limit"),
+                ("",            "  table too; that coupling is gone. Ask for the"),
+                ("",            "  hand-edited MLP table with MF 1."),
                 ("MFT [s]",     "MF 3 only: how long between corrections that"),
                 ("",            "  noise alone triggers. Every per-level"),
                 ("",            "  multiplier follows from it. Default 3600."),
@@ -1047,15 +1495,44 @@ class GpsdoTuner(QMainWindow):
                 ("",  "UNTUNED: only the 128 s limit was ever derived (125 ns,"),
                 ("",  "from the 10 MHz +/-0.01 Hz specification). Alan calls the"),
                 ("",  "rest arbitrary, so they are exposed for editing."),
-                ("",  "Trend shows CORR at a correction, ACQ for the first"),
-                ("",  "64 s, LOCK after. NoCT means CT has not run."),
+                ("",  "Trend vocabulary: WAIT (no data yet), SYNC (5 s"),
+                ("",  "settle after the divider arms), FLL (detector railed,"),
+                ("",  "frequency pull-in), NOPH (no valid phase, PWM frozen),"),
+                ("",  "NoPL (set LPOL first), NoCT (run CT first), ACQ, LOCK,"),
+                ("",  "and CORR / ZC on the seconds a correction or a"),
+                ("",  "zero-crossing cancellation is applied. Brief CORR and ZC"),
+                ("",  "flashes are normal and healthy - a correcting loop is a"),
+                ("",  "working loop."),
+            ]),
+            ("Algorithm 13 — Kalman filter", [
+                ("KL",          "List the filter state: the phase, frequency and"),
+                ("",            "  aging it believes, how well it believes them,"),
+                ("",            "  what R and Q it has measured, and how many"),
+                ("",            "  readings the innovation gate threw away."),
+                ("KR [ns]",     "Measurement noise. 0 = measure it from the"),
+                ("",            "  detector's own first differences (the default,"),
+                ("",            "  and what you want). Set it only to pin the"),
+                ("",            "  filter for an experiment."),
+                ("KQ [v]",      "Process noise, (ns/s)^2 per s. 0 = adapt it from"),
+                ("",            "  the innovation sequence (the default)."),
+                ("KT [s]",      "Phase horizon: how quickly the control nulls the"),
+                ("",            "  estimated phase. Default 100 s. Shorter follows"),
+                ("",            "  GPS harder, longer leans on the oscillator."),
+                ("",            "  Also sets the patience of the stall check:"),
+                ("",            "  five horizons far out and the picDIV is re-armed."),
+                ("",            "  KR/KQ/KT are saved on entry, in their own flash"),
+                ("",            "  ring record — no ES needed."),
+                ("",            "Holdover needs no setting: with no phase the"),
+                ("",            "  filter stops updating and keeps steering from"),
+                ("",            "  frequency and aging. The trend shows HOLD."),
+                ("",            ""),
             ]),
             ("Storage (flash ring)", [
-                ("ES [obj]",    "Save settings. Group: TZ / PID / LTIC / FLAGS / ALGO / ALGO12 / PO"),
+                ("ES [obj]",    "Save settings. Group: TZ / PID / LTIC / FLAGS / ALGO12 / ALGO / PO"),
                 ("ER",          "Recall settings from the ring"),
                 ("EE",          "Erase settings (back to defaults)"),
                 ("EW",          "Flash wear stats: erase cycles and slots used"),
-                ("FR 0|1",      "Flash ring on/off"),
+                ("FR",          "Flash ring status (always on since v0.96; see EW)"),
             ]),
             ("GPS and environment", [
                 ("SV <0|1>",    "Survey-in / Time Mode on a timing receiver"),
@@ -1215,13 +1692,47 @@ class GpsdoTuner(QMainWindow):
         # Continuous logging rather than a buffer dump. The monitor keeps only the
         # last 2000 lines — under five minutes at the telemetry rate — so a "save
         # what is on screen" button would quietly hand back five minutes of a
-        # thirty-hour test. Writing each line as it arrives captures the whole
+        # week-long test. Writing each line as it arrives captures the whole
         # session, costs no memory, and leaves the data on disk if the tool or the
         # machine falls over mid-run.
         self.log_btn = QPushButton("Start logging")
         self.log_btn.setToolTip("Write every received line to a .log file next to this script")
         self.log_btn.clicked.connect(self.toggle_logging)
         row.addWidget(self.log_btn)
+
+        # Redaction is a property of the FILE, so it is fixed when the file is
+        # opened and the box is disabled until logging stops. Letting it change
+        # mid-run would produce a log that is redacted in parts — which reads as
+        # redacted at a glance and is not, and that is the worst of the three
+        # possible states. Checked by default: a log with no coordinates in it
+        # loses nothing anyone analysing a phase record needs, while the reverse
+        # mistake cannot be undone once the file is sent.
+        self.log_redact = QCheckBox("Redact position")
+        self.log_redact.setChecked(True)
+        self.log_redact.setToolTip(
+            "Replace Lat / Lon / Alt with placeholders in the SAVED FILE.\n"
+            "The Raw monitor and the plots are untouched — this only affects\n"
+            "what goes to disk. Satellite count, HDOP and the TIME flag are\n"
+            "kept; they are diagnostic and say nothing about where you are.\n"
+            "Fixed when logging starts, so a file is wholly one or the other.")
+        row.addWidget(self.log_redact)
+
+        # What to write, not merely whether to write. A week of full telemetry
+        # is about 217 MB and a week of the CSV about 60, and someone leaving a
+        # seven-day capture running usually wants the columns rather than the
+        # transcript. Making CSV a tick-box beside the log would have forced
+        # them to take both. Latched with the file, like redaction, for the same
+        # reason: a file that is one format in its first half and another in its
+        # second is not a file anyone can load.
+        self.log_mode = QComboBox()
+        self.log_mode.addItems(["Full log", "CSV only", "Both"])
+        self.log_mode.setToolTip(
+            "Full log  - every received line, exactly as printed (~217 MB/week)\n"
+            "CSV only  - one row per second, analysis columns only (~60 MB/week)\n"
+            "Both      - the same capture written twice, .log and .csv\n\n"
+            "The CSV carries no position at any setting: there is no column for\n"
+            "it. Fixed when logging starts.")
+        row.addWidget(self.log_mode)
 
         tzb = QPushButton("Generate tz_table.h")
         tzb.setToolTip("Rebuild the timezone table from this machine's IANA tzdata")
@@ -1318,6 +1829,7 @@ class GpsdoTuner(QMainWindow):
     def _plot_family(self):
         if self._active_algo in (10, 11): return "ltic"
         if self._active_algo == 12:        return "mlacc"
+        if self._active_algo == 13:        return "kalman"
         return "pid"
 
     def _apply_plot_series(self):
@@ -1337,7 +1849,7 @@ class GpsdoTuner(QMainWindow):
         self._series_mid = fam[1][0]
         # The Vphase band guides only mean anything against the detector trace,
         # so they come down when that pane is showing a control voltage instead.
-        show_guides = (self._plot_family() == "ltic")
+        show_guides = (self._series_mid == "Vphase")
         for attr in ("vph_anchor", "vph_lo", "vph_hi"):
             ln = getattr(self, attr, None)
             if ln is not None:
@@ -1439,11 +1951,28 @@ class GpsdoTuner(QMainWindow):
 
         if self._logfile is not None:
             try:
-                self._logfile.write(line + "\n")
+                # Only the file is redacted. The monitor below and every plot
+                # still see the real line — the operator is looking at their own
+                # screen and wants their own fix on it.
+                self._logfile.write(
+                    (redact_position(line) if self._log_redacting else line) + "\n")
                 self._log_lines += 1
             except OSError as e:
                 self._stop_logging()
                 self.monitor.append(f"*** logging failed, stopped: {e}")
+        if self._csvfile is not None:
+            # One row per telemetry block, emitted when the NEXT block starts —
+            # so the file always trails real time by one second. That is the
+            # price of not guessing where a block ends, and a second of lag in a
+            # week-long capture is not a price.
+            try:
+                r = self._csv.feed(line)
+                if r is not None:
+                    self._csvfile.write(",".join(r) + "\n")
+                    self._csv_rows += 1
+            except OSError as e:
+                self._stop_logging()
+                self.monitor.append(f"*** CSV write failed, stopped: {e}")
 
         # raw monitor — keep it bounded without touching cursor enums (which
         # differ between Qt5/Qt6 bindings). Once it grows past the cap, drop the
@@ -1452,7 +1981,7 @@ class GpsdoTuner(QMainWindow):
         self._monitor_lines += 1
         # Trim in blocks, not on every line. Rebuilding the document costs O(n),
         # so doing it once per line past the cap meant several full rebuilds per
-        # second — for thirty hours that is close to a million of them. Letting it
+        # second — over a week that is six hundred thousand of them. Letting it
         # overshoot to 2500 before cutting back to 1500 does the same job for a
         # fraction of the work, and the operator cannot see the difference.
         if self._monitor_lines > 2500:
@@ -1465,26 +1994,47 @@ class GpsdoTuner(QMainWindow):
             sb.setValue(sb.maximum())
 
         # live numeric fields
-        now = time.time() - self.t0
-        got_any = False
+        #
+        # ONE TIME SAMPLE PER TELEMETRY SECOND, not one per line that happened to
+        # carry a field. The old rule appended to the shared time buffer whenever
+        # any field parsed, which is four of the six lines in a block — so the
+        # time axis filled about four times as fast as any individual series, and
+        # series() paired the newest 1725 phase samples with the newest 1725
+        # TIMESTAMPS, which covered only the last quarter of that span. Every
+        # plot in this tool has therefore been squashed 4:1 along X, and the
+        # "30 h" buffer was 30 h of phase against 7.5 h of clock. Measured on the
+        # 21.08 capture: 1725 telemetry seconds, 6872 time samples.
+        #
+        # The Up: line is printed exactly once a second by every algorithm, so it
+        # is the tick. Fields are then padded forward to it, which keeps every
+        # series the same length as the axis by construction rather than by
+        # coincidence.
+        if line.startswith("Up:"):
+            self.tbuf.append(time.time() - self.t0)
         for field in ("Vphase", "Vctl", "dph", "PWM", "drift", "damp", "qErr",
-                      "scale", "phase", "ph", "level", "corr", "arm", "sig", "zc"):
+                      "scale", "phase", "ph", "level", "corr", "arm", "sig", "zc",
+                      # CPU load, appended to the sensor line by the firmware.
+                      # Kept in the same buffer machinery as everything else so
+                      # it can be picked as a plot series without special cases.
+                      "CPU"):
             v = self.parser.extract(line, field)
             if v is not None:
-                self.data[field].append(v)
-                got_any = True
+                self._push(field, v)
         f = self.parser.parse_freq(line)
         if f is not None:
-            self.data["freq_err"].append((f - 10_000_000.0))
-            got_any = True
-        if got_any:
-            self.tbuf.append(now)
+            self._push("freq_err", f - 10_000_000.0)
 
+
+        # `is not None`, not a truth test: parse_state returns "" for the
+        # firmware's "___" — the loop saying it has nothing to report — and that
+        # is a state change to show, not a line to ignore. Treating it as falsy
+        # left the label on the previous word, which is the same stale-display
+        # bug in a different place.
         st = self.parser.parse_state(line)
-        if st:
+        if st is not None:
             self.last_state = st
             hint = self.parser.STATE_HINT.get(st, "")
-            self.state_lbl.setText(f"state: {st}" + (f"  ({hint})" if hint else ""))
+            self.state_lbl.setText(f"state: {st or '-'}" + (f"  ({hint})" if hint else ""))
 
         # Track the active algorithm from the Learn line so the LTIC tab can show
         # the algo-10 stage PID or the algo-11 Lars params as appropriate. The
@@ -1550,8 +2100,14 @@ class GpsdoTuner(QMainWindow):
         # Algo 11 (LTIC-Lars) single-line readbacks: "gain=0.300", "damping=3.000",
         # "time_const_s=60", etc. Map the firmware field name back to its verb and
         # drop the value into the matching spinbox without echoing a write.
+        # The pattern tolerates a trailing unit and a parenthesised gloss, for
+        # the reason spelled out under the algo-12 block below: LTO and LTR now
+        # answer "tic_offset=2.1104 V (2620 counts)" — volts at the face, ADC
+        # counts still in the settings block — and an end-anchored pattern would
+        # have dropped every one of those replies in silence, leaving the box
+        # empty while the board was answering perfectly well.
         for verb, fname in LARS_FIELD_NAMES.items():
-            m = re.match(rf"\s*{fname}=([-+]?\d+(?:\.\d+)?)\s*$", line)
+            m = re.match(rf"\s*{fname}=([-+]?\d+(?:\.\d+)?)\s*[A-Za-z/]*\s*(?:\(.*\))?\s*$", line)
             if m and verb in self.lars_boxes:
                 self.lars_boxes[verb].blockSignals(True)
                 self.lars_boxes[verb].setValue(float(m.group(1)))
@@ -1846,42 +2402,120 @@ class GpsdoTuner(QMainWindow):
                 f"canonical names, e.g. {', '.join(sorted(dropped)[:3])}")
 
     def toggle_logging(self):
-        """Start or stop writing every received line to a file.
+        """Start or stop writing the capture to disk.
 
-        The file is created next to this script as gpsdo_YYYY-MM-DD_HH-MM-SS.log
-        and opened line-buffered, so a run that ends badly still leaves usable
-        data behind rather than an empty file full of unflushed buffers."""
-        if self._logfile is not None:
+        Files are created next to this script as gpsdo_YYYY-MM-DD_HH-MM-SS with
+        a .log and/or .csv extension, and opened line-buffered, so a run that
+        ends badly still leaves usable data behind rather than an empty file
+        full of unflushed buffers. Which of the two appears is the write-mode
+        setting, read once here and then frozen until logging stops."""
+        if self._logfile is not None or self._csvfile is not None:
             self._stop_logging()
             return
-        name = time.strftime("gpsdo_%Y-%m-%d_%H-%M-%S.log")
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-        try:
-            self._logfile = open(path, "w", encoding="utf-8",
-                                 errors="replace", buffering=1)
-        except OSError as e:
-            self._logfile = None
-            self.log_lbl.setText(f"cannot open log: {e}")
-            return
-        self._log_lines = 0
-        self._log_path = path
+
+        mode = self.log_mode.currentText()
+        want_log = mode in ("Full log", "Both")
+        want_csv = mode in ("CSV only", "Both")
+        stem = time.strftime("gpsdo_%Y-%m-%d_%H-%M-%S")
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), stem)
+        self._log_redacting = self.log_redact.isChecked()
+
+        opened = []
+        if want_log:
+            try:
+                self._logfile = open(base + ".log", "w", encoding="utf-8",
+                                     errors="replace", buffering=1)
+            except OSError as e:
+                self._logfile = None
+                self.log_lbl.setText(f"cannot open log: {e}")
+                return
+            self._log_path = base + ".log"
+            self._log_lines = 0
+            # The file states its own provenance. Someone opening it a year from
+            # now, or receiving it second-hand, should not have to infer from the
+            # absence of coordinates whether they were removed or never present.
+            try:
+                self._logfile.write(
+                    "# gpsdo_tuner %s — capture started %s\n" % (
+                        TOOL_VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
+                self._logfile.write(
+                    "# GPS position: %s\n#\n" % (
+                        "REDACTED at capture (Lat/Lon/Alt replaced; Sat/HDOP kept)"
+                        if self._log_redacting else "present, not redacted"))
+            except OSError:
+                pass
+            opened.append(stem + ".log")
+
+        if want_csv:
+            try:
+                self._csvfile = open(base + ".csv", "w", encoding="utf-8",
+                                     errors="replace", buffering=1)
+            except OSError as e:
+                self._csvfile = None
+                if self._logfile is not None:
+                    self._stop_logging()
+                self.log_lbl.setText(f"cannot open csv: {e}")
+                return
+            self._csv_path = base + ".csv"
+            self._csv_rows = 0
+            self._csv = CsvRowBuilder()
+            # Two comment lines and then the header. Comment lines start with #
+            # so pandas, numpy and gnuplot all skip them with their default
+            # settings, and the provenance travels with the data rather than in
+            # a covering note that gets lost.
+            try:
+                self._csvfile.write(
+                    "# gpsdo_tuner %s — capture started %s\n" % (
+                        TOOL_VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
+                self._csvfile.write(
+                    "# one row per second; empty cell = field absent from that "
+                    "second's telemetry; no position columns exist\n")
+                self._csvfile.write(",".join(CSV_COLUMNS) + "\n")
+            except OSError:
+                pass
+            opened.append(stem + ".csv")
+
+        self.log_redact.setEnabled(False)          # fixed for the life of the file
+        self.log_mode.setEnabled(False)
         self.log_btn.setText("Stop logging")
-        self.log_lbl.setText(f"logging to {name}")
-        self.monitor.append(f"*** logging started: {path}")
+        tag = ("  [position redacted]" if self._log_redacting or want_csv else "")
+        self.log_lbl.setText("logging to " + " + ".join(opened) + tag)
+        self.monitor.append("*** logging started: " + ", ".join(
+            os.path.join(os.path.dirname(base), n) for n in opened) + tag)
 
     def _stop_logging(self):
-        if self._logfile is None:
+        if self._logfile is None and self._csvfile is None:
             return
-        try:
-            self._logfile.close()
-        except OSError:
-            pass
-        name = os.path.basename(self._log_path)
-        lines = self._log_lines
-        self._logfile = None
+        saved = []
+        if self._logfile is not None:
+            try:
+                self._logfile.close()
+            except OSError:
+                pass
+            saved.append(f"{os.path.basename(self._log_path)} "
+                         f"({self._log_lines} lines)")
+            self._logfile = None
+        if self._csvfile is not None:
+            # The row in hand belongs to the last second received and would
+            # otherwise be dropped, because a row is only closed by the arrival
+            # of the next one.
+            try:
+                r = self._csv.flush()
+                if r is not None:
+                    self._csvfile.write(",".join(r) + "\n")
+                    self._csv_rows += 1
+                self._csvfile.close()
+            except OSError:
+                pass
+            saved.append(f"{os.path.basename(self._csv_path)} "
+                         f"({self._csv_rows} rows)")
+            self._csvfile = None
+        self.log_redact.setEnabled(True)
+        self.log_mode.setEnabled(True)
         self.log_btn.setText("Start logging")
-        self.log_lbl.setText(f"saved {name} ({lines} lines)")
-        self.monitor.append(f"*** logging stopped: {lines} lines written")
+        tag = "  [position redacted]" if self._log_redacting else ""
+        self.log_lbl.setText("saved " + " + ".join(saved) + tag)
+        self.monitor.append("*** logging stopped: " + ", ".join(saved) + tag)
 
     def clear_plots(self):
         """Drop every buffered sample and restart the time axis at zero.
@@ -1951,11 +2585,34 @@ class GpsdoTuner(QMainWindow):
                 return secs
         return 300
 
+    def _push(self, name, value):
+        """Append one sample to a series, keeping it aligned to the time axis.
+
+        Every series must end up exactly as long as tbuf, or the pairing in
+        series() is off by however many samples the two have diverged. A field
+        that only starts appearing partway through a session — level and zc when
+        the operator switches to algorithm 12, say — is padded with NaN back to
+        the tick where it started, so the curve begins where the data does
+        instead of being dragged back to t0. The curves are drawn with
+        connect="finite", so a NaN is a gap rather than a line to nowhere.
+        """
+        target = len(self.tbuf)
+        if target == 0:
+            return                       # nothing yet to hang a sample on
+        buf = self.data[name]
+        n = len(buf)
+        if n >= target:
+            return                       # already have this tick; keep the first
+        if n < target - 1:
+            nan = float("nan")
+            for _ in range(target - 1 - n):
+                buf.append(nan)
+        buf.append(value)
+
     def refresh_plots(self):
         if not self.tbuf:
             return
-        t = list(self.tbuf)
-        now = t[-1]
+        now = self.tbuf[-1]
         span = self._plot_span()
 
         # Trim to the visible span and pin the X axis to it, so the trace scrolls
@@ -1968,22 +2625,27 @@ class GpsdoTuner(QMainWindow):
         # While paused the whole buffer is drawn, so panning and zooming reach
         # every sample held rather than stopping at the edge of the live window.
         if span > 0 and following:
-            cutoff = now - span
-            keep = sum(1 for x in t if x >= cutoff)
-            keep = max(keep, 2)          # a single point draws nothing
+            # Binary search, not a scan. The linear count was fine over 30 h and
+            # is 604 800 comparisons a second over a week, for a number that
+            # changes by one each time.
+            keep = max(self.tbuf.count_since(now - span), 2)
         else:
-            keep = len(t)
+            keep = len(self.tbuf)
 
         # Decimate for display. Paused on a full buffer this would otherwise push
-        # 108 000 points per curve into the view once a second, which pyqtgraph
+        # 604 800 points per curve into the view once a second, which pyqtgraph
         # will draw but not quickly. No plot pane is more than a couple of
         # thousand pixels wide, so beyond that the extra points cost time and show
         # nothing; stepping through the data keeps panning responsive.
         MAX_DRAW = 4000
+        t = None
         def series(name):
-            d = list(self.data[name])
-            n = min(len(d), len(t), keep)
-            xs, ys = t[-n:], d[-n:]
+            nonlocal t
+            buf = self.data[name]
+            n = min(len(buf), len(self.tbuf), keep)
+            if t is None or len(t) != n:
+                t = self.tbuf.tail(n)
+            xs, ys = t, buf.tail(n)
             if n > MAX_DRAW:
                 step = (n // MAX_DRAW) + 1
                 xs, ys = xs[::step], ys[::step]
@@ -2000,7 +2662,8 @@ class GpsdoTuner(QMainWindow):
         # Pinning it to now-span from the start would put the axis into negative
         # time and squeeze the first minutes into the right-hand edge.
         if following:
-            left = max(t[0], now - span) if span > 0 else t[0]
+            oldest = self.tbuf[0]
+            left = max(oldest, now - span) if span > 0 else oldest
             for plot in (self.plot_phase, self.plot_vph, self.plot_freq):
                 if span > 0:
                     plot.setXRange(left, max(now, left + 1.0), padding=0)
