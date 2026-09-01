@@ -45,7 +45,7 @@ extern "C" {
 /* ── Feature switches ────────────────────────────────────────────────── */
 
 /* ── OLED display type — select exactly one, or comment all out ──────── */
-//#define GPSDO_OLED_SH1106        /* SH1106  128x64 I2C — original hardware */
+#define GPSDO_OLED_SH1106        /* SH1106  128x64 I2C — original hardware */
 //#define GPSDO_OLED_SSD1306       /* SSD1306 128x64 I2C                     */
 //#define GPSDO_OLED_SSD1309       /* SSD1309 128x64 I2C (same init as 1306) */
 
@@ -60,9 +60,9 @@ extern "C" {
  * Common AliExpress/Adafruit-style 0.56" clock modules (addr 0x70).
  * Shows HH:MM with the colon blinking each second.  Pure I2C device —
  * shares the bus with OLED/LCD/sensors, no extra pins, no conflicts.   */
-#define GPSDO_HT16K33            /* 4-digit HT16K33: HH:MM                 */
-#define HT16K33_I2C_ADDR  0x70   /* default; A0/A1/A2 jumpers raise it     */
-#define HT16K33_BRIGHTNESS  2    /* 0 (dim) .. 15 (max)                    */
+//#define GPSDO_HT16K33            /* 4-digit HT16K33: HH:MM                 */
+//#define HT16K33_I2C_ADDR  0x70   /* default; A0/A1/A2 jumpers raise it     */
+//#define HT16K33_BRIGHTNESS  2    /* 0 (dim) .. 15 (max)                    */
 
 /* ── TFT SPI display — select exactly one, or comment all out ─────────
  *
@@ -110,7 +110,7 @@ extern "C" {
  * driver selection happens in the TFT_eSPI User_Setup.h.              */
 //#define GPSDO_TFT_ILI9341        /* ILI9341 240x320 SPI TFT */
 //#define GPSDO_TFT_ST7789         /* ST7789  240x320 SPI TFT */
-#define GPSDO_TFT_ILI9488        /* ILI9488 320x480 SPI TFT (480x320 landscape)
+//#define GPSDO_TFT_ILI9488        /* ILI9488 320x480 SPI TFT (480x320 landscape)
 /* TFT control pins (documentation — actual config is in User_Setup.h) */
 #define PIN_TFT_SCK   PA5
 #define PIN_TFT_MOSI  PA7
@@ -125,7 +125,7 @@ extern "C" {
 #define LCD_LINE2_SWITCH_SECS   10u   /* rotate line 2 content every N seconds     */
 
 /* ── Remaining feature switches (sensors, comms, GPS timing, etc.) ───── */
-#define GPSDO_AHT10
+//#define GPSDO_AHT10
 #define GPSDO_BMP280_I2C
 #define GPSDO_INA219
 //#define GPSDO_BLUETOOTH
