@@ -20,6 +20,7 @@
  */
 #pragma once
 #include "gpsdo_config.h"
+#include "gpsdo_sensor_measurements.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
@@ -181,8 +182,6 @@ extern CtrlData_t  gCtrl;
 extern Uptime_t    gUptime;
 
 /* ---- Sensor data (written by SensorTask, read by DisplayTask) ---------- */
-extern float  g_encl_temp, g_encl_pres, g_encl_humi;
-extern float  g_ocxo_volt, g_ocxo_curr;
 extern uint16_t g_freq_damp_win_dpll; /* FAD: 10/100/1000 (default 100) */
 extern uint16_t g_freq_damp_win_lock; /* FAL: 10/100/1000 (default 100) */
 extern bool   g_persist_valid;        /* true = settings loaded from flash ring */

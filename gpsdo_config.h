@@ -126,7 +126,8 @@ extern "C" {
 
 /* ── Remaining feature switches (sensors, comms, GPS timing, etc.) ───── */
 //#define GPSDO_AHT10
-#define GPSDO_BMP280_I2C
+//#define GPSDO_BMP280_I2C
+#define GPSDO_BME280_I2C
 #define GPSDO_INA219
 //#define GPSDO_BLUETOOTH
 /* GPSDO_BLUETOOTH_PARALLEL — USB + Bluetooth at the same time: telemetry, CLI

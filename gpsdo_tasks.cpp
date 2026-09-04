@@ -47,10 +47,6 @@ static bool i2c_probe(uint8_t addr)
     return Wire.requestFrom(addr, (uint8_t)1) > 0;
 }
 
-/* ---- Sensor data globals ---------------------------------------------- */
-float  g_encl_temp = 0.0f, g_encl_pres = 0.0f, g_encl_humi = 0.0f;
-float  g_ocxo_volt = 0.0f, g_ocxo_curr = 0.0f;
-
 /* ---- Damping-window sizes (FA / FAD / FAL) -----------------------------
  *
  * NOT under GPSDO_LTIC, although only the LTIC loops read them. They are part
@@ -205,6 +201,8 @@ void vSensorTask(void *pvParameters)
     }
 #endif
 
+    gpsdo_sensor_measurements_begin();
+
 #ifdef GPSDO_LTIC
     /* Initialise PA1 as analog input and take the first reading */
     pinMode(PIN_LTIC_VPHASE, INPUT_ANALOG);
@@ -248,6 +246,12 @@ void vSensorTask(void *pvParameters)
         }
         vTaskDelay(pdMS_TO_TICKS(10));
 #endif
+
+        if (xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            gpsdo_sensor_measurements_read();
+            xSemaphoreGive(xWireMutex);
+        }
+
 #ifdef GPSDO_LTIC
         /* Vphase is now sampled in vFreqRelayTask ~300 µs after the PPS edge
          * (ltic_read_fast), on the ramp peak. The old read here fired from
