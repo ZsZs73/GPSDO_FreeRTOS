@@ -1199,11 +1199,11 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
      * dacValue += (tempRef - tempFiltered) * tempCoeff. Off unless enabled. */
     float temp_ff = 0.0f;
     if (g_lars.flags & LARS_FLAG_TEMP_COMP) {
-        extern float g_bmp_temp;                         /* board temperature °C */
+        extern float g_encl_temp;                         /* enclosure temperature °C */
         /* Map temperature to ADC-like counts the same way tempRef is stored:
          * tempRef is in ADC counts, so we approximate the current temp in the
          * same units. A dedicated temp-ADC channel can replace this later. */
-        float temp_now = g_bmp_temp * 100.0f;            /* 0.01 °C resolution */
+        float temp_now = g_encl_temp * 100.0f;            /* 0.01 °C resolution */
         temp_ff = ((float)g_lars.temp_ref - temp_now)
                 * (float)g_lars.temp_coeff / 10000.0f;
     }
@@ -3029,11 +3029,10 @@ static bool   s_ho_track = false;
 static double s_ho_frac  = 0.0;                  /* fractional LSB accum */
 static double s_ho_total = 0.0;                  /* total excursion clamp*/
 
-/* Read the board temperature with a plausibility window (BMP → AHT). */
+/* Read the enclosure temperature with a plausibility window. */
 static bool nn_read_temp(double *out)
 {
-    float tc = g_bmp_temp;
-    if (!(tc > -40.0f && tc < 85.0f)) tc = g_aht_temp;
+    float tc = g_encl_temp;
     if (!(tc > -40.0f && tc < 85.0f)) return false;
     *out = (double)tc;
     return true;

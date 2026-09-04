@@ -48,9 +48,8 @@ static bool i2c_probe(uint8_t addr)
 }
 
 /* ---- Sensor data globals ---------------------------------------------- */
-float  g_bmp_temp = 0.0f, g_bmp_pres = 0.0f;
-float  g_aht_temp = 0.0f, g_aht_humi = 0.0f;
-float  g_ina_volt = 0.0f, g_ina_curr = 0.0f;
+float  g_encl_temp = 0.0f, g_encl_pres = 0.0f, g_encl_humi = 0.0f;
+float  g_ocxo_volt = 0.0f, g_ocxo_curr = 0.0f;
 
 /* ---- Damping-window sizes (FA / FAD / FAL) -----------------------------
  *
@@ -220,9 +219,13 @@ void vSensorTask(void *pvParameters)
     {
 #ifdef GPSDO_BMP280_I2C
         if (s_bmp_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            g_bmp_temp = s_bmp.readTemperature();
+            #ifndef GPSDO_AHT10
+            g_encl_temp = s_bmp.readTemperature();
+            #else
+            s_bmp.readTemperature();
+            #endif
             float raw_pres = s_bmp.readPressure();
-            g_bmp_pres = (raw_pres + g_pressure_offset) / 100.0f;
+            g_encl_pres = (raw_pres + g_pressure_offset) / 100.0f;
             xSemaphoreGive(xWireMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -231,16 +234,16 @@ void vSensorTask(void *pvParameters)
         if (s_aht_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             sensors_event_t hum, tmp;
             s_aht.getEvent(&hum, &tmp);
-            g_aht_temp = tmp.temperature;
-            g_aht_humi = hum.relative_humidity;
+            g_encl_temp = tmp.temperature;
+            g_encl_humi = hum.relative_humidity;
             xSemaphoreGive(xWireMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
 #endif
 #ifdef GPSDO_INA219
         if (s_ina_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            g_ina_volt = s_ina.getBusVoltage_V();
-            g_ina_curr = s_ina.getCurrent_mA();
+            g_ocxo_volt = s_ina.getBusVoltage_V();
+            g_ocxo_curr = s_ina.getCurrent_mA();
             xSemaphoreGive(xWireMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -460,12 +463,12 @@ static void print_tab_report(const GpsData_t *g, const FreqSnap_t *f,
     p = sd  (buf, p, (c->avg_vctl_adc/4096.0)*3.3, 3);        buf[p++] = '\t';
     p = sd  (buf, p, (c->avg_vcc_adc /4096.0)*3.3*2.0, 2);    buf[p++] = '\t';
     p = sd  (buf, p, (1.21*4096.0)/(double)c->avg_vdd_adc, 3); buf[p++] = '\t';
-    p = sd  (buf, p, g_bmp_temp, 1);                buf[p++] = '\t';
-    p = sd  (buf, p, g_bmp_pres, 1);                buf[p++] = '\t';
-    p = sd  (buf, p, g_aht_temp, 1);                buf[p++] = '\t';
-    p = sd  (buf, p, g_aht_humi, 1);                buf[p++] = '\t';
-    p = sd  (buf, p, g_ina_volt, 2);                buf[p++] = '\t';
-    p = sd  (buf, p, g_ina_curr, 0);                buf[p++] = '\t';
+    p = sd  (buf, p, g_encl_temp, 1);                buf[p++] = '\t';
+    p = sd  (buf, p, g_encl_pres, 1);               buf[p++] = '\t';
+    p = sd  (buf, p, g_encl_temp, 1);               buf[p++] = '\t';
+    p = sd  (buf, p, g_encl_humi, 1);               buf[p++] = '\t';
+    p = sd  (buf, p, g_ocxo_volt, 2);               buf[p++] = '\t';
+    p = sd  (buf, p, g_ocxo_curr, 0);               buf[p++] = '\t';
 #ifdef GPSDO_LTIC
     /* Vphase as 12-bit ADC value (matches André's original TIC column) */
     p = si(buf, p, g_ltic_adc_avg);
@@ -609,12 +612,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
     buf[p++]='\r'; buf[p++]='\n';
 
     /* Sensors */
-    p=sa(buf,p,"BMP:"); p=sd(buf,p,g_bmp_temp,1); p=sa(buf,p,"C ");
-                         p=sd(buf,p,g_bmp_pres,1); p=sa(buf,p,"hPa  ");
-    p=sa(buf,p,"AHT:"); p=sd(buf,p,g_aht_temp,1); p=sa(buf,p,"C ");
-                         p=sd(buf,p,g_aht_humi,1); p=sa(buf,p,"%rH  ");
-    p=sa(buf,p,"INA:"); p=sd(buf,p,g_ina_volt,2); p=sa(buf,p,"V ");
-                         p=sd(buf,p,g_ina_curr,0); p=sa(buf,p,"mA");
+    p=sa(buf,p,"BMP:"); p=sd(buf,p,g_encl_temp,1); p=sa(buf,p,"C ");
+                         p=sd(buf,p,g_encl_pres,1); p=sa(buf,p,"hPa  ");
+    p=sa(buf,p,"AHT:"); p=sd(buf,p,g_encl_temp,1); p=sa(buf,p,"C ");
+                         p=sd(buf,p,g_encl_humi,1); p=sa(buf,p,"%rH  ");
+    p=sa(buf,p,"INA:"); p=sd(buf,p,g_ocxo_volt,2); p=sa(buf,p,"V ");
+                         p=sd(buf,p,g_ocxo_curr,0); p=sa(buf,p,"mA");
 #ifdef GPSDO_LTIC
     p=sa(buf,p,"  Vphase:"); p=sd(buf,p,(double)g_ltic_voltage,3); p=sa(buf,p,"V");
     /* Derived phase in ns, once LC has calibrated the detector. Measured
@@ -2058,7 +2061,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
         static int16_t ina_ma_w = 0;
         if (ina_ma_w == 0) ina_ma_w = tft_text_w("0000.00 mA");
         if (ina_ok) {
-            dtostrf(g_ina_volt,6,3,fv); dtostrf(g_ina_curr,7,2,fi);
+            dtostrf(g_ocxo_volt,6,3,fv); dtostrf(g_ocxo_curr,7,2,fi);
             snprintf(s,sizeof(s),"INA: %s V",fv);
         } else {
             snprintf(s,sizeof(s),"INA: ---");
@@ -2094,12 +2097,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
        * whether the 12 V form fits, and it also puts this row in step with
        * "Alt:", "Vph:", "Vcc:" and "Vdd:", none of which carries one. */
       { static char fv[10],fi[10];
-        if (ina_ok) { dtostrf(g_ina_volt,5,3,fv);
+        if (ina_ok) { dtostrf(g_ocxo_volt,5,3,fv);
                       snprintf(s,sizeof(s),"INA:%sV",fv); }
         else          snprintf(s,sizeof(s),"INA:---");
         tft_val(10, TFT_COL_R, TFT_GRID_Y+4*TFT_ROW_H,
                 TFT_S(76), TFT_COL_VALUE, s);
-        if (ina_ok) { dtostrf(g_ina_curr,6,2,fi);
+        if (ina_ok) { dtostrf(g_ocxo_curr,6,2,fi);
                       snprintf(s,sizeof(s),"%smA",fi); }
         else          s[0] = '\0';
         tft_val_r(20, TFT_COL_R + TFT_S(146), TFT_GRID_Y+4*TFT_ROW_H,
@@ -2124,9 +2127,9 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            * against ("BMP: 00.00 C 0000.00 hPa"), so below 1000 hPa the field
            * was not even reaching its own line. */
 #if defined(GPSDO_TFT_ILI9488)
-          dtostrf(g_bmp_temp,5,2,ft); dtostrf(g_bmp_pres,7,2,fp);
+          dtostrf(g_encl_temp,5,2,ft); dtostrf(g_encl_pres,7,2,fp);
 #else
-          dtostrf(g_bmp_temp,4,1,ft); dtostrf(g_bmp_pres,6,1,fp);
+          dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,6,1,fp);
 #endif
       }
 #if defined(GPSDO_TFT_ILI9488)
@@ -2169,7 +2172,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #endif
 
       if (aht_ok) { static char ft[8],fh[8];
-          dtostrf(g_aht_temp,4,2,ft); dtostrf(g_aht_humi,4,2,fh);
+          dtostrf(g_encl_temp,4,2,ft); dtostrf(g_encl_humi,4,2,fh);
 #if defined(GPSDO_TFT_ILI9488)
           /* temp left-anchored in the right column; humidity right-anchored to
            * the screen edge (like Vdd) so the "% rH" stays pinned. Draw them
@@ -2208,7 +2211,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       { const int16_t rh_pad = TFT_S(60);            /* fits "45.30 % rH" */
         tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
                 (uint16_t)(align_L - rh_pad - TFT_COL_L), TFT_COL_VALUE, s);
-        if (aht_ok) { static char fh[8]; dtostrf(g_aht_humi,4,2,fh);
+        if (aht_ok) { static char fh[8]; dtostrf(g_encl_humi,4,2,fh);
             snprintf(s,sizeof(s),"%s %% rH",fh);
             tft_val_r(16, align_L, TFT_SENS_Y + TFT_ROW_H,
                       (uint16_t)rh_pad, TFT_COL_VALUE, s);
@@ -3230,7 +3233,7 @@ void vDisplayTask(void *pvParameters)
                 } else {
                     snprintf(line,sizeof(line),"GPS: acquiring  ");  oled_set_line(2,line);
                     snprintf(line,sizeof(line),"Sat: %2d         ",snap_g.sats); oled_set_line(3,line);
-                    { static char ft[6],fp[7]; dtostrf(g_bmp_temp,4,1,ft); dtostrf(g_bmp_pres,5,0,fp); snprintf(line,sizeof(line),"BM:%sC%shPa",ft,fp); }
+                    { static char ft[6],fp[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,0,fp); snprintf(line,sizeof(line),"BM:%sC%shPa",ft,fp); }
                     oled_set_line(4, line);
                 }
                 /* Row 5: uptime */
@@ -3251,15 +3254,15 @@ void vDisplayTask(void *pvParameters)
                 /* PAGE B: sensors + date focus */
                 /* Row 2: BMP280 */
                 /* BM: + temp(4,1) + C + pres(5,0) + hPa = 3+4+1+5+3 = 16 chars */
-                { static char ft[6],fp[7]; dtostrf(g_bmp_temp,4,1,ft); dtostrf(g_bmp_pres,5,0,fp); snprintf(line,sizeof(line),"BM:%sC%shPa",ft,fp); }
+                { static char ft[6],fp[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,0,fp); snprintf(line,sizeof(line),"BM:%sC%shPa",ft,fp); }
                 oled_set_line(2, line);
                 /* Row 3: AHT */
                 /* AH: + temp(4,1) + C + humi(5,1) + %rH = 3+4+1+5+3 = 16 chars */
-                { static char ft[6],fh[7]; dtostrf(g_aht_temp,4,1,ft); dtostrf(g_aht_humi,5,1,fh); snprintf(line,sizeof(line),"AH:%sC%s%%rH",ft,fh); }
+                { static char ft[6],fh[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_humi,5,1,fh); snprintf(line,sizeof(line),"AH:%sC%s%%rH",ft,fh); }
                 oled_set_line(3, line);
                 /* Row 4: INA219 */
                 /* IN: + volt(5,2) + V + curr(5,0) + mA = 3+5+1+5+2 = 16 chars */
-                { static char fv[7],fi[7]; dtostrf(g_ina_volt,5,2,fv); dtostrf(g_ina_curr,5,0,fi); snprintf(line,sizeof(line),"IN:%sV%smA",fv,fi); }
+                { static char fv[7],fi[7]; dtostrf(g_ocxo_volt,5,2,fv); dtostrf(g_ocxo_curr,5,0,fi); snprintf(line,sizeof(line),"IN:%sV%smA",fv,fi); }
                 oled_set_line(4, line);
                 /* Row 5: satellites + HDOP */
                 { static char fh[6];
@@ -3426,7 +3429,7 @@ void vDisplayTask(void *pvParameters)
                 case 3: /* AHT */
                     if (s_aht_ok) {
                         static char ft[6],fh[6];
-                        dtostrf(g_aht_temp,4,1,ft); dtostrf(g_aht_humi,4,1,fh);
+                        dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_humi,4,1,fh);
                         snprintf(line,sizeof(line),"AHT:%sC %s%%rH",ft,fh);
                     } else {
                         snprintf(line,sizeof(line),"AHT: not found      ");
@@ -3435,7 +3438,7 @@ void vDisplayTask(void *pvParameters)
                 case 4: /* INA219 */
                     if (s_ina_ok) {
                         static char fv[6],fi[7];
-                        dtostrf(g_ina_volt,4,2,fv); dtostrf(g_ina_curr,5,0,fi);
+                        dtostrf(g_ocxo_volt,4,2,fv); dtostrf(g_ocxo_curr,5,0,fi);
                         snprintf(line,sizeof(line),"INA:%sV %smA",fv,fi);
                     } else {
                         snprintf(line,sizeof(line),"INA: not found      ");
@@ -3445,7 +3448,7 @@ void vDisplayTask(void *pvParameters)
                 default:
                     if (s_bmp_ok) {
                         static char ft[6],fp[7];
-                        dtostrf(g_bmp_temp,4,1,ft); dtostrf(g_bmp_pres,5,1,fp);
+                        dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,1,fp);
                         snprintf(line,sizeof(line),"BMP:%sC %shPa",ft,fp);
                     } else {
                         snprintf(line,sizeof(line),"BMP: not found      ");
