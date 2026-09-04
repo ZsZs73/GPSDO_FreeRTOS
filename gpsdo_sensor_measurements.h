@@ -9,3 +9,5 @@ extern float g_ocxo_curr;
 
 void gpsdo_sensor_measurements_begin();
 void gpsdo_sensor_measurements_read();
+
+bool gpsdo_sensor_bmp280_available();

@@ -140,14 +140,6 @@ void ltic_read_fast(void)
   static const bool s_aht_ok = false;
 #endif
 
-#ifdef GPSDO_BMP280_I2C
-  #include <Adafruit_BMP280.h>
-  static Adafruit_BMP280 s_bmp;
-  static bool s_bmp_ok = false;
-#else
-  static const bool s_bmp_ok = false;
-#endif
-
 #ifdef GPSDO_INA219
   #include <Adafruit_INA219.h>
   static Adafruit_INA219 s_ina;
@@ -178,19 +170,6 @@ void vSensorTask(void *pvParameters)
     OUT_SERIAL.println(s_aht_ok ? "HW: AHT10/AHT20 sensor    OK  (I2C 0x38)"
                                 : "HW: AHT10/AHT20 sensor    not found");
 #endif
-#ifdef GPSDO_BMP280_I2C
-    s_bmp_ok = s_bmp.begin(0x77, 0x58);
-    if (s_bmp_ok) {
-        s_bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                          Adafruit_BMP280::SAMPLING_X2,
-                          Adafruit_BMP280::SAMPLING_X16,
-                          Adafruit_BMP280::FILTER_X16,
-                          Adafruit_BMP280::STANDBY_MS_500);
-        OUT_SERIAL.println("HW: BMP280 sensor         OK  (I2C 0x77)");
-    } else {
-        OUT_SERIAL.println("HW: BMP280 sensor         not found");
-    }
-#endif
 #ifdef GPSDO_INA219
     s_ina_ok = s_ina.begin();
     if (s_ina_ok) {
@@ -215,19 +194,6 @@ void vSensorTask(void *pvParameters)
 
     for (;;)
     {
-#ifdef GPSDO_BMP280_I2C
-        if (s_bmp_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            #ifndef GPSDO_AHT10
-            g_encl_temp = s_bmp.readTemperature();
-            #else
-            s_bmp.readTemperature();
-            #endif
-            float raw_pres = s_bmp.readPressure();
-            g_encl_pres = (raw_pres + g_pressure_offset) / 100.0f;
-            xSemaphoreGive(xWireMutex);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-#endif
 #ifdef GPSDO_AHT10
         if (s_aht_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             sensors_event_t hum, tmp;
@@ -2996,7 +2962,7 @@ void vDisplayTask(void *pvParameters)
         aht_ok = s_aht_ok;
 #endif
 #ifdef GPSDO_BMP280_I2C
-        bmp_ok = s_bmp_ok;
+        bmp_ok = gpsdo_sensor_bmp280_available();
 #endif
 #ifdef GPSDO_INA219
         ina_ok = s_ina_ok;
@@ -3390,7 +3356,7 @@ void vDisplayTask(void *pvParameters)
                     if (lcd_line2_mode == 2) avail = snap_g.valid;
                     if (lcd_line2_mode == 3) avail = s_aht_ok;
                     if (lcd_line2_mode == 4) avail = s_ina_ok;
-                    if (lcd_line2_mode == 5) avail = s_bmp_ok;
+                    if (lcd_line2_mode == 5) avail = gpsdo_sensor_bmp280_available();
                     if (avail) break;
                 }
             }
@@ -3450,7 +3416,7 @@ void vDisplayTask(void *pvParameters)
                     break;
                 case 5: /* BMP280 */
                 default:
-                    if (s_bmp_ok) {
+                    if (gpsdo_sensor_bmp280_available()) {
                         static char ft[6],fp[7];
                         dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,1,fp);
                         snprintf(line,sizeof(line),"BMP:%sC %shPa",ft,fp);
@@ -3509,7 +3475,7 @@ void vDisplayTask(void *pvParameters)
 #ifdef GPSDO_TFT
         if (s_tft_ok)
             tft_update(&snap_g, &snap_f, &snap_c, &snap_u,
-                       s_aht_ok, s_bmp_ok, s_ina_ok);
+                       s_aht_ok, gpsdo_sensor_bmp280_available(), s_ina_ok);
 #endif
 
 
