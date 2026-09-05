@@ -1,7 +1,7 @@
 /**
  * gpsdo_gps.cpp — vGpsTask — GPS NMEA parsing and UBX configuration
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -1026,8 +1026,7 @@ static int nmea_hexdig(char c)
  *
  * Simulated over all 25 transmit/listen pairs of the five candidate rates,
  * feeding real sentence text through an 8N1 transmitter and a bit-sampling
- * receiver: 25/25 correct, 0 false positives. The simulator lives in the
- * v1.06 tree under tools/uartsim/ if you want to re-run it. */
+ * receiver: 25/25 correct, 0 false positives. See tools/uartsim/. */
 static bool nmea_sentence_ok(uint32_t window_ms)
 {
     char    body[84];          /* NMEA caps a sentence at 82 incl. $ and CRLF */

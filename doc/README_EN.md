@@ -1,8 +1,8 @@
-# GPSDO FreeRTOS v1.05
+# GPSDO FreeRTOS v1.06
 
 **English** | [Polski](README_PL.md) | [Español](README_ES.md)
 
-📖 [Project home](../README.md)
+📖 [Project home](../README.md) · Manual: [MD](MANUAL_EN.md) · [PDF](MANUAL_EN.pdf)
 
 Real-time (FreeRTOS) firmware for a GPS-Disciplined Oscillator (GPSDO)
 on the STM32 BlackPill platform (WeAct F411CE / F401CCU6).
@@ -13,13 +13,14 @@ on the STM32 BlackPill platform (WeAct F411CE / F401CCU6).
 
 | Role | Person / source |
 |------|-----------------|
-| FreeRTOS port author, algorithms 3–11 | **J. M. Niewiński** — [repository](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
+| FreeRTOS port author, algorithms 3–11 and 13 | **J. M. Niewiński** — [repository](https://github.com/jmnlabs/GPSDO_FreeRTOS) |
 | Programming assistants | **Claude Opus 5 (Anthropic) · GLM-5.3 Max (Z.ai) · Qwen3.8-Max** |
 | Measurement and field testing, algorithms 10–12 | **Dan Wiering** — rubidium-referenced ADEV runs that found the algorithm-10 limit cycle, settled the `FA` damping question, reported the ACQ lock-up, and established the algorithm-11 comparison; now shaking down algorithm 12 |
 | ILI9486 / ILI9488 support — the push to implement it; and the PC tuner grew out of a monitoring script he assembled with Claude | **lucido** (EEVBlog forum) |
 | v0.06c author — inspiration for the RTOS port | **André Balsa** — [repository](https://github.com/AndrewBCN/STM32-GPSDO) |
 | Continuous-PI loop (algorithm 11) — original design | **Lars Walenius** (in memoriam) — GPSDO controller shared on the [time-nuts](http://www.leapsecond.com/time-nuts.htm) community and EEVBlog. Extended here with CT auto-calibration, a frequency-led acquisition branch and a picDIV phase-capture bridge. |
 | Multi-level accumulator (algorithm 12) — original design | **Alan Cashin** (MIS42N, EEVBlog forum) — [profile](https://www.eevblog.com/forum/profile/?u=121386) — his Budget GPSDO is the origin of algorithm 12, the zero-crossing correction, the dithered PWM that reaches 24 bits from a short one, and the `CS` self-assessment idea. Implemented here on the LTIC phase detector, with per-level limits made editable because only the 128 s one was ever derived from a specification. |
+| Kalman filter (algorithm 13) — original design | **J. M. Niewiński** — three states on a scalar measurement, so the textbook matrix inversion is one division and the whole filter costs about a microsecond a second on the M4F. Every constant it would otherwise need is derived from `CT` and `LC`, so it carries no number measured on one particular board. |
 | PCB design (prototype) | **Scrachi** (EEVBlog forum) — [post with files](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/825/) · [profile](https://www.eevblog.com/forum/profile/?u=762266) |
 | Project thread | [Yet another DIY GPSDO](https://www.eevblog.com/forum/projects/yet-another-diy-gpsdo-yes-another-one/) — EEVBlog Forum |
 
@@ -143,14 +144,13 @@ priority levels:
 | Medium | `vCliTask` | 1 KB | Serial / Bluetooth command parser |
 | Medium-low | `vSensorTask` | 1.5 KB | AHT/BMP/INA readout every 2 s |
 | Low | `vDisplayTask` | 4 KB | OLED, LCD, TM1637, serial report, LEDs |
-| Lowest | `vUptimeTask` | 768 B | Uptime counter (dd hh:mm:ss) |
+| Lowest | `vUptimeTask` | 768 B | Uptime clock during holdover only — the PPS drives it otherwise |
 
 **Shared state** is protected by FreeRTOS mutexes:
 
 - `xFreqMutex` — frequency data (`gFreq`, `gFreqSnap`)
 - `xGpsMutex` — GPS data (`gGps`)
 - `xCtrlMutex` — control data (`gCtrl`: PWM, algorithm, holdover, trend)
-- `xUptimeMutex` — uptime (`gUptime`)
 - `xWireMutex` — I2C bus (shared by sensors and displays)
 - `xSerialMutex` — serial / Bluetooth port
 
@@ -177,6 +177,7 @@ Eleven algorithms selectable via the `LA n` (0–10) command:
 | 10 | LTIC | TIC phase + freq | staged | Three-stage ACQ→DPLL→LOCK; hardware phase detector, self-calibrating |
 | 11 | LTIC-Lars | TIC phase | continuous | Single continuous PI, no state machine; gain auto-derived from `CT`. After Lars Walenius |
 | 12 | Multi-level accumulator | LTIC phase [ns] | adaptive | No time constant to set: the error picks its own averaging span. After Alan Cashin (MIS42N). **Untuned.** |
+| 13 | Kalman filter | LTIC phase [ns] + TIM2 frequency | adaptive | Three states — phase, frequency, aging — with covariances: the weight given to each reading comes from the measured variances rather than from a constant, and every scale is derived from `CT` and `LC`. Original to this project. |
 
 PLL algorithms (4, 5, 7 and the PLL branch of 8) use a **two-timescale**
 design tuned for "fast capture, gentle phase-hold":
@@ -280,7 +281,7 @@ matter.
 
 ```
  ┌──────────────────────────────────────────────────┐
- │ GPSDO v1.05-rtos                LMT 14:32:45 Mon │   header: version + local time
+ │ GPSDO v1.06-rtos                LMT 14:32:45 Mon │   header: version + local time
  │                                                  │
  │          1 0 0 0 0 0 0 0 . 0 0 0 0  H z          │   frequency, large font
  │                                                  │
@@ -662,7 +663,7 @@ Commands terminated by `\r\n` or `\n`. Command names are **case-insensitive**
 | `RD` | Report mode: tab-delimited |
 | `RP` | Pause serial/BT data stream |
 | `RR` | Resume serial/BT data stream |
-| `SW` | FreeRTOS task stack watermarks (diagnostics) |
+| `SW` | FreeRTOS task stack watermarks, heap free, uptime source and the measured MCU clock error against GPS (diagnostics) |
 | `CS` | Correction statistics: how hard the loop is working, and in df/f after `CT` |
 
 ### Control
@@ -1502,10 +1503,15 @@ per step at 3.3 V, near 2.7e-11 fractional on a 5.3 Hz/V oscillator. An 18-bit
 part with a reference designed for the job reaches roughly 17 µV, near 9e-12,
 with no filter delay inside the loop.
 
-The plumbing is in: `GPSDO_DAC_EXT` and a stub driver that refuses to compile
-until a device is chosen. No hardware SPI is needed or available — the DAC is
-written once per second, so bit-banging costs microseconds. Still to decide: the
-part, the reference, and the output span against the oscillator's EFC range.
+The part is now chosen and written: the **AD5680**, 18 bits, behind an external
+REF5045, bit-banged on CS/SCK/MOSI = PB4/PB0/PB2 on Dan Wiering's PCB. No
+hardware SPI is needed or available — the DAC is written once per second, so
+bit-banging costs microseconds. `GPSDO_DAC_EXT` enables it, and it is mutually
+exclusive with `GPSDO_PWM_DITHER` because both drive the control voltage. The
+driver compiles and links for cortex-m4 in `tools/hostcheck`; the hardware test
+is Dan's to run. Still open: choosing the output span against the oscillator's
+EFC range, and the runtime `DAC [PWM|DITH|EXT]` path selection that goes with
+the jumpered PCB.
 
 Worth knowing where the useful limit sits. At 24 bits the step is 197 nV;
 thermal noise in 10 kΩ over 1 Hz is about 13 nV, so Johnson noise is not the

@@ -1,7 +1,7 @@
 /* ======================================================================
  * settings_store.h  —  persistent user settings via the flash ring
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * Replaces the old STM32duino emulated EEPROM (gpsdo_state.cpp eeprom_*).
  * Settings are stored as a REC_SETTINGS slot in the flash ring (sector 7),
@@ -88,6 +88,18 @@ typedef struct {
     uint8_t  tz_mode;        /* g_tz_mode (0=manual 1=auto-EU 2=posix)     */
     int16_t  tz_manual_min;  /* g_tz_manual_min                            */
     char     tz_str[48];     /* g_tz_str (POSIX rule, NUL-terminated)      */
+    /* Control-voltage output path (DAC command) — carved from the two
+     * alignment pad bytes between tz_str and the float that follows it, the
+     * same trick the algo-12 fields below use and for the same reason: a
+     * version bump would throw away everyone's PID, LC and timezone for one
+     * byte. Verified against the compiler, not by eye — tz_str ends at 318,
+     * a12_gain sits at 320, so 318 and 319 are padding no build has ever
+     * written. Layout, size and SETTINGS_VER are unchanged.
+     *
+     * ZERO MEANS UNSET, so a record written by an older build — which memsets
+     * to zero and never touches these bytes — asks for the default rather than
+     * for path 0. That is why the encoding starts at 1. */
+    uint8_t  dac_path;       /* 0=unset 1=PWM 2=DITH 3=EXT (g_dac_path+1)  */
     /* Algorithm 12 (multi-level accumulator) — SETTINGS_VER 5+.
      *
      * These are here rather than compiled in because the limits are the one

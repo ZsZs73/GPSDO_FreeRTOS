@@ -1,4 +1,4 @@
-# GPSDO FreeRTOS v1.05
+# GPSDO FreeRTOS v1.06
 
 A GPS-disciplined 10 MHz OCXO on an STM32 BlackPill (F411CE), running FreeRTOS.
 Thirteen disciplining algorithms, a time-interval counter with sub-nanosecond
@@ -33,12 +33,15 @@ three languages:
 
 | | English | Polski | Español |
 |---|---|---|---|
+| **Step-by-step user manual** — build, flash, calibrate, every command, troubleshooting; written for first-time users | [MANUAL_EN](doc/MANUAL_EN.md) | [MANUAL_PL](doc/MANUAL_PL.md) | [MANUAL_ES](doc/MANUAL_ES.md) |
 | **Manual** — hardware, wiring, algorithms, CLI, display | [README_EN](doc/README_EN.md) | [README_PL](doc/README_PL.md) | [README_ES](doc/README_ES.md) |
 | **Changelog** — what changed and why | [CHANGELOG_EN](doc/CHANGELOG_EN.md) | [CHANGELOG_PL](doc/CHANGELOG_PL.md) | [CHANGELOG_ES](doc/CHANGELOG_ES.md) |
 | **Flash ring bring-up** — first-time setup of the flash ring buffer | [BRINGUP_EN](doc/FLASH_RING_BRINGUP_EN.md) | [BRINGUP_PL](doc/FLASH_RING_BRINGUP_PL.md) | [BRINGUP_ES](doc/FLASH_RING_BRINGUP_ES.md) |
 
-New here? Start with the manual in your language — it covers the build, the
-wiring and the first calibration run.
+New here? Start with the [step-by-step user manual](doc/MANUAL_EN.md) — it
+walks through the build, the flash, the first calibration and every command
+assuming no prior knowledge. The reference manual in your language covers the
+same ground in more depth.
 
 ---
 

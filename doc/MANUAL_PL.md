@@ -48,6 +48,7 @@ mówi, co wpisać i co powinieneś zobaczyć. Nic ważnego nie zostawiono jako
 - [Aneks A — Jak działa GPSDO, prostymi słowami](#aneks-a--jak-działa-gpsdo-prostymi-słowami)
 - [Aneks B — PID dla opornych](#aneks-b--pid-dla-opornych)
 - [Aneks C — Słowniczek](#aneks-c--słowniczek)
+- [Aneks D — Filtr Kalmana prostymi słowami](#aneks-d--filtr-kalmana-prostymi-słowami)
 
 ---
 
@@ -850,6 +851,46 @@ ciągu sekundy. Przy starcie filtr wypisuje jedną linię z tym, co ustalił:
 KAL: from CT/LC  res 1.01ns  R0 2.52ns  Q0 0.000006600  P0 1500ns  lim 939LSB  arm<0.25Hz
 ```
 
+**Dwa szumy procesowe, nie jeden.** Model zegara, który ten filtr realizuje,
+niesie `Sf` — biały szum częstotliwości, objawiający się jako błądzenie
+przypadkowe fazy — oraz `Sg`, błądzenie przypadkowe częstotliwości:
+`Q = [[Sf·t + Sg·t³/3, Sg·t²/2], [Sg·t²/2, Sg·t]]`. Do 01.09 istniało tu tylko
+`Sg`, i to jedno pominięcie było całym przesterowaniem: bez `Sf` jedynym
+sposobem wyjaśnienia fazy, która ruszyła się bardziej, niż przewidziano, jest
+orzeczenie, że błądzi *częstotliwość* — co podnosi wzmocnienie zapisujące stan
+częstotliwości, za którym jedzie DAC. `Sf` jest teraz mierzone, a nie
+adaptowane: różnice fazy na opóźnieniu 1 i 16 niosą `sigma_R² + Sf·k/2`, więc
+dwa opóźnienia rozdzielają biały szum od błądzenia tam, gdzie jedno nie potrafi —
+a różnica, która nie przekracza dwóch sigm własnego szumu estymatora, jest
+raportowana jako zero, co przy czystym detektorze jest właściwą odpowiedzią.
+`KL` pokazuje ją obok `R` i `Q`.
+
+**Q się adaptuje, ale nie może wyprzedzić swojego horyzontu.** Filtr dostraja
+szum procesu `Q` tak, aby jego własne innowacje wychodziły tej wielkości, jakiej
+się spodziewał. Ma to jedno systematyczne obciążenie i na stole ono uderzyło:
+gdy błąd detektora jest *skorelowany* — zero wędrujące w skali minut —
+innowacje są większe, niż filtr przewiduje, z powodu niemającego nic wspólnego z
+oscylatorem, więc `Q` narasta sekunda po sekundzie, aż kowariancja urośnie na
+tyle, by je wytłumaczyć. Zatrzymuje się, ale zatrzymuje się wysoko. 30.08 płytka
+pracowała z `Q` 195x powyżej zasiewu: filtr pięć razy szybszy niż horyzont, nad
+którym kazano mu sterować, ruszający DAC-iem o 1,80 LSB na sekundę wobec 0,49
+algorytmu 11 tej samej nocy — i bez lepszej fazy w zamian.
+
+`(R/Q)^(1/3)` ma wymiar czasu i jest własną stałą czasową filtru; `Q = R/KT³`
+to dokładnie stwierdzenie *biegnij tak szybko jak zadany horyzont*. Tam właśnie
+adaptacja jest teraz ograniczona: **filtr nie może biec szybciej niż `KT`**,
+przy `R` branym z pomiaru, a nie z zasiewu — i to sprawia, że reguła znaczy to
+samo na każdej płytce. Zmierzone na dwóch obiektach, pięciu ziarnach szumu i
+trzech poziomach wędrówki detektora: ADEV dla krótkich tau dwa razy lepsze, ruch
+DAC-a 2,4× mniejszy, kosztem 7% na sd fazy. Nic nie tracimy, odmawiając `Q`
+pochłaniania skorelowanego błędu detektora, bo `R` już go ma: `R` jest mierzone
+z różnic branych z szesnastosekundowym opóźnieniem, więc zero wędrujące w tych
+skalach siedzi w szumie pomiarowym, gdzie jego miejsce. Chcesz szybszej pętli?
+Skróć `KT` — teraz to jedyna rzecz, która nią rusza. Wartość przypięta ręcznie
+przez `KQ` przechodzi bez zmian: ograniczenie dotyczy adaptacji, nie Ciebie.
+`KL` pisze `[at ceiling]`, gdy `Q` opiera się o sufit, a pętla siedząca tam
+przez cały przebieg mówi, że `KT` jest dłuższe, niż ten oscylator udźwignie.
+
 **Parametry** — wszystkie cztery są opcjonalne, a domyślne są tymi, których się
 używa:
 
@@ -858,7 +899,7 @@ używa:
 | `KR [ns]` | `0` = mierz | Szum pomiaru. Zero znaczy „zmierz go z różnic samego detektora o szesnastosekundowym rozstawie" — biały szum i wolna wędrówka zera razem, i tego właśnie chcesz. Ustawiaj tylko, żeby unieruchomić filtr na czas eksperymentu. |
 | `KQ [v]` | `0` = adaptuj | Szum procesu, (ns/s)² na sekundę. Zero znaczy „adaptuj z ciągu innowacji". |
 | `KT [s]` | `100` | Horyzont fazy: jak szybko sterowanie zeruje estymatę fazy. Krócej — mocniej za GPS, dłużej — bardziej na oscylatorze. Ustawia też cierpliwość testu zawieszenia: pięć horyzontów daleko od zera i picDIV zostaje uzbrojony. |
-| `KL` | — | Wypisuje stan: fazę, częstotliwość i starzenie, jak mocno w każde wierzy, aktualne R i Q oraz ile odczytów odrzuciła bramka innowacji. |
+| `KL` | — | Wypisuje stan: fazę, częstotliwość i starzenie, jak mocno w każde wierzy, aktualne R i Q oraz ile odczytów odrzuciła bramka innowacji. `[at ceiling]` przy Q oznacza, że adaptacja opiera się o swoje ograniczenie. |
 
 `KR`, `KQ` i `KT` zapisują się w chwili wpisania, we własnym rekordzie flash
 ringu — bez `ES`, a starszy firmware po prostu nigdy o ten rekord nie pyta.
@@ -896,18 +937,23 @@ liczby jako względne, nigdy bezwzględne (4.6a).
 starzenie) przepychany o sekundę. Potem najwyżej dwa *pomiary* korygują —
 faza z detektora LTIC (chyba że na szynie, zamrożona lub poza pasmem) i
 częstotliwość z TIM2 (zawsze; utrzymuje pętlę przy życiu, gdy detektor
-jest ślepy). Na koniec *sterowanie*: `u = -(freq + faza/T)` — skasuj
-estymowany błąd częstotliwości i domknij fazę po horyzoncie `T`, z
-ograniczeniem do pasma detektora; reszta sub-LSB idzie na następną
-sekundę. To, co doszło do pinu, wraca do stanu częstotliwości. Wokół
-rdzenia: bramka 4σ, test zaufania (czy faza rusza tak, jak każe TIM2?),
-startowe uzbrojenie referencji i holdover.
+jest ślepy). Na koniec *sterowanie*: `u = -(freq + faza/KC)` — skasuj
+estymowany błąd częstotliwości i domknij fazę po horyzoncie **sterownika**
+`KC` (od pierwszego zablokowania pętli; wcześniej, w akwizycji, wolnym
+krokiem `KT`), z ograniczeniem do pasma detektora; reszta sub-LSB idzie na
+następną sekundę. To, co doszło do pinu, wraca do stanu częstotliwości. Wokół
+rdzenia: bramka 4σ, test zaufania (czy faza rusza tak, jak każe TIM2? —
+z ignorowaniem mrugnięć mniejszych niż własna rozdzielczość licznika),
+cztery sekundy celowej ciszy fazy po uzbrojeniu dzielnika (odczyty z rampy
+wtedy nie są fazą), startowe uzbrojenie referencji i holdover.
 
-**Insight uczciwego R.** Szum detektora mierzony z własnych różnic o
-szesnastosekundowym rozstawie widzi szum biały (~2,5 ns) **i** wolną
-wędrówkę zera (~5,9 ns) razem, R ≈ 6,5 ns. Ta liczba to cały charakter
-pętli: dlatego algorytm 13 odmawia gonienia za wolną strukturą detektora,
-za którą algorytm 11 idzie bez pytania. Zmierzone: przy spokojnej pętli
+**Insight uczciwego R.** R, które pokazuje `KL` (~2,9 ns na tym
+stanowisku), to pomiar z własnych różnic detektora o szesnastosekundowym
+rozstawie: podłoga biała (~2,5 ns) plus wzrost wolnej wędrówki zera przez
+te 16 s. **Pełna** wędrówka zera to osobna struktura (~2,6 ns w skali ~45 s
+na tym stanowisku), której filtr **celowo nie ściga** — dlatego algorytm
+13 odmawia gonienia za wolną strukturą detektora, za którą algorytm 11
+idzie bez pytania. Zmierzone: przy spokojnej pętli
 dph pokazuje płaską podłogę 5–9 ns od 10 s do 600 s uśredniania
 **niezależnie od pasma pętli** — szerokie, adaptowane i sztywne lądują na
 tym samym poziomie, czyli poziomie wędrówki detektora. Czy gonienie tej
@@ -921,29 +967,55 @@ zdarzenia GPS (dziesiątki ns) są odrzucane — odrzucenia wzrosły ze 163 do
 5021 na noc. Przypinaj tylko do obłożenia eksperymentu; `KR 0` jest
 lepszym domyślnym.
 
-**`KQ [v]`** (domyślnie 0 = adaptuj). Adaptacja widzi innowacje zabarwione
-własnym sterowaniem, więc **Q rakietuje w górę** — zmierzone 195× seed po
-jednej nocy (clamp na 1000×). Znane i tolerowane: adaptowana pętla
-przechodziła nocne epizody GPS wyraźniej lepiej. Przypięcie na seedzie
-(`KQ 0.000006359` — dokładny seed z linii `KAL: from CT/LC`) usztywnia
-pętlę ~14× i niemal zamraża PWM; w zmierzonym A/B nic na średnich tau,
-epizody odrobinę gorzej. **KQ zapisuje się od wpisania** — wróć przez
-`KQ 0`.
+**`KQ [v]`** (domyślnie 0 = adaptuj). Adaptacja działała jak zapadka:
+skorelowany błąd detektora sprawia, że innowacje są większe, niż przewiduje
+kowariancja, więc **Q rosło** — 195× seed po jednej nocy, czyli filtr pięć
+razy szybszy niż jego horyzont, ruszający DAC-iem o 1,80 LSB/s wobec 0,49
+algorytmu 11. Teraz jest ograniczone do `R/KT³` — **filtr nie może biec szybciej
+niż `KT`** — co zmniejsza ruch DAC-a 2,4× i podwaja ADEV dla krótkich tau
+(4.6). Płytka Dana Wieringa, ten sam firmware, nic nie ruszane, doszła do samej
+starej szyny: `Q` 1000× zasiewu w 2h37m, DAC ruszający się 11,05 LSB/s i ADEV
+na 20 s równe 8,6e-11 wobec 3,1e-12 dla algo 11 na tej samej płytce i tym samym
+rubidzie. `KL` pisze `[at ceiling]`, gdy adaptacja opiera się o ograniczenie.
+Przypięcie na zasiewie (`KQ 0.000006359` — dokładna wartość z linii
+`KAL: from CT/LC`) usztywnia pętlę jeszcze bardziej i niemal zamraża PWM;
+wartość przypięta ręcznie przechodzi bez zmian, ograniczenie dotyczy
+adaptacji. **KQ zapisuje się od wpisania** — wróć przez `KQ 0`.
 
-**`KT [s]`** (domyślnie 100). Jak szybko sterowanie domyka fazę: krócej —
-mocniejsze trzymanie GPS (i więcej kopiowanego szumu detektora), dłużej —
-oparcie na stabilności oscylatora. To też cierpliwość czujnika zastoju —
-pięć horyzontów daleko i picDIV jest uzbrajany. Na stanowisku z wędrówką
-detektora rozstrzyga, ile z niej dochodzi do oscylatora.
+**`KT [s]`** (domyślnie 100). Od buildu 36 to horyzont **estymatora** —
+cierpliwość rozumu, nie tempo rąk. Krótszy KT = filtr o większym pasmie
+wiary (i wyższy sufit adaptacji Q, bo `R/KT³`); dłuższy = oparcie na
+stabilności oscylatora. To też cierpliwość czujnika zastoju — pięć
+horyzontów daleko i picDIV jest uzbrajany. Tempem domykania fazy steruje
+już `KC`.
+
+**`KC [s]`** (domyślnie 0 = auto = KT/3; **skuteczne dopiero po pierwszym
+zablokowaniu pętli** — w akwizycji i po restarcie algorytmu sterowanie
+wraca do KT). Jak szybko *ręce* domykają fazę, którą *rozum* już zna:
+pomysł polega na tym, że estymat fazy jest już wygładzony, więc szybkie
+ jego domykanie nie wzmacnia szumu — wzmacnia tylko poprawkę. Zmierzone
+na 20-godzinnym logu: ADEV wyjścia lepsze o ~23% na tau 256–4096 przy
+ditherze DAC rosnącym z 0,37 do 0,52 LSB/s — to budżet, nie darmo. Sweep
+nie znalazł kolana (zysk monotonny, koszt ∝ 1/KC), więc wartość domyślna
+to kompromis, a nie optimum; sam `KC` bez argumentu pokazuje wartość
+ustawioną i tę faktycznie w mocy.
 
 **`KL` — odczytaj stan** przed, w trakcie i po każdym eksperymencie:
-estymaty, sigma wiary w fazę, R i Q w użyciu (Q vs seed = prędkość
-rakiety), ostatnia innowacja, licznik odrzuceń. Najbardziej informacyjny
+estymaty, sigma wiary w fazę, R i Q w użyciu (`[at ceiling]` przy Q znaczy,
+że adaptacja doszła do swojego ograniczenia `R/KT³` — na stanowisku z
+nieustającymi mikrozdarzeniami GPS zdarza się to większość nocy i jest
+własnością nieba, nie usterką), ostatnia innowacja, licznik odrzuceń,
+**ratio adaptacji** (czy innowacje są większe od przewidywań; >1 naciska Q
+w górę, <1 w dół) i **znaki wodne Q** od startu trackowania (`lo..hi` —
+czy Q nocą wychodziło z sufitu). Najbardziej informacyjny
 nawyk: `KL`, potem `SW`, potem godzinny log.
 
-**Trendy:** `KAL` (normalna), `REJ` (bramka odrzuciła), `ARM` (uzbrojenie
+**Trendy:** `KAL` (normalna), `REJ` (bramka odrzuciła — pojedynczo lub
+parami przy zdarzeniach GPS to norma), `ARM` (uzbrojenie
 dzielnika — start, szyna lub zastój), `HOLD` (brak fazy, sterowanie z
-modelu), `NoPL`/`NoCT` (brak kalibracji), `WAIT` (brak danych).
+modelu; **cztery sekundy HOLD zaraz po `ARM` to celowa cisza** — rampa
+czyta wtedy szynę, a to nie jest faza), `NoPL`/`NoCT` (brak kalibracji),
+`WAIT` (brak danych). Jak wygląda dobra noc — patrz [Aneks D](#aneks-d--filtr-kalmana-prostymi-słowami).
 
 ## Część 5 — Wyświetlacze: co znaczy każde pole
 
@@ -1158,7 +1230,8 @@ właśnie trafiłeś:
 
 ### Algo 13 (Kalman) — zapis w chwili wpisania, bez `ES`
 `KR` (0..1000 ns, 0 = mierz), `KQ` (0..1, 0 = adaptuj), `KT` (10..10000 s,
-domyślnie 100), `KL` (wypisz stan filtru) — znaczenia w części 4.6.
+domyślnie 100), `KC` (10..10000 s, 0 = auto KT/3; działa po pierwszym
+zablokowaniu), `KL` (wypisz stan filtru) — znaczenia w części 4.6.
 
 ### GPS, czas, czujniki
 | Komenda | Zakres | Co robi |
@@ -1635,3 +1708,94 @@ uwagę, że połowa z nich gdzie indziej znaczy co innego.
 | **trend** | Czteroznakowe słowo w telemetrii i na wyświetlaczu, nazywające to, co pętla robi w tej chwili: `ACQ`, `DPLL`, `LOCK`, `CORR`, `ZC`, `NOPH`, … |
 | **Vctl / Vphase** | Vctl to napięcie sterujące idące *do* oscylatora; Vphase to napięcie detektora wracające *z* pomiaru fazy. Dwa różne piny, łatwo pomylić. |
 | **ZC** | Zniesienie w przejściu przez zero (algorytm 12): zdjęcie celowego slewingu dokładnie w chwili, gdy faza przechodzi przez zero — częstotliwość i faza zostają poprawne naraz. |
+
+## Aneks D — Filtr Kalmana prostymi słowami
+
+Część 4.6 opisuje algorytm 13 od strony pokręteł; ten aneks od strony
+intuicji. Bez wzorów — kilka obrazów i tyle.
+
+### D.1 Trzy przekonania i ołówek do każdego
+
+Filtr nosi w sobie trzy przekonania: **o ile faza oscylatora jest
+przesunięta** (w nanosekundach), **jak szybko to przesunięcie rośnie**
+(pikosekundy na sekundę) i **jak to dryfowanie samo się zmienia z wiekiem**
+(starzenie). Do każdego przekonania nosi też **grubość ołówka**: przedział,
+o którym wie, że nie wie. „Faza = 2 ns ± 1 ns" znaczy: jestem pewny na
+jeden nanosekund — a w ciągu nocy ta pewność sama rośnie i mala.
+
+Ołówki to połowa filtra. Gdy przychodzi pomiar, filtr przesuwa przekonanie
+**w jego stronę, ale tylko na tyle, na ile grubość ołówka pomiaru pozwala
+przeciw grubości własnego przekonania**. Pewny pomiar i rozmyte
+przekonanie — duży krok. Rozmyty pomiar i pewne przekonanie — lekki mus.
+Cały „filtr Kalmana" to właśnie to: wiara z wagami, odnawiana co sekundę.
+
+### D.2 Dwaj świadkowie
+
+- **Detektor fazy** jest świeży, ale gadatliwy: co sekundę mówi o fazie
+  z szumem ~2,5 ns, a do tego jego zero samo wędruje (~2,6 ns w skali
+  ~45 s). Filtr mierzy ten hałas sam — z różnic między kolejnymi
+  odczytami — i nazywa go R.
+- **Licznik TIM2** jest uczciwy, ale toporny: częstotliwość mówi z
+  dokładnością, która robi się użyteczna dopiero po stu sekundach. Za to
+  milczy tylko wtedy, gdy milczy wszystko — i to on trzyma pętlę przy
+  życiu, gdy detektor oślepnie.
+
+Krótko mówiąc: na sekundach decyduje oscylator, na miesiącach GPS, a
+filtr **co sekundę na nowo** wybiera proporcje — zamiast raz na zawsze,
+jak stała czasowa algorytmu 11.
+
+### D.3 Rozum i ręce: KT i KC
+
+Od buildu 36 to dwa osobne pokrętła, i warto rozumieć różnicę:
+
+- **KT** to cierpliwość **rozumu**: jak szeroko filtr rozkłada wiarę w
+  czasie i jak szybki wolno być jego wnioskowaniu (stawia też sufit
+  adaptacji Q — filtr nie może biegać szybciej niż jego horyzont).
+- **KC** to szybkość **rąk**: skoro filtr już *wie*, że faza siedzi 5 ns
+  za daleko — po jakim czasie to domknąć? Domyślnie KT/3, ale dopiero
+  **po pierwszym zablokowaniu**: po zimnym starcie pętla wchodzi do
+  pasma spokojnym krokiem KT, a szybkie ręce włączą się same, gdy będzie
+  czego szybko domykać. Szybsze ręce to mniejszy błąd fazy (ADEV lepsze
+  o ~23% na średnich tau), ale większy dither DAC — budżet, nie
+  darmo.
+
+### D.4 Zdrowy sceptycyzm, czyli co filtr robi, gdy coś nie gra
+
+- **Bramka 4σ.** Odczyt zbyt dziki jak na własne przewidywania jest
+  odmawiany — pojedynczo i parami przy zdarzeniach GPS to normalna
+  rzecz (noc na buildzie 42: 320 odrzutów w 20 godzin, największa seria
+  dwa).
+- **Test zaufania.** Faza i częstotliwość to to samo widowisko z dwóch
+  stron: jeśli licznik mówi, że częstotliwość jest przenoszona, faza
+  *musi* rosnąć. Detektor, który nie rusza się, kiedy musiał — kłamie.
+  Test ignoruje mrugnięcia mniejsze niż własna rozdzielczość licznika
+  (żeby nie skazywał zdrowego detektora na szumie samego wzorca), a
+  skazany detektor dostaje po pół godziny ponowny głos.
+- **Cisza po uzbrojeniu.** Uzbrojenie dzielnika zatrzymuje go na sekundę,
+  a rampa czyta wtedy górną szynę (~1400 ns — wygląda jak faza, ale nią
+  nie jest). Przez cztery sekundy po armie filtr słowa „faza" po prostu
+  nie słyszy. Cztery sekundy `HOLD` zaraz po `ARM` w logu to znak
+  zdrowia, nie błędu.
+- **Cisza TIM2 po restarcie.** Przez pierwsze sto sekund po starcie
+  stumianowa średnia licznika niesie jeszcze rozgrzewkę oscylatora;
+  filtr czeka na czysty pomiar, zamiast wierzyć w przeszłość.
+
+### D.5 Jak wygląda dobra noc
+
+Trend `KAL` przez ~99% czasu. Pojedyncze `REJ` przy zdarzeniach GPS.
+`HOLD` tylko cztery sekundy po `ARM`. R trzyma się ~2,9 ns, `sig` ~1 ns.
+Przy Q widoczne `[at ceiling]` — na tym stanowisku mikrozdarzenia GPS
+naciskają adaptację przez całą noc, więc Q spędza ją na suficie; to
+własność nieba, nie usterka. `KL` po nocy dorzuca ratio adaptacji i znaki
+wodne Q (`lo..hi`) — z nich widać, czy Q nocą kiedykolwiek zeszło z
+sufitu.
+
+### D.6 Kiedy niczego nie ruszać
+
+Domyślne KR/KQ/KT/KC są **mierzone z samej płytki** — R z jej detektora,
+Q z jej oscylatora, resztę z horyzontów. Przypinanie (KR do podłogi
+białej, KQ na zasiewie) służy eksperymentom porównawczym, nie codziennej
+pracy: każde przypięcie mówi filtrowi, że wie lepiej niż płytką — a
+płytką zwykle nie kłamie. Jeśli chcesz zobaczyć, *czy* filtr ma rację,
+najlepszym pojedynczym nawykiem pozostaje: `KL`, `SW`, godzinny log —
+i Aneks A, żeby wiedzieć, czego patrzeć.

@@ -180,8 +180,46 @@ PLOT_SERIES = {
     # one number the filter exists to produce. Vphase underneath it, with the
     # band guides, because the question this loop most often raises is whether
     # the detector is alive at all.
-    "kalman": [("ph",     "Phase estimate (ns) - Kalman state",     "#22aa44"),
+    # ...and then showed ONLY the estimate, which is the opposite mistake and a
+    # more flattering one. An estimate is what the filter believes after it has
+    # removed the detector's white noise: on the 03/04.09 overnight capture it
+    # has sd 1.06 ns where the reading it came from has 4.4 ns. A pane showing
+    # just that says the loop is holding phase four times better than it is, and
+    # it cannot be compared with algorithm 11's pane, which shows a measurement.
+    #
+    # So the top pane shows what every other algorithm's does - dph, the reading
+    # - and the estimate goes OVER it as a second trace. The gap between them is
+    # the innovation, which is the one thing worth watching on this loop: while
+    # they sit together the filter is tracking, and when the estimate walks away
+    # from the reading it is either rejecting at the gate or believing something
+    # the detector is not saying.
+    "kalman": [("dph",    "Phase  dph (ns) - measured, filter estimate over it", "#22aa44"),
                ("Vphase", "Detector Vphase (V) - ramp position",    "#2277cc")],
+}
+
+# THE SECOND TRACE ON THE TOP PANE, AND THE SECOND IT BELONGS TO.
+#
+# field, legend name, colour, and HOW MANY SAMPLES THE FIELD LAGS THE TOP SERIES
+# IN THE LOG. That last number is not a fudge: the Learn line and the BMP line
+# are printed by vDisplayTask on the first wake after the pulse, and the control
+# task updates the filter on the same wake. The report wins the race, so `dph`
+# on a block is THIS second's reading while `ph` on the same block is the
+# estimate as it stood after the PREVIOUS one.
+#
+# Measured, and it is not subtle. First differences of both series, settled
+# window, cross-correlated against lag:
+#
+#            lag   0 s      +1 s
+#   build 41      -0.587    +0.729
+#   build 40      -0.589    +0.720   (7.5 h overnight, 10 000 samples)
+#
+# The peak at +1 is the alignment; the strong NEGATIVE at 0 is its companion -
+# both series share the reading of second N-1 with opposite signs there, which
+# is exactly what a one-sample offset produces and what makes it certain rather
+# than probable. Plotting them index-aligned draws the estimate a second late
+# and makes a filter that is tracking perfectly look like one that lags.
+PLOT_OVERLAY = {
+    "kalman": ("ph", "Kalman estimate", "#b96ccc", 1),
 }
 
 # Algorithm 11 (LTIC-Lars) parameters: verb -> (label, lo, hi, decimals).
@@ -899,6 +937,12 @@ class GpsdoTuner(QMainWindow):
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self.toggle_connect)
         self.status_lbl = QLabel("disconnected")
+        # Firmware identity, filled from the V reply (see _handle_line). Kept as
+        # separate fields rather than one string so a board that answers only
+        # part of it still shows what it did answer.
+        self._fw_ver = self._fw_date = self._fw_time = ""
+        self._fw_build = self._fw_crc = ""
+        self._fw_match = True
         self.state_lbl = QLabel("state: ?")
         self.state_lbl.setStyleSheet("font-weight: bold;")
         for w in (QLabel("Port:"), self.port_combo, refresh,
@@ -954,8 +998,31 @@ class GpsdoTuner(QMainWindow):
         for p in (self.plot_phase, self.plot_vph, self.plot_freq):
             p.showGrid(x=True, y=True, alpha=0.3)
             p.setLabel("bottom", "time", units="s")
+        # A legend, because the top pane carries two series under algorithm 13
+        # and identity must never be colour alone. addLegend() before the plot()
+        # calls, so the named curves register themselves; wrapped because older
+        # pyqtgraph builds differ on the offset/labelTextColor keywords and this
+        # tool has to run on whatever the operator happens to have.
+        try:
+            # top-right: the interesting end of a phase trace is the newest
+            # samples at the right edge, but the left is where a pull-in puts
+            # its excursion, and that is what the legend was sitting on.
+            self.phase_legend = self.plot_phase.addLegend(offset=(-10, 10))
+        except Exception:
+            try:
+                self.phase_legend = self.plot_phase.addLegend()
+            except Exception:
+                self.phase_legend = None
         self.curve_phase = self.plot_phase.plot(
-            pen=pg.mkPen("#22aa44", width=2), connect="finite")
+            pen=pg.mkPen("#22aa44", width=2), connect="finite", name="measured")
+        # The overlay: a second trace on the SAME axis, which is allowed here
+        # precisely because it is the same quantity in the same units. Dashed as
+        # well as coloured - the estimate is the smooth one, and between the dash
+        # and the legend it stays readable to a colour-blind reader and on a
+        # monochrome screenshot. Hidden until a family asks for it.
+        self.curve_over = self.plot_phase.plot(
+            pen=pg.mkPen("#b96ccc", width=2), connect="finite", name="estimate")
+        self.curve_over.setVisible(False)
         self.curve_vph = self.plot_vph.plot(
             pen=pg.mkPen("#2277cc", width=2), connect="finite")
         self.curve_freq = self.plot_freq.plot(
@@ -1333,7 +1400,6 @@ class GpsdoTuner(QMainWindow):
             ("Reporting", [
                 ("RH / RD",     "Report format: human readable / tab delimited"),
                 ("RP / RR",     "Report pause / resume"),
-                ("TAB / ESC",   "Pause or resume the telemetry with one key."),
                 ("",            "  Same as RP / RR, but you do not have to get a"),
                 ("",            "  command in edgeways while reports scroll past."),
                 ("",            "  A bare ESC toggles; ESC followed by [ or O is"),
@@ -1847,6 +1913,24 @@ class GpsdoTuner(QMainWindow):
             curve.setData([], [])
         self._series_top = fam[0][0]
         self._series_mid = fam[1][0]
+        # The overlay follows the family. Cleared and hidden for every family
+        # that has none, so a switch away from algorithm 13 cannot leave a stale
+        # estimate lying across the next loop's measurement.
+        ov = PLOT_OVERLAY.get(self._plot_family())
+        self._series_over = ov
+        if hasattr(self, "curve_over"):
+            self.curve_over.setData([], [])
+            self.curve_over.setVisible(ov is not None)
+            if ov is not None:
+                self.curve_over.setPen(pg.mkPen(ov[2], width=2))
+        # One series needs no legend - the pane title already names it, and a
+        # box saying "measured" over a single trace is furniture. It appears
+        # only where there are two things to tell apart.
+        if getattr(self, "phase_legend", None) is not None:
+            try:
+                self.phase_legend.setVisible(ov is not None)
+            except Exception:
+                pass
         # The Vphase band guides only mean anything against the detector trace,
         # so they come down when that pane is showing a control voltage instead.
         show_guides = (self._series_mid == "Vphase")
@@ -1942,12 +2026,47 @@ class GpsdoTuner(QMainWindow):
         except Exception as e:                                  # noqa: BLE001
             self.monitor.append(f"*** line handler error: {e!r}")
 
+    def _refresh_fw_status(self):
+        """Compose the status line from whatever the board has told us so far.
+
+        Three facts, and they answer different questions. The VERSION says which
+        protocol this tuner is talking; the BUILD and compile time say which
+        source tree it came from; the CRC says which binary is actually running,
+        and it is the only one of the three that cannot be stale — the board
+        computes it from its own flash at boot, so it stays honest even when the
+        Arduino builder reuses an object file and the timestamp does not.
+
+        Two captures from two different builds once carried the same timestamp
+        and cost an hour of arguing with a log that was right, which is why the
+        CRC is here at all and why all three are shown rather than one.
+
+        Everything past the version is optional: an older firmware answers V with
+        the name alone and the line simply says less."""
+        if not self._fw_ver:
+            return
+        bits = [f"firmware v{self._fw_ver}"]
+        if self._fw_build:
+            bits.append(f"build {self._fw_build}")
+        if self._fw_date:
+            # Seconds are noise at a glance; the CRC settles any real ambiguity.
+            bits.append(f"{self._fw_date} {self._fw_time[:5]}".strip())
+        if self._fw_crc:
+            bits.append(f"CRC {self._fw_crc}")
+        if not self._fw_match:
+            bits.append(f"tuner v{TOOL_VERSION} (MISMATCH)")
+        self.status_lbl.setText("connected — " + "  ".join(bits))
+
     def _on_line(self, line):
         # Data arriving proves the link is live — if the status label somehow
         # missed the connect signal (e.g. a restarted worker), correct it here.
         if self.worker.isRunning() and self.connect_btn.text() == "Connect":
             self.connect_btn.setText("Disconnect")
             self.status_lbl.setText(self.worker.port or "connected")
+            # A new board may be a different binary; forget the old identity so
+            # a stale build number cannot survive a reconnect.
+            self._fw_ver = self._fw_date = self._fw_time = ""
+            self._fw_build = self._fw_crc = ""
+            self._fw_match = True
 
         if self._logfile is not None:
             try:
@@ -2079,22 +2198,42 @@ class GpsdoTuner(QMainWindow):
                 self._lp_active = False
                 self._absorb_lp_block("\n".join(self._lp_buf))
                 # fall through to handle this line normally
-        # Firmware version banner, e.g. "GPSDO v1.00-rtos". Compared against the
-        # release this tuner was written for; a mismatch is reported once and not
-        # treated as fatal, because an older board is still worth talking to — the
-        # operator just needs to know why something might read oddly.
-        m_ver = re.match(r"\s*GPSDO\s+v(\d+\.\d+)", line)
+        # Firmware version banner, e.g. "GPSDO v1.06-rtos compiled 2026-09-02
+        # 09:46:31  build 27". Compared against the release this tuner was
+        # written for; a mismatch is reported once and not treated as fatal,
+        # because an older board is still worth talking to — the operator just
+        # needs to know why something might read oddly.
+        #
+        # The compile stamp and the build serial are optional on purpose: an
+        # older firmware answers V with the name and version alone, and this has
+        # to keep working against it. Everything past the version is captured
+        # only if the board offered it.
+        m_ver = re.match(r"\s*GPSDO\s+v(\d+\.\d+)(\S*)"
+                         r"(?:\s+compiled\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}))?"
+                         r"(?:\s+build\s+(\d+))?", line)
         if m_ver:
             fw = m_ver.group(1)
-            if fw == TOOL_VERSION:
-                self.status_lbl.setText(f"connected — firmware v{fw}")
-            else:
-                self.status_lbl.setText(
-                    f"connected — firmware v{fw}, tuner v{TOOL_VERSION} (MISMATCH)")
+            self._fw_ver   = fw + (m_ver.group(2) or "")
+            self._fw_date  = m_ver.group(3) or ""
+            self._fw_time  = m_ver.group(4) or ""
+            self._fw_build = m_ver.group(5) or ""
+            self._fw_match = (fw == TOOL_VERSION)
+            self._refresh_fw_status()
+            if not self._fw_match:
                 self.monitor.append(
                     f"*** Version mismatch: firmware v{fw}, tuner v{TOOL_VERSION}."
                     f" Some fields may read wrong or some commands may be"
                     f" rejected. Use the matching pair.")
+            return
+
+        # "image CRC32 78B08D26  (267156 bytes)" — the identity that cannot be
+        # stale, since the board computes it from its own flash at boot. The
+        # banner writes "bytes of flash", V writes "bytes"; both are taken, and
+        # "image CRC32 unavailable" matches neither, so no bogus value is shown.
+        m_crc = re.match(r"\s*image CRC32\s+([0-9A-Fa-f]{8})", line)
+        if m_crc:
+            self._fw_crc = m_crc.group(1).upper()
+            self._refresh_fw_status()
             return
 
         # Algo 11 (LTIC-Lars) single-line readbacks: "gain=0.300", "damping=3.000",
@@ -2656,6 +2795,28 @@ class GpsdoTuner(QMainWindow):
         tx, a = series(top);         self.curve_phase.setData(tx, a)
         tx, b = series(mid);         self.curve_vph.setData(tx, b)
         tx, fe = series("freq_err"); self.curve_freq.setData(tx, fe)
+
+        # The overlay, drawn against the second it actually describes. The shift
+        # is applied to the INDICES before decimation, not by subtracting a
+        # second from the x values: the telemetry tick is one second by
+        # construction but the timestamps are wall clock, so pairing sample i+1
+        # of the estimate with sample i of the axis is exact where arithmetic on
+        # the clock would only be close. See PLOT_OVERLAY for the measurement
+        # that fixes the shift at one.
+        ov = getattr(self, "_series_over", None)
+        if ov is not None and hasattr(self, "curve_over"):
+            field, _name, _col, lag = ov
+            buf = self.data[field]
+            n = min(len(buf), len(self.tbuf), keep)
+            if n > lag + 1:
+                xs = self.tbuf.tail(n)[:n - lag]      # the older timestamps
+                ys = buf.tail(n)[lag:]                # ...paired with the later estimates
+                if len(xs) > MAX_DRAW:
+                    step = (len(xs) // MAX_DRAW) + 1
+                    xs, ys = xs[::step], ys[::step]
+                self.curve_over.setData(xs, ys)
+            else:
+                self.curve_over.setData([], [])
 
         # Left edge is clamped to the oldest sample we actually hold, so a fresh
         # session grows from t0 to the full width and only then starts sliding.

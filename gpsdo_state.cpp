@@ -1,7 +1,7 @@
 /**
  * gpsdo_state.cpp — Shared state instances and persistence wrappers
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -17,6 +17,7 @@
  */
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
+#include <limits.h>
 #include "gpsdo_tz.h"
 #include "ubx_timtp.h"
 #include "GPSDO_algorithms.h"
@@ -30,7 +31,6 @@
 SemaphoreHandle_t xFreqMutex;
 SemaphoreHandle_t xGpsMutex;
 SemaphoreHandle_t xCtrlMutex;
-SemaphoreHandle_t xUptimeMutex;
 SemaphoreHandle_t xSerialMutex;
 SemaphoreHandle_t xWireMutex;
 SemaphoreHandle_t xTwoHzSemaphore;
@@ -53,7 +53,9 @@ FreqData_t  gFreq;
 FreqSnap_t  gFreqSnap;
 GpsData_t   gGps;
 CtrlData_t  gCtrl;
-Uptime_t    gUptime;
+volatile uint32_t gUpSecs  = 0;
+volatile uint32_t gUpPpsMs = 0;
+volatile int32_t  gMcuPpm  = INT32_MIN;
 bool        g_persist_valid = false;
 
 /* ---- persistence wrappers (delegating to the flash ring) ----------------

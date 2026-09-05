@@ -1,7 +1,7 @@
 /*
  * dac_ext.cpp — AD5680 external 18-bit DAC, bit-banged GPIO. No hardware SPI.
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * Pins (Dan Wiering's PCB, chosen 2026-08): CS=PB4, SCK=PB0, MOSI=PB2.
  * PB2 doubles as BOOT1 — sampled only at reset, and the AD5680's DIN never

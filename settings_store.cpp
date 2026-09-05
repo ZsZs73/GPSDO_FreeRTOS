@@ -1,7 +1,7 @@
 /* ======================================================================
  * settings_store.cpp  —  persistent user settings via the flash ring
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * See settings_store.h for the design. This module snapshots the runtime
  * settings globals into a flat SettingsBlock_t and stores it as a REC_SETTINGS
@@ -14,6 +14,7 @@
  * ====================================================================== */
 
 #include "settings_store.h"
+#include "gpsdo_dac.h"
 #include "flash_ring.h"
 #include "gpsdo_state.h"
 #include <stddef.h>   /* offsetof, for the v4 migration */
@@ -44,6 +45,7 @@ static void snapshot_full(SettingsBlock_t *s)
     s->ver = SETTINGS_VER;
     s->pwm  = gCtrl.pwm_output;
     s->algo = gCtrl.active_algo;
+    s->dac_path = (uint8_t)(g_dac_path + 1u);   /* 0 stays "unset" */
     s->a12_gain      = g_mlacc_gain;
     s->a12_run_level = g_mlacc_run_level;
     s->a12_thr_src   = g_mlacc_thr_src;
@@ -121,15 +123,25 @@ static void apply_full(const SettingsBlock_t *s)
 {
     /* PWM & algo (PWM applied later by the boot sequence after live_store) */
     if (s->pwm != 0) gCtrl.pwm_output = s->pwm;
-    /* 12 is the highest algorithm; the bound has to move with every addition or
+    /* 13 is the highest algorithm; the bound has to move with every addition or
      * the setting saves correctly and is silently dropped on recall, which looks
-     * like the flash ring failing rather than a stale constant here. */
-    if (s->algo <= 12u) gCtrl.active_algo = s->algo;
+     * like the flash ring failing rather than a stale constant here. The 29.08
+     * build shipped with 13 in the dispatcher and 12 here, so LA 13 + ES ALGO
+     * came back as algo 0 after reset - exactly this trap. */
+    if (s->algo <= 13u) gCtrl.active_algo = s->algo;
+    /* 0 = never written (old record, or a build before this field existed) and
+     * means "use the default"; 1..3 are the paths, offset by one so that zero
+     * can carry that meaning. Whatever comes out is resolved against what is
+     * actually compiled in before it reaches the pin. */
+    if (s->dac_path >= 1u && s->dac_path <= 3u)
+        g_dac_path = gpsdo_dac_path_resolve((uint8_t)(s->dac_path - 1u));
     if (s->a12_gain >= 0.0f && s->a12_gain <= 10000.0f) g_mlacc_gain = s->a12_gain;
     if (s->a12_run_level < 11u) g_mlacc_run_level = s->a12_run_level;
-    /* 0 is the valid "follow MG" / "use the default target" pair, which is also
-     * what an older block's padding reads back as — so no guard is needed for
-     * the old-record case, only for a corrupted one. */
+    /* 0 is the valid "default limit source" / "use the default target" pair,
+     * which is also what an older block's padding reads back as — so no guard
+     * is needed for the old-record case, only for a corrupted one. (0 used to
+     * mean "follow MG"; it now means the noise formula, so a saved 0 recalls
+     * the better behaviour rather than the old coupling.) */
     if (s->a12_thr_src <= 3u) g_mlacc_thr_src = s->a12_thr_src;
     if (s->a12_thr_tgt_s == 0u || s->a12_thr_tgt_s >= (1u << MLACC_LEVELS))
         g_mlacc_thr_tgt_s = s->a12_thr_tgt_s;
@@ -350,6 +362,7 @@ bool settings_save_partial(settings_partial_t which)
     case SET_ALGO:
         s.pwm  = gCtrl.pwm_output;
         s.algo = gCtrl.active_algo;
+        s.dac_path = (uint8_t)(g_dac_path + 1u);
         break;
     case SET_ALGO12:
         /* Saved on its own so tuning algorithm 12 does not rewrite the PID or

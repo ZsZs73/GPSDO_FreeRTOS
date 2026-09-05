@@ -2,48 +2,2249 @@
 
 **English** | [Polski](CHANGELOG_PL.md) | [Español](CHANGELOG_ES.md)
 
-📖 [Project home](../README.md) · Back to [README](README_EN.md)
+📖 [Project home](../README.md) · Back to [README](README_EN.md) · Manual: [MD](MANUAL_EN.md) · [PDF](MANUAL_EN.pdf)
 
 All notable changes to this project are documented here.
 
 Project by **J. M. Niewiński** — <https://github.com/jmnlabs/GPSDO_FreeRTOS>
 Based on **GPSDO v0.06c** by André Balsa
 (<https://github.com/AndrewBCN/STM32-GPSDO>), FreeRTOS port and algorithms
-3–10 by the author, with Claude AI as programming assistant and PCB design
-by Scrachi (EEVBlog forum).
+3–10 by the author, with **Claude Opus 5** (Anthropic), **GLM-5.3 Max** (Z.ai)
+and **Qwen3.8-Max** as programming assistants, and PCB design by Scrachi
+(EEVBlog forum).
 
 The version suffix `-rtos` marks the FreeRTOS port lineage.
 
 ---
 
-## [v1.05-rtos SJ] — unreleased
+## [v1.06-rtos] — released 2026-09-05 (build 42)
 
-The build for Dave (Solder_Junkie), EEVblog: v1.05 plus the backported
-non-blocking report write (`doc/v105-usb-cdc-nonblocking.patch`), with his
-hardware configuration (SSD1306 OLED, no LTIC / PICDIV / GPS-TIMING / INA219,
-so algorithms 10–12 are compiled out).
+Released as build 42. Entries landed here as they were measured, not as
+they were written.
+
+### Added
+
+- **Manuals: Appendix D — the Kalman filter in plain words; KC documented
+  (all three languages).** A new no-formulas appendix explains algorithm 13
+  by intuition: the three beliefs and their uncertainty pencils, the two
+  witnesses (detector and TIM2), KT-vs-KC as understanding-versus-hands,
+  the scepticism machinery (4σ gate, trust test, arm silence, post-restart
+  TIM2 silence), what a good night looks like and when not to touch the
+  knobs. Section 4.6a now describes the split control law (`phase/KC`,
+  in force after the first settle), the measured R (~2.9 ns) with the
+  separate ~2.6 ns/45 s zero-wander structure, the KL adaptation ratio and
+  Q water marks, and the four deliberate HOLD seconds after an arm.
+- **`KC` — the controller's horizon, separated from the estimator's.** One
+  number was doing two jobs in algorithm 13: the Q ceiling `R/T³` sets how fast
+  the **estimator** may run, and `x0/T` in the control law sets how fast the
+  **controller** nulls a phase error it already knows about. The note by the `KT`
+  command said in as many words that those are different things, and then said
+  separating them "needs Sg measured from the oscillator, which needs a reference
+  this board does not have." That was wrong. It needs a second variable.
+
+  **What the measurement said first.** On the 03.09 14:17 capture, settled and in
+  time mode, the filter's own estimate was correlated with the detector at
+  **r = 0.822 with a lag of −1 s** — the measurement cadence, i.e. no lag at all
+  — and subtracting the estimate left **2.52 ns**, which is the detector's white
+  floor to within 1 %. So `dph = ph + white noise`: the filter *sees* the whole
+  phase error, 3.27 ns of it. And that error is slow — the 100 s average of `dph`
+  still has sd **3.06 ns**, 69 % of the amplitude surviving a full horizon of
+  averaging. Nothing was being mis-estimated. The controller was simply choosing
+  not to correct what the estimator had already found.
+
+  **Why the split is free.** `x0` is an estimate, not a measurement. Its own
+  error is `sqrt(P00)` ≈ 1.05 ns against a 3.3 ns signal on this board, so
+  nulling it quickly does not amplify white noise — the filter removed that
+  already. Only `Q/R` decides how much of the detector's slow lie gets believed,
+  and `KC` does not touch `Q/R`. There is a second effect in the same direction:
+  the control law **books its own correction into the frequency state**, so a
+  horizon that tolerates a standing phase error for 100 s biases `x1` for 100 s.
+  Nulling faster removes that bias, which is why the *frequency* tracking
+  improves as much as the phase does.
+
+  **Measured**, night plant reconstructed from the 03.09 8 h capture, eight
+  seeds, `KT = 100` throughout, `KC = 100` (the old behaviour) against
+  `KC = auto = KT/3 = 33 s`:
+
+  | condition | phase sd | control-error sd | r | DAC motion | Q |
+  |---|---|---|---|---|---|
+  | clean detector | 24.72 → **4.46** | 2.20 → **0.78** | 0.637 → 0.913 | 0.619 → 0.675 | unchanged |
+  | wander 2.8 ns / 60 s *(this board)* | 15.06 → **4.01** | 1.56 → **0.59** | 0.759 → 0.945 | 0.680 → 0.862 | 9.4e-6 → 8.5e-6 |
+  | wander 8 ns / 60 s | 18.98 → **8.14** | 1.89 → **1.14** | 0.688 → 0.833 | 0.817 → 1.193 | unchanged |
+  | wander 12 ns / 300 s | 23.35 → **12.24** | 2.15 → **1.47** | 0.655 → 0.764 | 0.756 → 1.042 | unchanged |
+  | railed cold start | settled 266 → **108 s** | same arm count | | | |
+
+  Better on both plants, at every level of detector wander, and in acquisition —
+  including the 12 ns case where shortening `KT` itself measured *worse*, because
+  that route speeds up the estimator too and the estimator is what copies the
+  lie. Against shortening `KT` to 40 s, which reaches the same phase sd at the
+  same DAC motion, `KC = 33` leaves **Q at 8.5e-06 instead of 1.64e-05** — half
+  the process noise, so half the willingness to follow the detector — and leaves
+  the long averaging and the aging state that pay for holdover exactly as they
+  were.
+
+  The default is `KT/3` rather than a constant, so it scales with the horizon and
+  is not a number fitted to one oscillator. The measured knee is 20–30 s on a
+  board whose detector wander has `tau ≈ 60 s`; `KT/3 = 33 s` lands there. `KC`
+  takes 10–10000 s, or 0 for auto, and warns in both directions: above ~60 s it
+  says the loop tolerates a standing phase error and books it into the frequency
+  state; below ~15 s it says the phase stops improving while the DAC moves more.
+  `KL` prints the value in force.
+
+  The flash record grows from 12 to 14 bytes and its version from 1 to 2.
+  **Version 1 records still load** — rejecting them would have been two lines
+  shorter and would have silently reset an operator's `KR`/`KQ`/`KT` on the one
+  upgrade that had no business touching them.
 
 ### Fixed
-- **The non-blocking report write silenced the 1 Hz telemetry on USB CDC.**
-  The original guard asked `availableForWrite()` once and dropped the WHOLE
-  report when it returned less than the report size. On USB CDC that is every
-  report: `USBSerial`'s transmit queue is
+
+- **The blank was one cycle short, because the count starts at the request and
+  the request is not the pin (build 42).** Three was the number of rail readings
+  a capture *shows*. The loop sees one more. `ltic_arm_picdiv()` only sets an
+  event bit; the control task picks it up on its next wake and pulls the pin,
+  holds it for `PICDIV_ARM_MS` = 1001 ms — deliberately just past a second, so
+  the release lands after the edge instead of racing it — and the divider then
+  syncs on the following 1PPS. Only the ramp after that is a phase.
+
+  Build 41 leaked the fourth reading at both of its arms:
+
+  | arm at cycle | rails at | the loop consumed |
+  |---|---|---|
+  | A = 101 | A+2, A+3, A+4 | **1377.0 ns** |
+  | A = 661 | A+3, A+4 | **1361.5 ns** |
+
+  Note where the rail *starts*: A+2 in one, A+3 in the other, because the
+  dispatch wake is where the jitter is. Note where it *ends*: **A+4 in both**,
+  because the end is set by the 1001 ms hold and the resync, which are
+  deterministic. Four is therefore not three plus a safety margin — it is the
+  cycle the rail actually ends on, twice.
+
+  **Measured.** The harness could not see this either, and for a reason worth
+  writing down: its arm model decremented the settle counter and landed the
+  phase in the same iteration, so `ARMSETTLE=n` produced `n−1` rail cycles and a
+  model asking for four gave three — exactly what the build-41 blank already
+  covered, so the leak reproduced as nothing. With that off-by-one fixed and the
+  transient set to the four cycles the hardware loop actually sees, twenty-four
+  seeds on the night plant:
+
+  | | settle median | settle worst | arms worst | rejects median |
+  |---|---|---|---|---|
+  | build 41 | 240 s | **2154 s** | 6 | 12 |
+  | build 42 | **220 s** | **347 s** | 3 | **2** |
+
+  The single leaked reading is worth **+454 LSB** of commanded correction in the
+  simulator — the hardware's ~430 — and the loop then rejects the real readings
+  for as long as it takes the gate to reopen around a phase estimate 2570 ns
+  from the truth.
+
+  **And the cost of being one too many is nothing.** Run against a three-cycle
+  transient, where build 42 blanks one reading it did not have to: settle median
+  220 s either way, worst 300 s against 297 s. Three seconds in the worst seed
+  of twelve. Being one short costs a 454 LSB command and, on one seed in
+  twenty-four, the whole acquisition.
+
+- **A reading taken while the divider is stopped is not a phase (build 41).**
+  Arming the picDIV stops its output and waits for the next 1PPS edge. The LTIC
+  ramp goes on being sampled throughout, and with nothing to stop it, it reads
+  near its top. That reading is in band, quantised, and carries a nanosecond of
+  jitter — there is nothing in it for the innovation gate or the filter to
+  object to. It is simply not a phase. Six arms in the 03/04.09 overnight
+  capture, the three seconds after each and then the fourth:
+
+  | arm at | +1 | +2 | +3 | +4 |
+  |---|---|---|---|---|
+  | t+102 | 1425.4 | 1378.0 | 1378.0 | **−1453.4** |
+  | t+445 | 1437.5 | 1381.0 | 1381.0 | **−947.1** |
+  | t+510 | 1437.5 | 1381.0 | 1381.0 | **−1106.4** |
+  | t+575 | 1437.5 | 1381.0 | 1381.0 | **−1740.9** |
+  | t+1597 | 1444.7 | 1394.9 | 1397.0 | **−1326.9** |
+  | t+2202 | −1357.5 | 1378.1 | 1380.3 | **−1320.8** |
+
+  The same three numbers every time, because it is the rail and not a
+  measurement — and then the landing, where the arm model says it should be.
+
+  **What it cost.** On the first arm of that capture the filter had just been
+  reset, so the gate was open on `P00 = (range/2)²` and it took all three rail
+  readings as phase. It commanded **+1653 LSB in 105 s**. TIM2 said the board
+  was within **0.01 Hz** when the loop started; it was **0.50 Hz** out when the
+  loop finished with it — fifty times the arm gate's own band, put there by the
+  loop itself. The phase then crossed the detector at about 100 ns/s, the ramp
+  railed, and the trust test convicted it, rightly: it was not following. Three
+  further arms could not help, because a convicted loop does not steer and so
+  cannot undo the frequency error that keeps railing the detector. It took the
+  30-minute expiry to get out — **2373 s of holdover on a board that had been
+  locked when it was switched on.**
+
+  The repair is the one GLM-5.3 Max wrote for TIM2 a build earlier, applied to
+  the other measurement for the same reason: **no phase reading for three
+  seconds after an arm.** `raw` false is the honest description — the detector
+  said nothing, which is true, and every consumer downstream already knows what
+  to do with it. The landing capture then catches the fourth reading, which is
+  the one the arm gate has wanted all along and has never once been given.
+
+  **Measured.** The simulator could not see any of this, because its arm landed
+  instantly — the fourth flattering model found in that file, after the perfect
+  TIM2, the wrong rail voltage and the landing at zero. With the transient
+  modelled from the table above, twenty-four seeds on the night plant, phase
+  starting where the capture started:
+
+  | | settle median | settle worst | arms worst | phase sd worst | rejects median |
+  |---|---|---|---|---|---|
+  | build 40 | 514 s | **never (28680 s)** | 51 | **9495 ns** | 89 |
+  | build 41 | **218 s** | **297 s** | 2 | **0.55 ns** | 2 |
+
+  Ten of the twenty-four seeds failed to acquire at all before the change; none
+  after. Outside acquisition the change is not merely small but **bit-identical**
+  — same figures to every digit on five seeds with no arm, and on the 26.08
+  plant — and the frozen-detector case still convicts (50 arms either way).
+
+- **One quantum is not the whole of the reference's noise (build 40).** The
+  quantum floor added a build earlier is right in kind and short in magnitude.
+  Measured on the very run it was written for, the windows immediately before
+  the false verdict carried `|aexp|` up to **83 ns** — two and a half quanta,
+  because the gated average dipped to −0.04 Hz. At a 32 ns floor that window
+  still convicts: `amov` 20.0 ns against `0.25·aexp` = 20.7. **The verdict the
+  floor exists to stop is the one it lets through.**
+
+  The floor now comes from the reference's own measured scatter instead of its
+  display step. `Rf` is the variance of `z_f` and the filter already computes it
+  for the TIM2 update; the thirty-two readings in a window come from a
+  hundred-second boxcar and so share almost all their content, which makes the
+  accumulated noise `W·σ` rather than `sqrt(W)·σ`. On this board that is
+  32 × 2.9 = **93 ns**, clearing the 83 ns event by twelve per cent and
+  following the antenna instead of being a constant.
+
+  It is a one-sigma test and deliberately so: two sigma would be 186 ns and
+  would blind the frozen-detector check this whole test exists for. The cost is
+  stated — a frozen detector now needs a real offset of about 0.03 Hz before it
+  can be convicted — and below that there is no phase motion to miss. The
+  simulator is silent on the change (steady state 3.94 ns and dPWM 1.305 either
+  way), because its TIM2 is clean and `aexp` never approaches any of the floors;
+  this is a hardware-only fault and the measurement above is the evidence.
+
+- **The trust test convicted healthy detectors on TIM2's own quantisation
+  (build 39).** The window's expected phase motion comes from `z_f = -100 x
+  avg100`, whose gated 100 s average moves in 0.01 Hz quanta - one quantum of
+  bias is 32 ns of "expected motion" over a 32 s window, above the old floor
+  of `4*sqrt(2R) ~ 16.5 ns`. An oscillator parked near a quantisation
+  boundary with quiet GPS then opened the test on phantom motion, a locked
+  loop moved nothing, and three windows convicted the detector: 30 minutes of
+  HOLD with healthy in-band readings (03.09 20:11, and already on record at
+  02.09 10:59). The floor now also covers one step of the reference's own
+  resolution: `max(4*sqrt(2R), trust_ns, 100 * 0.01 Hz * KF_TRUST_W)`. The
+  cost is stated: a frozen detector needs real offset above one quantum
+  before the test can see it.
+- **KC no longer acts during acquisition (build 39).** With the controller
+  horizon split (KC = KT/3), a cold arm landing half a band out commanded
+  1278/33 = 39 ns/s of nulling and the boot rode the limiter through six
+  rail-bounces and 116 rejects. KC now waits on a one-way latch - the phase
+  inside the acquisition band on a reading the filter is using - then keeps
+  it for good; `LA n` restarts re-earn it. The R-EMA moving guard and the
+  frozen-detector patience follow the horizon in force, so both revert to
+  their pre-split (KT) behaviour during acquisition.
+- **The first TIM2 update after a reset no longer believes the power-on
+  transient (build 39).** `kf_reset()` seeds P11 wide open, so the first
+  update gave a stale 100 s boxcar (still carrying the oscillator's pull to
+  frequency) a gain of ~0.9 and wrote a frequency the board no longer had -
+  f = -29513 ps/s one second after the 03.09 boot arm, un-said through the
+  limiter for nine minutes. TIM2 updates are blanked for the first boxcar
+  (100 s) after a reset; the arm gate and the trust test read `z_f` directly
+  and are unaffected. Arms widen P00 only and do not re-trigger the blank.
+- **The innovation average carried the pull-in for hours, and the Q adaptation
+  acted on it.** An arm lands the phase a thousand nanoseconds out, so the
+  innovations during acquisition are of that order and their *squares* are a
+  million times the steady-state value. `s_kf_ms_innov` is an EMA with a 0.001
+  constant, so it needs about three hours to forget one. Reconstructed from the
+  03.09 18:35 capture it peaked at **3.0e+05** and, 5100 s later on a run that
+  had been quiet since t+446, still read **1.6e+03** against a true value of
+  **9.1**. The firmware's own `KL` reported `ratio 31.55` on a run whose last
+  thousand seconds measure **1.7**.
+
+  That is not a display fault. The adaptation *acts* on this ratio, so **Q was
+  being driven to its ceiling for hours after every boot by innovations that
+  belonged to the pull-in** — which is why almost every capture in this
+  project's history has shown `[at ceiling]`, and why the only run that did not
+  was the eight-hour one. It is the same shape as the water-mark bug two builds
+  earlier, and it hid for longer because the number it corrupts is plausible.
+
+  The EMA now starts when `tracking` does, on the same latch as the water marks,
+  and is **seeded to `S`** rather than zeroed: `S` is what a consistent filter
+  expects `y²` to be, so the adaptation opens at ratio 1 and moves only on
+  evidence gathered while tracking. Measured across the harness — steady state,
+  clean detector, 8 ns wander, railed cold start, −1300 ns start — no change
+  beyond seed noise, because the simulator's arm model is milder than the
+  hardware's and its acquisition transient was never the problem.
+
+- **The R estimator's freeze guard divided by `KT` while the control asked for
+  `x0/KC`.** The guard's own comment binds it to "exactly what `u` below will
+  ask for"; since build 36 that is `x0/KC`, so left on `KT` it under-read the
+  commanded nulling rate by `KT/KC` = 3 at the default split — motion it scored
+  as 0.4 ns/s was really 1.2 and should have frozen the EMAs. Steady state is
+  unaffected because `x0` is small, but every nulling transient fed R and
+  `ms_diff1` at three times the intended rate, and `KC` makes those transients
+  three times steeper. Found by GLM-5.3 Max reading build 36 against that
+  comment.
+
+  Shipped on the argument: the harness barely sees it (only a frequency-error
+  start moves, rejects 6 → 4), because these plants contain cold starts rather
+  than the episode recoveries real GPS produces. `tools/episode_r.py` measures
+  the difference on hardware — how far R rises above its pre-episode mean — and
+  the build-35 baseline is **median +0.074 ns, 90th percentile +0.143, worst
+  +0.306** over sixteen episodes.
+
+  `patience` moved to `KC` with it, because its comment names the control
+  explicitly. The arm gate's `horiz` stays on `KT` deliberately: it asks how far
+  drift carries a landing before the loop has authority, which is not a
+  nulling-speed question, and `KC` there would admit *more* arms.
+
+- **The phase measurement and the housekeeping voltmeter shared one ADC with no
+  interlock, and the bench caught it on the harmless side first.** `PA1` (the
+  LTIC ramp) is `ADC1_IN1` and `PIN_VCTL_ADC` (`PB1`) is `ADC1_IN9` — one ADC on
+  this part — and the core's `analogRead()` reconfigures the channel on a shared
+  handle and is not reentrant. `ltic_read_fast()` runs from the PPS-woken task;
+  `ControlTask` reads Vctl/Vcc/Vdd every 200 ms. Nothing stood between them.
+
+  The visible symptom was cosmetic and exact. In the 03.09 10:08 capture the
+  displayed Vctl dropped from 1.800 V to **1.620 V** seven times, for about two
+  seconds each, with the PWM unchanged. Vctl is a **ten-deep moving average**, so
+  one conversion returning zero drops it by exactly one tenth: 1.800 × 0.9 =
+  1.620, matched to four figures, seven times. That value feeds only the
+  displays, so nothing was steered by it — but it is a direct measurement of an
+  ADC conversion being destroyed by the other task, and the same collision on the
+  other side destroys a **phase**.
+
+  There was a second, independent reason the read had to be atomic: **the 50 µs
+  settle is a deadline, not a delay.** The ramp decays with a ~5 ms leakage
+  constant, so a task switch that pushes the read out by 1 ms lands it 20 % down
+  the decay — a 20 % phase error with no outward sign at all.
+
+  Both are now closed by suspending the scheduler around every ADC access: the
+  whole settle-and-sixteen-conversions block in `ltic_read_fast()` (~350 µs) and
+  the three conversions in `ControlTask` (~60 µs), plus the two calibration
+  refreshes and the one throwaway read at startup. **Interrupts stay enabled
+  throughout** — the PPS capture, the timers and SysTick are untouched — so
+  nothing in the timing path changes; only other *tasks* are excluded.
+
+  A mutex was considered and rejected. The only correct timeout on the phase side
+  is zero, because it cannot afford to wait; and a zero-timeout take that fails
+  leaves a choice between racing anyway and dropping a phase measurement, neither
+  of which is an improvement. Suspending the scheduler makes the cheap side yield
+  to the deadline instead, which is the right way round.
+
+  The same capture also carried what the collision looks like on the phase side:
+  a lost second in the log (03:18:24 → 03:18:26), CPU 38 % on the sample that
+  followed, and a single detector reading of **+1369.1 ns** — a full ramp, i.e. a
+  read served against the wrong reference edge. The LTIC gate should have held it
+  (the jump is 1364 counts against a 743-count threshold) and did not, because
+  its second-chance branch accepts a reading that matches the previously rejected
+  one — and a task starved past a PPS boundary produces exactly a matching pair.
+  Algorithm 13's innovation gate caught it regardless: `rej` went 135 → 136 and
+  the phase estimate never moved off −3.7 ns. Defence in depth worked; the layer
+  that should have stopped it did not.
+
+  No new telemetry is needed to confirm the repair. If it worked, the Vctl ×0.9
+  dips stop appearing.
+
+- **A night's `KL` reported `Q since start: 5.022e-06 .. 4.982e-05` and neither
+  number meant what the pass conditions needed.** The water marks added one build
+  earlier — so that a single dump at the end of an unattended run could answer
+  "did Q ever pass its ceiling" and "did it descend during quiet stretches" —
+  spanned the whole run, and during pull-in `tracking` is false, the ceiling is
+  not in force, and the wide `q_seed·1e3` rail applies instead. The high mark was
+  therefore six times the tracking ceiling, entirely legal, and unreadable as
+  either an excursion or its absence. An offline replay of the settled hours put
+  the real range at `6.4e-06 .. 1.2e-05`. The marks now start at the first
+  tracking second and are never reset afterwards — a momentary loss of tracking
+  is part of the night, not a new one. `KL` says `Q while tracking` accordingly.
+
+  It is worth naming what happened rather than just fixing it: the diagnostic
+  added to stop a rail going unreported was itself unreadable on its first night
+  out, in the same way and for the same reason. Two builds earlier the `[at
+  ceiling]` line hid the floor; here the water marks hid the regime.
+
+- **The Q adaptation was subtracting the wrong R, and the two noise EMAs were
+  named so alike that a written analysis of this filter read them backwards.**
+  `R` is deliberately the **lag-16** mean square — it carries the detector's slow
+  wander as well as its white noise, so the innovation gate and the Kalman gain
+  treat the detector as worth what it is across the horizon the loop steers over.
+  That derivation is documented at its code site and it measured: dropping to the
+  white floor there is what threw away 11% of readings on the 29.08 bench and, on
+  the 27/28.08 run, steered the detector's wander into the oscillator.
+
+  It is right for the gate and right for the gain. It was wrong for the third
+  thing R had quietly been given to do. An innovation at a **one-second**
+  prediction horizon can only carry the white floor plus whatever the filter
+  failed to track — about 6.4 ns² on this board — so it can never reach the
+  8.45 ns² the lag-16 estimator reports. `Pobs = ms_innov - R` is therefore
+  negative in quiet GPS as a matter of arithmetic, and the adaptation was
+  information-starved by construction rather than by accident. The hold added in
+  build 30 made that survivable; it did not make it informative.
+
+  Referenced to the lag-1 floor instead, the arithmetic closes:
+  `E[y²] = P00 + σ_white²`, so `Pobs` estimates the true `P00` and `Ppred` is the
+  filter's own — a covariance-consistency test that Q can actually move, because
+  `P00` is exactly what Q is the lever on. The gate and the gains keep the lag-16
+  `R` and every protection documented there.
+
+  The bang-bang law went with it. `×1.02` above ratio 1.2 and `×0.98` below 0.8
+  has no fixed point, only two deadband edges to chatter between, and it is
+  violently asymmetric in time: at ratio 1.25 it compounds to **×2.7 per minute**,
+  while coming back down needs the ratio under 0.8, which cannot happen until P
+  has already grown. It is now a multiplicative stochastic approximation,
+  `Q *= 1 + κ(ratio − 1)` with `κ = 0.001` matched to the innovation EMA and the
+  step clipped at ±0.02 so the worst-case rate is no higher than before. Fixed
+  point exactly at ratio 1, symmetric, and the same ratio 1.25 now e-folds Q in
+  **about an hour instead of a minute** — a GPS episode cannot ratchet it. The
+  adaptation also stands down for ten minutes after any picDIV arm and while the
+  gate is rejecting above 5%, on the same grounds as the `moving` guard the R
+  estimator already had.
+
+  Because the lag-1 EMA now sets the adaptation's reference rather than only
+  feeding `Sf`, its input is **Winsorized**: the squared difference is clamped
+  rather than the sample skipped, so a Gaussian tail is barely touched while a
+  20 ns GPS step is bounded. The clamp is **9×** the running mean square, not the
+  3× that looks natural — the EMA holds `0.5·d1²`, whose mean is `σ²`, while `d1`
+  itself has standard deviation `√2·σ`, so clamping at `m·σ²` clamps `|d1|` at
+  `√m` standard deviations. At `m = 3` that is 1.73 σ: it fires on **8.4%** of
+  samples and biases the floor **down by 14%** (measured on 400 000 Gaussian
+  draws) — landing squarely on the quantity the change exists to measure
+  accurately. At `m = 9` it is the intended 3 σ: 0.27% of samples, 0.5% bias.
+
+  **Measured**, before against after, twelve noise seeds per condition. With a
+  detector wander matched to this board's (5 ns / 300 s), phase sd **27.4 -> 19.3
+  ns** mean and **44.6 -> 25.3** worst case, control-error sd 2.13 -> 1.58 LSB, DAC
+  motion unchanged. At 8 ns of wander, **21.2 -> 17.5** mean and **35.4 -> 21.3**
+  worst. A frequency error of 200 LSB: mean 29.8 -> 28.0, worst **51.3 -> 34.9**.
+  Acquisition — eight railed cold starts at two horizons, and a -1300 ns start —
+  is unchanged. Two conditions come out worse: a perfectly clean detector (mean
+  23.1 -> 24.6, though worst case improves 33.7 -> 31.3) and wander at 12 ns,
+  which is half again what this board shows (17.0 -> 18.6). That is the expected
+  shape of the trade: the change lets Q rise to cover wander the lag-16 `R` was
+  keeping out of the gain, which is right up to the point where the wander is
+  large enough that it wants its own state instead.
+
+  And the EMAs are renamed. `s_kf_ms_diff` is now `s_kf_ms_diff16`, with the lag
+  in the name and a comment at the declaration, because the pair being read
+  backwards is what turned a documented design decision into a phantom "30% error
+  in R" and cost a day.
+
+  Diagnosis and the two repairs are **GLM-5.3 Max's**, from an independent
+  reading of the 02.09 four-hour capture; the two constants above are this
+  project's corrections to them.
+
+- **Algorithm 13's process noise had never once adapted — it was always pressed
+  against a rail, and one of the two rails was invisible in `KL`.** Three
+  captures on one board, 02.09, at three different horizons:
+
+  | KT | Q in use | which rail |
+  |---|---|---|
+  | 100 s | 7.777e-06 | `R/T^3` — the ceiling |
+  | 40 s | 9.936e-08 | `q_seed/1000` — the floor |
+  | 20 s | 7.949e-07 | `q_seed/1000` — the floor |
+
+  Each matches its rail to four significant figures. `KL` named only the
+  ceiling, so two of the three runs looked like a healthy adaptation.
+
+  Two faults, and they hid each other. First, the floor was `q_seed/1000` and
+  `q_seed` is `r_seed/T^3` — **the same T as the ceiling**. Both rails moved
+  together, so changing KT slid a fixed thousand-fold window up and down instead
+  of giving the adaptation any more room. The KT sweep those captures were meant
+  to be measuring was measuring where a rail happened to sit: KT 40 came out
+  *worse* than KT 100 (fitted loop time constant 91 s against 40–65 s) because Q
+  fell 78x when the floor moved under it and the estimator's own `(R/Q)^(1/3)`
+  went to 462 s. A shorter horizon produced a slower loop.
+
+  Second, the adaptation compared the innovation mean square against `S`, and
+  `S = HPH' + R`. `S` can never fall below `R`, so whenever the innovations come
+  out smaller than R alone the ratio is stuck under 0.8 whatever Q does, and the
+  0.98-per-second decay runs until it hits something. **There is no lower fixed
+  point.** The adaptation was being asked to repair an error in R by shrinking
+  Q, which is not a thing Q can do — and on this board, since the sawtooth
+  pairing was fixed, the innovations *are* smaller than R: measured R is 2.9–3.0
+  ns while a structure-function fit of the same captures puts the white part at
+  2.35–2.65. The ratio sits near 0.77. At KT 100 it measured 0.83 and Q froze on
+  the ceiling where an earlier climb had left it; at KT 40 it measured 0.77 and
+  Q walked to the floor. A four per cent change in R flipped the loop between
+  two opposite failures.
+
+  The floor is now a **numerical** rail with no T in it — the value the same
+  formula gives at the longest horizon the firmware accepts, with a detector at
+  its quantisation limit, about 1e-12 on this board and six decades under the
+  seed — so it can keep the recursion off zero without taking part in the
+  answer. The ceiling keeps its T, because "do not run faster than the horizon
+  you were given" is what KT means. And the adaptation now subtracts R from both
+  sides and compares `HPH'` predicted against `HPH'` implied: when the implied
+  value is negative the innovations carry no information about Q, so Q is
+  **held** and `KL` says so, pointing at R instead. `KL` also names the floor
+  now, and the held state.
+
+  **Measured**, before against after, same tree, one condition at a time.
+  Steady state with a detector walk matched to the measured one: at KT 100 phase
+  sd **42.1 -> 31.6 ns**, control-error sd **3.17 -> 2.56 LSB**, correlation with
+  the true required control **0.046 -> 0.319**, DAC motion unchanged; at KT 40 Q
+  leaves the floor (**1.2e-07 -> 2.9e-05**) and phase sd goes 6.00 -> 5.06. With
+  a clean detector at KT 100 over twelve seeds, mean **24.26 -> 23.12** and worst
+  case **53.42 -> 33.73**. With 12 ns of slow detector wander, **20.8/29.2 ->
+  16.5/20.4**. Every acquisition case — eight railed cold starts at each of three
+  horizons, a -1300 ns start, a frozen detector inside and outside the band — is
+  **bit-identical**, which is what should happen: the adaptation stands back
+  during pull-in and this change is entirely inside the part that tracks.
+
+  The repair the previous comment in this file proposed — seeding Q from a TIM2
+  measurement of the oscillator's frequency walk — was checked and is not
+  possible: an integer one-second count quantises at 29 ns/s and a hundred-second
+  average at 2.9, against a walk of order 1e-2 ns/s. That is item 4 of
+  `doc/AUDIT_algo13_model_gaps.md`, already closed there as unmeasurable. The
+  seed was never the problem; the floor was.
+
+- **The loop could re-sync the divider while the detector was reporting a
+  perfectly good phase, and throw away most of the acquisition band doing it.**
+  The arm test asked `!have`, and `have` is `raw && trust` — two different
+  faults collapsed into one question. A RAILED detector (`raw` false) is saying
+  nothing at all, and re-syncing the picDIV is the only repair there is. A
+  DISTRUSTED one (`raw` true, `trust` false) is still reporting a phase, and if
+  that phase is inside the acquisition band then arming repairs nothing: it
+  discards a usable reading and lands somewhere between -900 and -1650 ns.
+
+  On the 02.09 10:59 capture that is exactly what happened. At t+593 s the
+  detector read **-53 ns** at `Vphase 2.041 V` — healthy by any measure — but
+  the trust test had dropped it eight seconds earlier and the loop was in
+  holdover. The branch counted its five seconds and armed. The phase went to
+  **-1222 ns** and the run needed another seven hundred seconds to come back:
+  three arms and **1317 s** to settle, against one arm and **309 s** the night
+  before on the same board.
+
+  The branch now arms only when there is nothing to lose — no valid reading at
+  all, or a valid one already outside the band, which is the frozen case where
+  a re-sync *is* the repair. **Measured** against the same tree with the one
+  condition removed: eight railed cold starts, steady state, a 12 ns/300 s
+  detector drift, a -1300 ns start offset and a 200 LSB frequency error all come
+  out bit-identical, and a detector frozen outside the band still arms fourteen
+  times. Only a detector frozen *inside* the band changes — fourteen arms become
+  none — which is the case the change is for.
+
+- **The TIM2 measurement was lagged and over-trusted; fixing both halved the time
+  to acquire.** Two faults in one place, and `loopsim.cpp` had described the
+  second of them about its own plant model since 26.08 without anyone telling the
+  filter.
+
+  `Rf` was estimated from the differences of adjacent `avg100` readings. Those
+  are boxcars sharing ninety-nine of their hundred samples, so their difference
+  is about a hundredth of the single-sample noise and the estimator came out two
+  orders of magnitude too small — the `Rf >= 1` floor was quietly doing all the
+  work, and 1 (ns/s)² is itself about eight times too optimistic. It is now built
+  from the ONE-SECOND counter's own measured scatter divided by the number of
+  samples the average in use contains: no constant, and a noisier PPS or a worse
+  antenna shows up in it directly.
+
+  And a hundred-second boxcar is not a measurement of the frequency now — it sits
+  about fifty seconds behind, which is exactly when the frequency was different if
+  the loop has been correcting. The loop books every correction it makes, so it
+  knows the commanded change over that window: the measurement is now predicted
+  as `x1 - du/2` rather than `x1`. A correction, not an inflation, because the
+  number is known rather than merely bounded.
+
+  **Measured** over sixteen railed cold starts (four frequency offsets, four
+  seeds): mean time to settle **1802 -> 923 s**, worst case **4615 -> 2727 s**,
+  with far fewer picDIV arms. Frozen-detector tracking improves six-fold (track
+  sd 978 -> 169 LSB). Steady state is a wash. This is item 3 of
+  `doc/AUDIT_algo13_model_gaps.md`, which was ranked third of five and turned out
+  to be the largest single improvement of them.
+
+- **Algorithm 13 could fail to acquire at all, and the simulator could not see
+  it because its picDIV model was flattering.** The 01.09 21:00 capture never
+  locked: eleven minutes, four arms, 460 s of holdover, 94 s of gate rejections,
+  eleven seconds of normal operation. `Sf` had nothing to do with it — `R` never
+  left its seed, so `Sf` was identically zero the whole run.
+
+  **Where an arm actually lands.** Seven arms across the three captures of 01.09,
+  phase read in the second after each: `-1554 -1431 -899` (21:00), `-1641 -1441
+  -943` (17:12), `-927` (10:49 — the one run that then worked). Every one
+  negative, none near zero, -900 to -1650 ns against a band of ±1500. The
+  simulator modelled the landing as `gauss(300)` — a few hundred nanoseconds
+  either side of zero — so every simulated arm recovered and every acquisition
+  test passed. That is the third flattering model found in `loopsim.cpp`, after
+  the perfect TIM2 and the wrong rail voltage. It now lands where the hardware
+  lands, and it can rail again afterwards, which the harness also never modelled.
+  `LOOPSIM_ARMOFS` / `LOOPSIM_ARMSD` override the two numbers.
+
+  **Why the old gate could not work.** It asked only that the frequency error not
+  carry the phase across half the band during the 60 s hold-off — `arm_hz =
+  range/(2·100·60)` = 0.25 Hz — which spends the entire budget on drift and
+  leaves nothing for the landing offset, and the landing offset turns out to be
+  most of the band. The 21:00 arms passed that gate at +0.24 and +0.17 Hz: 24 and
+  17 ns of phase per second, enough to walk a -1450 landing off the ramp in
+  seconds. The gate now asks the question that matters — *given where this
+  divider lands, will the phase still be readable one horizon from now?* — with
+  the landing measured from the last arm and the drift from TIM2, so neither term
+  is a constant anyone has to guess. It also stops refusing a large frequency
+  error that happens to push the phase back toward the middle. An escape after
+  ten horizons blind keeps a gate that can refuse forever from doing so.
+
+  **And the filter was treating its own actuator as exact.** `s_kf_x1 +=
+  polarity*applied/lsb_per_ns` hands the filter the correction as fact, with no
+  covariance attached, and `lsb_per_ns` comes from `CT`, which is a measurement
+  like any other. A few per cent of error there accumulates in `x1` and nothing
+  ever takes it back — and the bias has a stable home, because `u = -(x1 + x0/T)`
+  commands exactly nothing whenever `x1 = -x0/T`. The loop parks at a constant
+  phase offset with zero innovations and no measurement disagreeing with
+  anything. Seen in the simulator parked at -100 ns for 1500 s with `x1` = +1.0
+  ns/s — a 0.01 Hz error, exactly TIM2's resolution, so the second measurement
+  cannot see it either — and on hardware as the 01.09 run that took 3600 s to
+  bring 21 ns down to 7.5 ns while reporting "already nulling" (TODO 80), and as
+  every standing offset this loop has ever shown. Five per cent of the applied
+  correction, squared, now goes into `P11`: the filter keeps enough doubt about
+  its own frequency for the phase measurement to pull it back.
+
+  **Measured**, sixteen railed cold starts (four frequency offsets, four seeds),
+  on the honest arm model: mean time to settle **2316 -> 1802 s**, worst case
+  **7127 -> 4615 s**, and far fewer arms in every case that changed. The locked
+  loop is unchanged to two decimal places on every steady-state figure across two
+  plants, five seeds and three levels of detector wander — both repairs are inert
+  once the loop is in.
+
+  `loopsim` now reports **time to settle**, which is the metric acquisition
+  changes actually move; phase sd over a whole run scores a loop that arms early
+  and badly the same as one that waits and arms well.
+
+
+- **Algorithm 13 was running half a clock model, and that half was the ratchet.**
+  The two-state clock model every timing text uses carries *two* process-noise
+  densities — `Sf`, the white frequency noise (`h0`) which appears as a random
+  walk in phase, and `Sg`, the frequency random walk (`h_-2`):
+
+  ```
+         | Sf*t + Sg*t^3/3   Sg*t^2/2 |
+    Q =  |                            |
+         |    Sg*t^2/2        Sg*t    |
+  ```
+
+  This filter injected `Q/3`, `Q/2`, `Q`, which at `t` = 1 s is `Sg`'s three
+  terms exactly, with **`Sf` identically zero** — not a knob set to zero: it had
+  no name and nothing measured it. The consequence is the whole story of the last
+  week. With no `Sf`, the only way to explain *"the phase moved more this second
+  than I predicted"* is to raise `Sg`, that is, to conclude the OSCILLATOR'S
+  FREQUENCY is wandering fast. Short-term phase noise, a wandering detector zero,
+  a lagged counter reading: all of it was booked as frequency random walk, which
+  raises `K1`, the gain that writes the frequency state, which is what the DAC
+  follows. The `Q` ratchet was not a bug in the adaptation. It was the adaptation
+  doing the only thing the model left it.
+
+  **Measuring `Sf` needs two lags, and the second is nearly free.** Over a lag of
+  `k` seconds the phase differences carry `0.5*E[dp^2] = sigma_R^2 + Sf*k/2` —
+  white noise, which does not grow with `k`, plus a walk, which does. The history
+  for the lag-16 `R` estimator was already there; a lag-1 estimator alongside it
+  separates the two. It is the same `floor` / `slow` split `tools/logab.py` has
+  been printing all along and the filter was never given.
+
+  **`Sf` is measured, not adapted**, so unlike `Sg` it cannot ratchet — that was
+  the point.
+
+  The first version of this clamped the difference at zero and was wrong, in a
+  way worth recording: both estimators are EMAs with `alpha` = 0.002 of a squared
+  Gaussian, so each carries about 4.5% standard error and their difference about
+  6.3%, and clamping a noisy signed quantity at zero rectifies it into a positive
+  bias of roughly 0.4 sigma. On a perfectly white simulated detector, where the
+  honest answer is zero, `Sf` came out 1.5e-2 ns²/s — the predicted bias almost
+  exactly — and it cost 60% on phase sd and a factor of two on ADEV at tau 1024,
+  because a fictitious `Sf` explains the innovations, the adaptation then starves
+  `Sg`, and `Sg` is what lets the filter follow a drifting oscillator. The
+  difference must now clear two sigma of its own noise (0.126 of the estimate)
+  before it counts as one, and that threshold is derived from the EMA constant
+  rather than chosen.
+
+  **Measured**, two plants, five seeds. With a clean detector, where `Sf`
+  correctly reads zero, everything is unchanged; the railed, frozen, cold-start
+  and `KT`-sweep cases are unchanged to the last digit. With 12 ns of detector
+  zero wander — which is the condition both real boards are actually in, `R` 6.3
+  ns of which about 5.9 ns is wander — short-tau ADEV improves **1.7x**
+  (3.11e-11 -> 1.81e-11 at tau 16) and the loop tracks the oscillator's true
+  trajectory materially better (track sd 1.26 -> 1.14 LSB, applied-against-
+  required correlation 0.913 -> 0.928; on the second plant 1.29 -> 1.15 and
+  0.461 -> 0.529). The costs are 33% more DAC motion — still an order of
+  magnitude below where this started, and it is useful motion, since short-tau
+  ADEV improved with it — and about 8% on ADEV at tau 1024.
+
+  `KL` prints `Sf` next to `R` and `Q`. Zero there means the two lags agree,
+  which on a clean detector is the right answer.
+
+  This is item 1 of `doc/AUDIT_algo13_model_gaps.md`. Items 2 to 4 — the detector
+  zero as a state, the lagged and over-trusted TIM2 measurement, and a `KT` that
+  the rubidium-referenced data says is five to ten times too short — are still
+  open, and `KT` still cannot be raised until the `Sg` seed stops scaling as
+  `1/KT^3`.
+
+
+- **The `Q` ceiling stood back during acquisition, because otherwise it was
+  tightest exactly when the filter needed room.** `R` starts *at* its seed
+  (`kf_reset` seeds the difference estimator with `r_seed`) and `q_seed` is
+  `r_seed/KT³`, so on the first second `R/KT³` **is** `q_seed`: the new ceiling
+  landed on the seed and left the adaptation no upward room at all until `R` had
+  been measured. Acquisition is where a wide `Q` earns its keep — a phase a
+  thousand nanoseconds out needs a filter that can move.
+
+  The 01.09 17:12 capture is what raised it: a picDIV arm landed the phase at
+  -2124 ns, outside the detector band, and the run took five arms, 897 railed
+  seconds and 3300 s to settle while throwing away up to **70% of its readings**
+  at the innovation gate — against one arm and 900 s the run before. The
+  simulator does not reproduce that start (arming lands cleanly there), so how
+  much was this and how much was the arm's own dice roll is not settled; a
+  ceiling that collapses onto the seed at boot is wrong either way.
+
+  So the horizon bound now applies only while the loop is tracking: the phase
+  inside the acquisition band **and** `R` with at least one EMA time constant of
+  real measurement behind it. Until both hold, the adaptation runs against the
+  wide sanity rail as before. Nothing is lost — the ratchet this bound exists to
+  stop is a steady-state fault that needs hours of quiet tracking to develop.
+  Steady state is unchanged to the last digit across two plants, five seeds and
+  three levels of detector wander; the frozen-detector case improves sharply
+  (phase sd 347k -> 55k ns, end frequency -0.50 -> +0.31 Hz, gate rejections
+  11.2% -> 0.8%).
+
+  Standing back is not the same as letting go, and the first version of this got
+  that wrong: with the tight ceiling suspended and no unconditional one behind
+  it, a 1.02-per-second ratchet reached `Q` = 5.4e+18 in under two hours on the
+  frozen-detector plant — the loop never reads "tracking", so the only bound left
+  has to be an unconditional one. The wide rail is now applied in both branches.
+
+
+- **The CPU reading in the TFT header is back on the centre line of the bar.**
+  Fixing the clipped `%` moved it: the field was centred in the gap between the
+  product name and the *padding* the LMT clock reserves, and `HDR_LMT_PAD` is far
+  wider than the clock's glyphs, so the whole string sat about 23 px left of
+  centre on the 480 panel. The padding was never the obstacle — both draw paths
+  put CPU down last, so nothing can erase it afterwards, and the only thing it
+  must not touch is the clock's actual glyphs. Measured against those instead,
+  the free space is symmetric (the product name and the clock are both sixteen
+  characters), so the centre line fits with about 30 px to spare on each side and
+  that is where it goes. The erase band is now sized to the widest reading the
+  field can show (`CPU 100%`) rather than to the whole gap — sizing it to the gap
+  was what forced the text off-centre in the first place. The centre is used only
+  when the measured widths say it fits; otherwise the gap centre is kept as the
+  fallback, and if even that is too small nothing is drawn, so no arrangement of
+  fonts or panels can bring the clipping back.
+
+
+- **`KL` now says so when `KQ` is pinned.** The header line already distinguished
+  the two by omitting `(adapt)` after the value, and that was not enough. The
+  01.09 capture showed the loop moving the DAC six times less than the week
+  before, which read as the new ceiling on the `Q` adaptation doing its work —
+  and it was not: `KQ` had been pinned at the seed during an earlier experiment
+  and recalled from the flash ring on every boot since, so the adaptation had
+  not run at all. A setting that survives reboots and changes the meaning of
+  every other number in the report needs a line of its own, so it has one.
+
+- **Algorithm 13 over-actuated: `Q` ratcheted up on correlated detector noise
+  until the filter was five times faster than its own horizon.** The bench had
+  been showing the loop moving the DAC 1.80 LSB per second against algorithm
+  11's 0.49 on the same night, with no better phase for it — and split into fast
+  and slow components it was per-second jitter, 3.7x, not slow wander.
+
+  The cause is in the `Q` adaptation, and it is a one-way ratchet. The filter
+  raises `Q` whenever its innovations come out bigger than the covariance
+  predicted. When the detector's error is *correlated* — a zero wandering over
+  minutes — they do, for a reason that has nothing to do with the oscillator, so
+  `Q` climbs at 1.02 per second until `P` and `S` have grown enough to explain
+  them. It stops, but it stops high: `KL` on 30.08 read `Q=1.238e-03` against a
+  `6.36e-06` seed. 195x in `Q` is `sqrt(195)` = 14x in the gain that writes the
+  frequency state, and that gain is what the DAC follows.
+
+  A SECOND BOARD SETTLED IT. Dan Wiering ran the same firmware on his own board
+  with nothing touched beyond `CT`, `LC`, `SAW 1` and `ES LTIC`, and it went the
+  whole way: `Q` was against the old 1000x rail at `4.468e-03` within 2h37m of
+  boot and still there nine hours later, the DAC moving **11.05 LSB/s** and
+  applying a **249 LSB span where the oscillator needed 19.8**. Measured against
+  a rubidium standard — the independent reference this project does not have —
+  ADEV at 20 s was **8.6e-11 against 3.1e-12** for algorithm 11 on the same board
+  and the same reference, a hump peaking, as it must, at the filter's own time
+  constant. Same defect, four times the size, on hardware that had never been
+  tuned by hand.
+
+  `(R/Q)^(1/3)` has the units of time and is the filter's own time constant, so
+  `Q = R/KT³` says exactly *run as fast as the horizon you were given*. The
+  adaptation is now bounded there: **the filter may not run faster than `KT`**,
+  with `R` taken as measured rather than as seeded. That last part is not a
+  detail. The first version of this bound was eight times the seed, and it
+  worked — but only by luck, because `q_seed` comes from the a-priori
+  2.5-quantum guess and how far a real detector sits above that is a property of
+  the board: this one measures 2.5x its seed and Dan's 6.8x, so the same
+  multiplier meant tau >= 92 s here and >= 95 s there, and would have meant
+  >= 50 s on a board whose detector matched its seed. Taken from the `R` in use
+  it says the same thing everywhere, and it follows a re-run of `LC` within a
+  second. Measured over two plants, five noise seeds and three levels of detector
+  wander: short-tau ADEV twice better (7.99e-12 against 1.54e-11 at tau 16), DAC
+  motion 2.4x lower, against 7% on phase sd and 25% on ADEV at tau 1024 — and the
+  phase sd is measured against the detector, which is the instrument that lies
+  here, while a rubidium is not. Pinning `Q = 1.238e-03` by hand reproduces the
+  bench figure in the simulator, 1.07 LSB/s, which is the confirmation the log
+  alone could not give.
+
+  Nothing is lost by refusing to let `Q` absorb correlated detector error: `R`
+  already carries it, being measured from differences taken near the horizon. A
+  value pinned with `KQ` still passes as given; the bound is on the adaptation.
+  A faster loop is now asked for the honest way — shorten `KT`.
+
+  AND THAT CUTS BOTH WAYS, which is worth stating plainly. All of the above is at
+  the default `KT` of 100 s. At `KT` 300 and 1000 the loop runs into this ceiling
+  and stays against it (phase sd 0.64 -> 2.82 ns at 300, 3.04 -> 47.6 ns at 1000),
+  because `Q_seed = R/KT³` falls as the cube of the horizon while the
+  oscillator's real walk does not move at all — past a few hundred seconds the
+  seed stops estimating anything, and the old 1000x rail was quietly correcting
+  it. That is now visible rather than hidden: `KL` prints `[at ceiling]` beside
+  `Q`, and a loop sitting there for a whole run is saying *your `KT` is longer
+  than this oscillator supports*. The repair, when it comes, is to seed `Q` from
+  the oscillator instead of from the horizon — TIM2 can measure the frequency
+  walk directly and its noise is independent of the detector's zero. Until then
+  `KT 100` is the measured configuration. `KL` gained the `[at ceiling]` flag in
+  the first place because this fault was found by grepping a capture for that
+  number, which is not a diagnostic anyone should need twice.
+
+- **Algorithm 13's frequency gate could latch shut, and it took holdover with
+  it.** Found while checking the above against a frozen detector: the trust test
+  does its job and drops the detector, and from there TIM2 is the only
+  measurement left — but by then the oscillator is a hertz out, the innovation
+  is 100 ns/s and the gate's limit is 4 ns/s, because `P11` has nothing but `Q`
+  to grow on. Every reading refused, the frequency state stuck at zero, and the
+  loop riding a model that says all is well while the phase runs off. The one
+  case this measurement exists for was the one case it could not act in.
+
+  The phase gate's escape — widen the covariance by the refused innovation and
+  let the next one in — was tried here first and measured far worse: it puts the
+  gain at nearly one, so the state snaps to a measurement that is a 100 s boxcar
+  and therefore fifty seconds behind, and the loop chases its own lag (+10.2 Hz
+  and 7795 LSB/s, against -1.04 Hz and 0.06 LSB/s for refusing outright). That
+  works for the phase because the phase is instantaneous; this is not. So the
+  gate now **clips** instead of opening: after ten refusals in a row the reading
+  is accepted, but only four sigma of it, and the state walks toward the truth
+  at a bounded rate. Frozen detector: -0.49 Hz and 1.9 LSB/s, the best of the
+  three. Every healthy case — railed detector, 400 LSB cold start, clean run,
+  both plants, all seeds — is bit-for-bit unchanged.
+
+### Changed
+
+- **The tuner's status bar now shows the whole firmware identity, and `V`
+  answers with it.** It used to say `connected — firmware v1.06` and stop there,
+  which names the protocol but not the binary. It now reads
+
+  ```
+  connected — firmware v1.06-rtos  build 27  2026-09-02 09:46  CRC 78B08D26
+  ```
+
+  The compile stamp and build serial existed already but only in the boot
+  banner, which has usually scrolled past by the time anyone connects. The
+  sketch now composes that stamp once into a shared string — it has to be the
+  sketch, since `__DATE__` is baked into whichever translation unit mentions it
+  and the sketch is the only one `build_id.h` forces to recompile — and both the
+  banner and `V` print the same characters rather than two that can drift apart.
+
+  All three facts are there because they answer different questions: the version
+  says which protocol the tuner is talking, the build and timestamp say which
+  source tree it came from, and the CRC says which binary is actually running.
+  Only the last cannot be stale, which is the whole reason it exists: on 26.08
+  two captures from two different builds carried the same timestamp and cost an
+  hour of arguing with a log that was right.
+
+  Everything past the version is optional in the parser, so an older firmware
+  that answers `V` with the name alone still connects and the line simply says
+  less.
+
+
+- **`KT` above 200 s now warns, because the loop cannot serve both ends.** `Sg`
+  is seeded and capped at `R/KT³`, so a long horizon forces the *estimator* to be
+  as slow as the *controller* — and those are different things. Removing the cap
+  fixes `KT` 1000 completely (phase sd 50.2 -> 2.92 ns, settling immediately
+  instead of after 11120 s) and brings the ratchet straight back at `KT` 100
+  (`Q` to 1.12e-3, ADEV at tau 16 from 8.05e-12 to 4.08e-11). Freezing the
+  adaptation while the loop is commanding — the guard that works for `R` — does
+  not help either: the ratchet develops in the quiet state too. Separating the
+  two needs `Sg` measured from the oscillator, and `Sg` is 6.4e-6 (ns/s)²/s
+  against a TIM2 noise floor of 8 (ns/s)² — six orders of magnitude below what
+  this board can see. So the cap stays, `KT 100` remains the measured
+  configuration, and the firmware says so when you set anything longer.
+
+- **The detector zero as a fourth state was built, measured, and left out of the
+  tree** — kept whole in `doc/algo13-zero-state.patch`. It does what it was
+  designed to do: with 12 ns of zero wander the DAC moves 32% less and short-tau
+  ADEV improves 1.6x. It also holds the true phase worse (sd 12.80 -> 13.90,
+  track sd 1.13 -> 1.24, `r` 0.929 -> 0.917, ADEV at 1024 +17%), because `x0` and
+  the zero are nearly degenerate — the phase measurement sees only their sum, and
+  the only thing separating them is TIM2 at about 8 (ns/s)². Time constants of
+  1x, 2x, 5x and 10x `KT` were tried. Both losing metrics are measured against
+  the phase reading, which is the instrument the change is about, so this
+  simulator cannot settle it; an independent reference measuring the output would,
+  in one night.
+
+
+
+- **Algorithm 10, LOCK: the deadband is gone, replaced by algorithm 12's own
+  construction.** The old LOCK treated any phase error below `range_ns/40` as
+  zero — 47 ns on this board — with a soft knee above it, and the loop duly
+  parked at a standing +76 ns for ninety minutes. That offset was not a fault in
+  the loop; it was the specification. Removing it and acting on the plain mean
+  of the interval was worse (phase swept ±500 ns, both detector rails), because
+  a mean over H seconds is the phase as it was H/2 ago and this stage already
+  updates only every H.
+
+  Algorithm 12 does not average. Its test `(a+b) + 2*(b-a)` keeps two adjacent
+  half-windows and EXTRAPOLATES to the end of the pair, so the averaging and the
+  lag cancel by construction — and the same pair yields the slope, which is a
+  measurement of the frequency error that LOCK otherwise cannot see at all
+  (`Kp` is 0 here, so the TIM2 term is identically zero). LOCK now keeps that
+  pair, gates the phase on the standard error of the newer mean and the slope on
+  the standard error of a difference of two means, and feeds the slope into the
+  integrator as an absolute PWM correction. No threshold is assumed anywhere:
+  sigma comes from first differences of the detector, the same estimator
+  algorithm 12 uses.
+
+  Measured on 21.08 at `LIV 30`, 25 min in LOCK with no drop: phase RMS
+  **6.9 ns** after settling (mean **+2.2 ns**, −14.3…+19.1 ns), 31 corrections,
+  median step 2 LSB, largest 9. Overlapping ADEV matches the 23 h algorithm 12
+  record to within a few percent at every tau out to 128 s
+  (3.5e-9 at 1 s, 1.0e-10 at 128 s) — which is the point of the change: the
+  three-stage loop now holds phase as well as the accumulator does, on the same
+  hardware, and with a gentler control effort.
+
+- **LOCK cadence is bounded by the drift the loop has just measured.** Never let
+  the phase travel more than two sigma of its own noise between updates, using
+  the slope the pair already yields. This only ever SHORTENS the interval, and a
+  board with no resolvable drift keeps the full `lock_interval_s` it was given,
+  because the bound is a division by a slope that reads zero. Swept in
+  simulation: at `LIV 300` and the drift measured on this hardware, phase RMS is
+  90 ns at eight sigma, 50 at four and 34 at two, against 100 for the old
+  deadband; the loop that looks more often has less to undo each time, so the
+  individual PWM steps get SMALLER, not larger (about 10 LSB at two sigma
+  against 17 at eight). `LIV 30` remains the best setting measured and needs no
+  bound at all.
+
+- **Bumpless DPLL↔LOCK transfer.** The integrator is the absolute PWM target in
+  this loop (`u = integ - pwm`), so on a stage change it is now re-seeded to what
+  was just written. Measured across the transition on 21.08: 40853 → 40854, a
+  one-LSB step where the phase had previously been jerked by wherever `integ`
+  happened to have wound.
+
+- **Vcc is shown to three decimals** and the `dph` row is labelled `dp:` on the
+  320×240 panel; `qE:` is expanded to `qEr:`. All three touched rows now tile
+  the 168..314 px span exactly.
+
+- **Algorithm 10's ACQ was unconditionally unstable — the gain was five times
+  the stability boundary.** ACQ updates every 5 s but steers on `avg100`, a
+  SLIDING 100 s boxcar, so a correction cannot reach the measurement for up to
+  100 s while the loop keeps acting twenty times inside that window. The gain
+  was half the plant (`acq.Kp = 0.5 * lsb_per_hz`), so it applied about ten
+  times what was needed before the measurement could answer.
+
+  Measured 25.08 21:06, a cold ACQ entry with the OCXO already inside 0.02 Hz:
+  PWM swung **31229..51512** — twenty thousand LSB — Vctl 1.38..2.15 V, the
+  runaway guard fired twice, and the run ended parked at **+2.53 Hz** with the
+  PWM frozen for its last 527 s. The simulator reproduces it from the shipped
+  constants alone (PWM ±13319, ending at 2.79 Hz) and diverges even from a
+  one-LSB start, which is what "unconditionally" means here.
+
+  The bound is `Kp * K < 2 * period / window` = 0.10. Swept in simulation from
+  a 0.02 Hz start: 0.50 diverges, 0.25 crawls, 0.10 is the edge (334 s), 0.05
+  settles in 167 s. `acq.Kp` is now **0.05 × lsb_per_hz**, a factor of two
+  inside the boundary, and it converges monotonically from 1 LSB, 0.02 Hz,
+  1 Hz and 3 Hz starts with no overshoot at all (peak excursion 0.95× the
+  starting offset, settled within 603 s in the worst case). It scales with the
+  board's own measured K, so it carries to any OCXO.
+
+  This only ever bit a COLD ACQ. `g_ltic.state` is persisted, so a warm start
+  resumes in DPLL or LOCK and never runs the path — which is why an algorithm
+  shipped in v1.04 took until now to show it.
+
+- **ACQ centring is gated on "not railed", not on "in band" — and the error is
+  clamped to the band instead of being discarded with it.** One term, two
+  opposite failures. Gating it on the full band test stopped the 20.08 shove
+  (Vphase 3.187 V against a band of 0.818..2.865 V, err_v +1.35 V, 690 LSB
+  swept), but it also switches the pull-in off whenever the band LC recorded is
+  narrower than the detector really is — and on this hardware it is a fifth of
+  it. Measured 25.08 with the ACQ gain fixed: after the picDIV arm the phase
+  parked at -1320 ns, i.e. 1.583 V against a recorded band of 1.729..2.433 V.
+  Outside the band, so no centring; frequency already on target, so no
+  frequency term; `u = 0`, PWM frozen, and ACQ→DPLL needs |phase| ≤ 200 ns. A
+  permanent stall with every guard quiet, because nothing was wrong except that
+  the loop had switched itself off.
+
+  What is meaningless outside the band is the MAGNITUDE of `V - centre`, not
+  its sign: the ramp is monotonic up to the rails, so the reading still says
+  which way home is, and that is all ACQ needs — it is a bounded proportional
+  nudge that integrates nothing. It now steers whenever the reading is off the
+  rails, with the error clamped to the band edge: unchanged in band, a
+  band-edge pull outside it rather than a 1.35 V shove, and holding at the
+  rails as before. DPLL and LOCK keep the strict test — they integrate the
+  phase, which is what the gate exists for.
+
+- **The tuner showed a stale loop state on the algorithms with their own
+  vocabulary.** `parse_state()` scanned the whole line for a fixed list of
+  words, and the list could not keep up: the firmware emits `SYNC`, `FLL`, `ZC`,
+  `HYB`, `NoPL`, `hit` and ten direction words like `uf+` that were never in it.
+  On those seconds it returned nothing and the label went on showing whatever it
+  had last recognised — under algorithm 12 the panel read **LOCK through every
+  CORR and ZC second**. `[HOLDOVER]` never matched either, so holdover was
+  invisible. The search was not anchored, so any of those words anywhere in any
+  line could set the state.
+
+  The trend is a FIELD, not a vocabulary: it is the last token of the `PWM:`
+  line, and in holdover the firmware replaces it outright. Taken by position, a
+  word the firmware invents tomorrow is displayed verbatim instead of being
+  dropped, and nothing else on the wire can be mistaken for it. `___` now clears
+  the label instead of leaving the previous word standing — the caller tested
+  truthiness where it had to test `is not None`, which was the same stale-display
+  bug one level up. Fifteen cases checked against the firmware's actual output.
+
+- **The panel's `dph` gained the decimal the log has always had.** The serial
+  report prints one decimal and the panel printed whole nanoseconds; invisible
+  while readings were hundreds of ns, glaring once the loop settled to single
+  digits — the log said −5.2 and the panel said −5. The decimal could not simply
+  be added: both phase fields are sized to the string `+0000ns`, and the 320
+  panel's own comment warns that a five-digit reading would overrun the label.
+  So one decimal below 100 ns, where the widest form `-99.9ns` is exactly the
+  seven characters the field was measured for, and whole numbers above. Checked
+  across the whole detector range: the widest string either format can produce
+  is seven characters, so no pad needed re-cutting. `dtostrf`, not `%.1f` —
+  this file uses no float conversions in `snprintf` anywhere, deliberately,
+  because they print `?` without Float printf enabled in the IDE.
+
+- **The tuner's Help tab caught up with the firmware.** `DAC` now documents the
+  path argument; `LTO`/`LTR` say volts; `MR`'s default is 7, not 9; `AQI`/`AQD`
+  are marked stored-but-inert with a pointer to `ACG`; the algorithm-12 trend
+  list covers the whole vocabulary rather than three of it; `SAW` describes the
+  pairing counters; and `FA`/`FAD`/`FAL` are documented at all, having been
+  missing since they were added. Checked mechanically against the verb list
+  extracted from `gpsdo_cli.cpp` — nothing the firmware answers to is now
+  missing from the tab.
+
+- **`DAC PWM|DITH|EXT` — the control-voltage path is chosen at runtime.** All
+  three output paths now compile together and the command picks which one the
+  firmware drives. The SIGNAL is switched by jumpers on the board; there is no
+  soft multiplexer and there must not be one, because two drivers fighting over
+  the control voltage is a hardware fault rather than a mode. What the firmware
+  needs to know is which path it is steering, so that the step size, the
+  telemetry and the fine-path arithmetic describe the thing that is connected.
+
+  `GPSDO_PWM_DITHER` and `GPSDO_DAC_EXT` were mutually exclusive at compile time
+  and are not any more — the pins never collided (PB9/TIM4 against PB4/PB0/PB2),
+  only the assumption that one binary drove one output. One binary now serves
+  either wiring, and a dither-on against dither-off comparison is a command
+  instead of a reflash.
+
+  PWM and DITH share PB9/TIM4 CH4, so selecting PWM on a board that has the
+  dither engine does **not** tear the DMA down and hand the pin back to
+  `analogWrite`. It writes the same 24-bit code with the low eight bits cleared:
+  every table entry identical, constant duty cycle, bit-for-bit the voltage
+  plain PWM produced — the same output reached without a reconfiguration that
+  could fail halfway. `gpsdo_dac_fine_available()` becomes a property of the
+  ACTIVE path rather than of the build, so a loop steering in fractions is told
+  when the whole-LSB path is about to throw them away.
+
+  Stored in one byte carved from the alignment padding between `tz_str` and
+  `a12_gain` — verified against the compiler, not by eye — so the layout, the
+  size and `SETTINGS_VER` are all unchanged and a block written by an older
+  build still loads. Zero means UNSET and asks for the default, which is why the
+  encoding starts at 1: an old record reads back as "use the default" rather
+  than as "path 0". **The default is DITH**, resolved at bring-up against what
+  is actually compiled in, and never resolving to a path that cannot drive the
+  pin. On a build with the external DAC but no dither engine an unset value
+  gives PWM, not EXT — the external part is a deliberate hardware choice and
+  should have to be asked for.
+
+  The report now prints the commanded voltage beside the measured one and warns
+  when they differ by more than half a volt. The firmware cannot see the jumper;
+  the only evidence that the setting and the wiring disagree is that the control
+  voltage is not where it was told to go. Half a volt is deliberately loose —
+  the ADC divider and reference are good to a few percent at best — because what
+  this has to catch is "commanded 1.80 V, measured 0.00 V", not a scale error.
+
+- **`LTO` and `LTR` take volts, like everything else on this detector.** The
+  same physical point — the detector's phase zero — was held in two units that
+  did not agree: `LZO` = 2.0809 V for algorithm 10, `LTO` = 2620 ADC counts for
+  algorithm 11, which is 2.1104 V. Thirty-seven counts apart, about 37 ns once
+  the scale was corrected, and invisible because nobody compares 2.0809 with
+  2620 by eye. Both commands now take and print volts; the settings block still
+  holds ADC counts, exactly the split `MLP` uses for nanoseconds, so no
+  `SETTINGS_VER` bump and no migration. Both print the count alongside, since
+  that is what a flash dump shows. A value between 3.3 and 4095 is refused with
+  the conversion spelled out — "2620 counts = 2.1104 V — type that" — because
+  that is the one mistake anyone will actually make. In the tuner, `LTO` and
+  `LTR` become volt boxes, EVERY parameter label now carries its unit (or says
+  "(x)" for a dimensionless one), and the algo-11 readback pattern stopped
+  being anchored at end of line, which would otherwise have silently dropped
+  every `tic_offset=2.1104 V (2620 counts)` reply and left the box empty while
+  the board answered perfectly well.
+
+- **`AQI` and `AQD` did nothing, and said nothing about it.** ACQ reads
+  `pid->Kp` and nothing else; the centring pull is `g_ltic_acq_centre_gain`,
+  set by `ACG`, a separate global with its own units. `acq.I_LIMIT` IS live —
+  it is the step limiter — so the inert pair is exactly Ki and Kd. They were
+  set by autotune, printed by `LL`, settable by `AQI`/`AQD`, persisted, and
+  offered as editable boxes in the tuner: five ways to be told a knob works
+  when turning it changes nothing. Every read and write of them now says so,
+  `LL` carries the same note on the ACQ row, and the tuner greys both boxes —
+  the readback still shows what the board holds, it just cannot be turned. The
+  verbs still accept a value, because the tuner sends all four as one group on
+  Apply and a refusal there would look like a fault in the tuner. Removing the
+  fields means touching the settings block, which is a separate job.
+
+- **The TFT phase row was subtracting the NEXT pulse's sawtooth.** Both display
+  paths asked `ubx_timtp_correction_ns()` for the correction at the moment they
+  were drawn, and that returns whatever qErr was decoded most recently. The
+  serial report is gated on a change of `ppscount`, so it runs on the first wake
+  after the pulse and gets the right one. The TFT redraws on EVERY wake of
+  `vDisplayTask` — and one of those wakes comes from the GPS parser, after the
+  receiver's serial burst has been consumed. TIM-TP is inside that burst, so by
+  then `g_qerr_ns` has advanced to the next pulse while `g_ltic_voltage` is
+  still this pulse's ramp. The panel was subtracting qErr(N+1) from phase(N).
+
+  Noticed as a panel reading visibly larger than the log line printed in the
+  same second, and larger is exactly right: on this receiver successive qErr
+  values are ANTI-correlated (corr −0.30, period 2–3 s), so the neighbouring
+  pulse's correction adds the sawtooth instead of removing it. Measured on the
+  25.08 record, subtracting the neighbour takes the residual from 11.46 ns to
+  13.6 ns — worse than applying no correction at all. Alan Cashin had raised
+  exactly this failure mode for the loop the same day; it was in the display.
+
+  `ltic_read_fast()` runs ~50 µs after the PPS edge, before the burst carrying
+  the next frame, so the qErr visible there still belongs to this pulse. It is
+  now latched once and every reader uses the latch, so the report, the panel and
+  the loop agree by construction whenever they happen to be drawn.
+
+- **Algorithm 10 overnight, 26.08: 9.7 h in LOCK, no drop-outs.** ACQ took
+  225 s, DPLL 47 s, and after t = 410 s the state machine never moved again.
+  Settled over 9.29 h: phase mean **+0.09 ns**, sd 7.42 ns, drift **−0.10 ns/h**,
+  PWM inside a 32 LSB band with one correction every 53 s. Overlapping ADEV
+  4.4e-9 at 1 s, 1.0e-10 at 128 s, 1.2e-11 at 1024 s, 1.7e-12 at 8192 s. The
+  residual correlation against qErr held at +0.021 over the whole night, so the
+  sawtooth cancellation is not a short-run artefact.
+
+  What the run also shows is where the remaining error now lives. Splitting the
+  phase into per-sample noise (from first differences) and everything slower:
+
+  ```
+                            sd      noise floor   slow structure
+    algo 11, 5.2 h        3.11 ns      2.56 ns        1.76 ns
+    algo 10, same window  7.76 ns      2.53 ns        7.34 ns
+  ```
+
+  The detector floor is identical — same board, same receiver — so the
+  difference is entirely in the loop. Algorithm 11 corrects every second with a
+  60 s time constant; algorithm 10's LOCK corrects once every 53 s with a phase
+  integral whose restoring time constant is nearer 800 s, and the phase wanders
+  ±20 ns at periods of 250–2400 s because the loop is slower than whatever is
+  moving it. LOCK is now the limit, not the detector.
+
+- **`ltic_autotune()` recomputes only when its inputs changed.** Every gain it
+  derives is a pure function of `lsb_per_hz` (from CT) and `range_ns` (from
+  LC), yet it ran on every transition into ACQ and silently threw away anything
+  the operator had typed. Hit twice in one evening while testing the ACQ gain
+  by hand: `AQP` is set, the loop drops to ACQ, autotune puts the old value
+  straight back, and the next observation is of the tuning you thought you had
+  replaced — with nothing in the log to say so. It now runs once per boot and
+  again whenever CT or LC moves the measured constants, which is what "no
+  per-board hand tuning is ever required" actually needs.
+
+- **The runaway guard could never release.** Freezing set `u = 0`, which leaves
+  the OCXO parked wherever the escape put it; the phase then races through the
+  detector forever, `railed_now` never clears, `|e_freq|` never falls below
+  0.25, and the release condition cannot be met. The 25.08 run sat in exactly
+  that state for its last 527 s. The guard now walks PWM back toward
+  `start_pwm` — the last code held while genuinely healthy — at up to 50 LSB
+  per cycle instead of stopping on the spot, so a 20 000 LSB escape unwinds in
+  about half an hour and the guard releases the moment the frequency comes
+  back inside 0.25 Hz on the way.
+
+- **`LNV` / `LZO` / `LRN` set by hand did not survive a reset.** The detector
+  calibration lives in two places and the other one wins at boot: `LC` writes
+  it to the live-store slot, `ES LTIC` writes it to the settings block, and
+  `setup()` applies the settings block first and the live slot after it.
+  Measured 25.08: `LNV 1252` was set, saved, and the board came back up on
+  2649.3914 without a word. `ES LTIC` now refreshes the live slot as well, so
+  the two agree and the load order stops mattering. Reordering the loads was
+  the other candidate, but `LC` saves ONLY to the live slot, so making the
+  settings block authoritative would have stopped an ordinary `LC` surviving a
+  reboot.
+
+- **The zero-crossing test is armed only by a LIMIT correction (Alan's rule).**
+  One flag was doing two jobs: suppressing a second correction while the first
+  one's deliberate slew is still walking the phase home — our addition, after
+  the 14.08 +3800 LSB overshoot — and arming the zero-cross cancellation. Only
+  the second is Alan's, and his rule is narrower than the port made it: a
+  scheduled correction (the `MR` run level) fires on a timer with the phase
+  wherever it happens to be, so there is no known slew for a crossing to cancel
+  and no reason to expect a crossing at all, and a ZC does not re-arm itself
+  because it *is* the cancellation. Arming in either case let an unrelated
+  crossing minutes later pull a step out of a stale slope. The two jobs are now
+  two flags: the settling suppression still follows every correction, the
+  arming follows only the limit path.
+
+- **`MR` default is 7 (256 s), not 9 (1024 s)** — Alan's own value, and the one
+  that makes the scheduled correction the workhorse it is meant to be rather
+  than a once-every-17-minutes backstop. The code changed with the algorithm-12
+  work; the three manuals said 9 in two places each until now.
+
+- **`MLP` and `ML` speak nanoseconds.** The limit table is stored in accumulator
+  units — a level holds 2^(level+1) samples of `2*phase + 1`, so the stored
+  number is the phase shifted left by `level+2` — and both commands printed that
+  raw number while calling it "ns". Tuning a quantity nobody can relate to an
+  oscilloscope is tuning blind. `MLP <n>` now prints both (`lim[6]=126ns (32350
+  units over 128s)`), `MLP <n> <ns>` takes nanoseconds, `ML` tabulates ns beside
+  units and span, and the tuner's limit boxes are nanoseconds throughout. The
+  storage format is unchanged, so the settings block and existing saves are
+  untouched.
+
+- **Nothing claims the phase detector is present when it cannot know.** Dave
+  Solder_Junkie built without one, and every layer told him it was fine: the
+  boot banner printed `HW: LTIC phase input OK (PA1 analog)`, `LA 12` was
+  accepted, and the loop disciplined the OCXO against ADC noise on a floating
+  pin. Three changes, none of which can detect the hardware — because nothing
+  can — but which stop pretending otherwise. The banner now reads
+  `enabled (PA1) - needs the ramp detector hw`. The `GPSDO_LTIC` comment in
+  `gpsdo_config.h` states the requirement in full instead of describing the
+  circuit. And `LA 10`, `LA 11` and `LA 12` check whether `LC` has EVER run: if
+  the TIC slope *and* the detector range are both still at build defaults, the
+  warning is no longer the mild "uncalibrated" but "no detector calibrated,
+  phase may be floating — is the hardware really there?".
+
+- **ACQ centring holds on an invalid detector reading**, the way algorithm 12
+  already did. The centring term steers on the raw voltage, and a saturated
+  detector reports a voltage that no longer tracks phase; the drift gate did not
+  catch it, because a railed reading is flat and its drift reads zero. Measured
+  on 20.08 19:42, three seconds after a switch into algorithm 10: Vphase
+  3.187 V against a band of 0.818..2.865 V, the centring term saturating its own
+  cap and pushing for as long as the detector stayed out of band, 690 LSB of PWM
+  swept before it settled. Holding costs nothing — the frequency path works from
+  TIM2, which sees the offset whatever the detector is doing, and that is
+  exactly what algorithm 12 falls back on.
+
+### Added
+- **AD5680 external DAC: the driver exists.** `dac_ext.cpp` leaves stub-hood —
+  bit-banged GPIO on CS/SCK/MOSI = PB4/PB0/PB2 (Dan Wiering's PCB routing;
+  PB2 doubles as BOOT1, so the MOSI trace must stay pull-up free), 24-bit
+  word MSB-first (`code << 2`, zero command bits = write & normal mode), DIN
+  clocked on SCLK's falling edge, register latched on SYNC's rising edge,
+  shift-out under ~20 us of masked interrupts. Enable with `GPSDO_DAC_EXT`.
+  Alongside: TM1637 and the 2 kHz test generator are OFF by default per the
+  v1.06 policy (historical options) and yield their pins automatically when
+  the external DAC is enabled — no more #error, the build simply omits them.
+
+  It now builds on a real toolchain: `hostcheck` gained two AD5680 rows (with
+  and without the phase detector) and both compile and link for cortex-m4 under
+  `arm-none-eabi-g++`. That closes the "reviewed only" caveat the driver
+  shipped with — it does not close the hardware test, which is Dan's to run.
+### Added
+- **Algorithm 13 — a three-state Kalman filter (phase, frequency, aging).** Every
+  loop in this firmware until now has had a bandwidth chosen once and lived
+  with: algorithm 10 switches between three, algorithm 11 has a time constant,
+  algorithm 12 picks a level from a threshold table. All three answer the same
+  question — how much of this second's reading to believe — with a number
+  decided in advance. This one answers it from the variances, and re-answers it
+  every second.
+
+  **It costs nothing worth counting.** Three states and a SCALAR measurement, so
+  the matrix inversion everyone worries about is one division: about 140
+  multiply-adds and 36 bytes of state, once a second, roughly a microsecond of a
+  100 MHz M4F. The received wisdom that a Kalman filter needs a Cortex-A or an
+  FPGA is about twenty-state GNSS filters, not about this.
+
+  **Both noise figures are measured, not set.** R comes from the detector's own
+  first differences, the same estimator algorithm 12 uses for its sigma. Q is
+  adapted from the innovation sequence: the filter predicts how big its own
+  surprises should be, and when they are consistently bigger the process noise
+  is too small. `KR` and `KQ` pin either one for an experiment; zero means
+  measure. Seeded with the figures the 26/27.08 night gave — 2.64 ns and
+  2e-6 (ns/s)²/s, the latter consistent across 600, 1800 and 3600 s windows,
+  which is what random-walk FM looks like — so the filter is sane from its first
+  second rather than after the estimators converge.
+
+  **Holdover needs no code of its own.** The state carries frequency AND aging
+  with their covariances, so losing the phase is not a special case: stop
+  updating, keep predicting, keep steering. The trend shows `HOLD` and `KL`
+  reports how long it has been running on the model.
+
+  Measured with `tools/loopsim`, replaying the oscillator reconstructed from the
+  26/27.08 logs, five noise seeds, against the loops that already exist:
+
+  ```
+                     phase sd [ns]        ADEV @ 1024 s
+                  algo-12 win / algo-11   algo-12 win / algo-11
+    algorithm 11     3.62 / 7.39           7.7e-12 / 1.5e-11
+    algorithm 12     3.07 / 4.20           4.1e-12 / 7.6e-12
+    algorithm 13     1.20 / 1.25           1.4e-12 / 1.8e-12
+  ```
+
+  The second column is the interesting one. The other two loops lose ground on
+  the plant that drifts more and this one does not, which is the adaptive
+  bandwidth doing its job rather than a better constant.
+
+  Two guards, both put there by the simulator rather than by taste. **A gate
+  that never opens is a broken filter**: the innovation gate rejects a reading
+  more than four sigma from prediction — the 26/27.08 night had two such spikes
+  at ±40 ns — but ten consecutive rejections mean the STATE is wrong rather than
+  the data, so the filter widens its own belief by the size of what it keeps
+  refusing. Without that, a start 1500 ns out never recovered. And **a phase
+  still beyond the ACQ window after five horizons is a reading that is not
+  moving with the oscillator**, which on this board means a picDIV that never
+  synced: arm it once and start the filter again.
+
+  New commands `KR` / `KQ` / `KT` / `KL`, saved on entry in their own flash-ring
+  record (`REC_A13`) rather than in the settings block, which has no padding
+  left — growing it would have forced a `SETTINGS_VER` bump and thrown away
+  everyone's PID, LC and timezone for three numbers.
+
+- **TAB or ESC pauses and resumes the telemetry, one key.** Alan Cashin's
+  suggestion, and the right one: `RP` and `RR` already do this, but typing a
+  command while the reports scroll past is exactly the thing that is hard, and
+  the fix should not itself need a clear moment to type into. A bare ESC toggles
+  like TAB; ESC followed by `[` or `O` is an arrow or function key and is
+  swallowed, so reaching for shell history no longer stops the reports. A
+  half-typed line is abandoned on the toggle rather than being left to join the
+  next one.
+
+- **CPU load on the telemetry line.** `CPU:7%`, appended to the sensor line.
+  Measured rather than modelled and with no timer of its own:
+  `vApplicationIdleHook()` increments a counter, and once a second the count
+  becomes a percentage against the highest per-second count ever seen, which is
+  by definition an idle second. `configGENERATE_RUN_TIME_STATS` was the
+  alternative and it wants a spare timer and a base clock to produce per-task
+  figures nobody asked for.
+
+  What it sees: everything the idle task did not get, interrupt time included,
+  because an ISR steals from whatever is running. What it cannot see: a board
+  that has never once been near idle, where the reference is an underestimate
+  and the figure therefore flatters. The reference leaks by about 0.02% a second
+  so it follows the board instead of being pinned forever by one lucky second at
+  boot. It is appended at the END of the line on purpose — every reader searches
+  for its own field rather than anchoring, but adding one in the middle is still
+  how you silently break somebody's regex.
+
+### Measured
+- **The "27% worse than algorithm 11" figure was wrong, and it is withdrawn.**
+  It came from comparing two different nights, and both algorithm-13 runs behind
+  it were misconfigured: one had `KR` pinned at 2.5 ns, which cost eleven per
+  cent of its readings at the innovation gate, and the 29.08 12:31 session had
+  the R estimator running away to **47.70** during pull-ins — the very failure
+  the freeze-while-moving guard was written for, on a build that predates it.
+  Neither run should ever have been used to judge the loop.
+
+  The 28.08 capture switches algorithms mid-session, which settles in one
+  afternoon what cross-night comparison cannot settle at all. Algorithm 13 ran
+  4.24 h and algorithm 11 the next 3.53 h, back to back on the same board:
+
+  ```
+    algo   dph sd  floor   slow   track sd    r    req span  applied
+     13     3.67    2.72   2.46     0.54    0.996    20.7      59.0
+     11     3.22    2.70   1.76     0.48    0.959    10.0      23.0
+     12     6.18    2.67   5.57     0.87    0.959    20.0      28.0
+  ```
+
+  Thirteen per cent apart on tracking error, fourteen on phase sd — and
+  algorithm 13 had the harder half, against a required control span of 20.7 LSB
+  where algorithm 11 faced 10.0. Both are far ahead of algorithm 12 in the same
+  session. That is a different loop from the one the cross-night number
+  described.
+
+- **And the earlier verdict on the R estimator is withdrawn with it.** The
+  replay said the 16 s lag measured marginally worse than 1 s; the bench says R
+  reached 47.70 on the build without the guard, against a white floor of 6.4.
+  `loopsim` never reproduces that because its plants carry no pull-in transient
+  large enough — the runaway happens while the loop is moving the phase, which
+  is exactly the state the guard freezes the estimator through. The change
+  stays, and the replay result stands as what it is: a measurement of a
+  situation the replay does not contain.
+
+- **One behavioural difference survives every session: algorithm 13 works the
+  actuator far harder than it needs to.** 59 LSB applied for 20.7 required on
+  28.08, and 111 for 8.0 on the bad 29.08 run, against algorithm 11's 23 for
+  10.0 and 17 for 6.1. It is not under-correcting — that suspicion is closed —
+  it is over-actuating, consistently, and that is the thing left to attack.
+
+### Added
+- **`tools/logab.py` — compare the algorithms against each other inside one
+  capture.** Per contiguous stretch of one algorithm it prints the phase sd, the
+  detector floor, the slow structure the loop is responsible for, and the
+  tracking error against the control the oscillator actually needed
+  (reconstructed the way `loopsim` builds its plants). Two algorithms on two
+  nights are two experiments; one capture that switches between them is a
+  comparison.
+
+  It also fixes a trap that cost a day: the Learn line has a different shape per
+  algorithm family, so a regex written for one of them silently keeps the
+  previous value for the others — which turned a four-algorithm session into a
+  single 20 h "algorithm 13" segment on the first attempt. Only `algo=` comes
+  from the Learn line; everything else comes from lines every algorithm prints.
+
+### Measured
+- **Three bench runs on algorithm 13, and the one certain finding is that a
+  pinned `KR` cost eleven per cent of the readings.** The 29/30.08 run threw
+  away **4904 of 45275** samples at the innovation gate — `rej` went 98 to 5021
+  — and nothing said so: the Learn line carries a cumulative counter nobody
+  differentiates while it scrolls, and the phase sd looked ordinary at 6.07 ns.
+  `KR` was pinned at 2.5 ns, which fixes R below the innovations the detector
+  actually produces and leaves the 4-sigma gate too tight. The two short runs of
+  30.08, with R measured, rejected **none at all** — and neither does the
+  simulator. So: leave `KR` at 0 unless pinning it is the experiment.
+
+- **The loop is not under-correcting**, which was the standing suspicion from
+  the 57-against-93 LSB observation. Reconstructing what the oscillator actually
+  needed from each log: the required control spanned **17.6 LSB** on the
+  algorithm-13 night and **18.6 LSB** on the algorithm-11 night — the two nights
+  were as comparable as one could ask — while the loops applied 61 and 93 LSB
+  respectively. Both move three to five times more than required; algorithm 11
+  moves the MORE of the two and still holds the phase better.
+
+- **A metric that discriminates, and a sharper statement of where the simulator
+  fails.** Smoothed over 300 s, the correlation between the control applied and
+  the control required is **0.992 for algorithm 11 and 0.942 for algorithm 13**,
+  with tracking errors of 0.70 and 0.81 LSB. `loopsim` now reports the same two
+  numbers, and on the replayed 26.08 oscillator it gives algorithm 11
+  **0.71 LSB** against the bench's 0.70 — the plant reconstruction is sound and
+  the metric is right. For algorithm 13 it gives 0.20 LSB against the bench's
+  0.81. The divergence is specific to that one loop, not to the plant.
+
+  Calibrating the simulator's correlated detector error against the bench does
+  not close it: algorithm 13 matches at about 12 ns of zero wander (0.96 LSB,
+  r 0.944), and algorithm 11 matches at zero (0.71, r 0.971). There is no
+  setting at which both are right. The same detector behaves as though it were
+  12 ns noisier to one loop than to the other.
+
+### Rejected
+- **Making R bigger does not fix it.** The R estimator's lag was swept at the
+  bench-matching operating point: 1 s gives 0.96 LSB / r 0.945, 16 s gives
+  1.01 / 0.939, and 64, 128 and 256 s get monotonically worse to 1.49 / 0.886.
+  Pinning Q lower — the other way to filter harder — is worse again (1.30 LSB at
+  1e-7 against 1.01 adaptive); pinning it higher is marginally better. Every
+  lever tried so far moves the wrong way or does nothing: the R lag, the Q,
+  the horizon from 50 to 800 s, feeding the aging state forward, and an
+  innovation whiteness test. The mechanism is real — correlated detector error
+  degrades this loop five times faster than algorithm 11 — but inflating R is
+  not its cure, because a slower filter tracks the real drift worse.
+
+  The A/B on ONE night is still the experiment that settles it, and until it is
+  run every further change to this loop is a guess.
+
+### Fixed
+- **The CPU reading on the TFT header lost the tail of its `%`, and the 320x240
+  build did not compile at all.** Two separate things, found together because
+  the same check now exists for both.
+
+  The header's CPU field was centred at `TFT_W / 2`. The LMT clock beside it is
+  right-anchored with a padding of `TFT_S(130)`, and TFT_eSPI's padding erase is
+  a rectangle of that width ending at the anchor — 276..471 on the 480 panel.
+  `CPU 66%` in FreeSans9pt is about 79 px, so centred at 240 its right edge
+  lands near 279, three pixels inside that band, and the clock (drawn after it)
+  wipes the last glyph. On the 320 panel the same sum leaves about one pixel,
+  which is not a margin but a coincidence: a three-digit reading clips there
+  too. The field is now centred in the gap the other two fields actually leave,
+  with both widths taken from `textWidth()` rather than assumed — the panels do
+  not even use the same face — and it is drawn after the clock, so no erase can
+  reach it whatever the widths turn out to be. If the gap cannot hold the
+  string it draws nothing: a clipped number is worse than no number. The
+  padding constant now has one name, `HDR_LMT_PAD`, because two copies of a
+  number that a one-pixel margin depends on is how this happened.
+
+- **The 320x240 TFT build had a variable declared in the 480 branch and used in
+  the 320 one** (`phs`, the formatted phase). It has presumably been broken
+  since that row was split, and nobody could have noticed: **no check compiled a
+  single line of the display code.** Every panel switch was off in
+  `tools/hostcheck` for want of the vendor library, and the display block is the
+  largest thing in `gpsdo_tasks.cpp`. A configuration nobody can build is not a
+  configuration, it is a rumour.
+
+  `tools/hostcheck/stub/TFT_eSPI.h` is now enough of that API to compile
+  against, and hostcheck grew three rows: both panels with the detector, and the
+  small panel without it. Fourteen configurations. It draws nothing and cannot
+  catch a clipped glyph — only the panel can — but it catches the typo, the
+  wrong type, the datum that does not exist and the variable out of scope, which
+  is the class of error that actually happens here.
+
+### Measured
+- **Algorithm 13 on the bench, 11.8 h overnight: the standing offset is gone and
+  the loop is 27% worse than algorithm 11.** Both facts matter and the second
+  one is not yet explained.
+
+  What worked. The +18.7 ns standing offset of the previous run is **+0.06 ns**
+  — the output-stage bookkeeping fix did exactly what it was supposed to. The
+  CT/LC derivation printed `res 1.01ns R0 2.52ns Q0 6.36e-6 P0 1500ns lim 750LSB
+  arm<0.25Hz` and the measured R settled at 6.28 against a seeded 6.35, so the
+  seed was right to within noise. **163 innovation rejections in twelve hours**
+  against 281 in the previous fifty-three minutes, and **zero** picDIV re-arms.
+  The frequency estimate averaged +0.0007 ns/s: no bias.
+
+  What did not. Phase sd **5.94 ns against algorithm 11's 4.68 ns** over a
+  comparable 11.0 h night on the same board — same detector floor (2.74 against
+  2.64 ns), same thermal swing (2.4 against 2.7 °C), so it is the loop and not
+  the room. ADEV 1.0e-11 at 1024 s against 7.8e-12, and 2.7e-12 at 4096 s
+  against 2.0e-12; identical at 1 s and 16 s, so the short end is detector-
+  limited for both and the whole difference sits at mid tau.
+
+  **The simulator says the opposite, by a factor of three.** Four attempts to
+  make it say otherwise all failed — correlated detector noise, a realistic
+  TIM2, the horizon from 50 to 800 s, and feeding the aging state forward into
+  the control. The one clue nobody has explained: over the night this loop moved
+  the PWM **57 LSB where algorithm 11 moved 93** on a comparable night. That is
+  the signature of UNDER-correction, not of chasing noise. The two runs were
+  different nights, so the honest next step is A/B on ONE night — a couple of
+  hours of each, alternating — which takes the environment out of the comparison
+  entirely.
+
+### Fixed
+- **Two simulator models were flattering, and one of them was an outright bug.**
+  `loopsim` handed the firmware the exact, instantaneous, noiseless frequency
+  every second. The real TIM2 gates whole cycles for one second, so the 1 s
+  figure is an INTEGER number of hertz, the 100 s average is the mean of a
+  hundred of those — which is where its 0.01 Hz resolution comes from — and it
+  is a boxcar that lags by fifty seconds. That did not matter while the
+  frequency was a minor term; it mattered the moment algorithm 13 took it as a
+  Kalman measurement. The plant now counts whole cycles and averages them the
+  way the counter does.
+
+  The detector noise was white, and a ramp TIC read through a 12-bit ADC is not.
+  This is not a detail: any loop that estimates its measurement noise from FIRST
+  DIFFERENCES — algorithm 13's R, algorithm 12's sigma — measures only the white
+  part and is blind to the rest by construction. `LOOPSIM_DNOISE=<ns>` now adds
+  a stationary slow error, so the question has a number for an answer. It
+  degrades algorithm 13 five times faster than algorithm 11 (1.22 → 7.23 ns
+  against 7.45 → 10.07 at 8 ns of zero wander), which is the right shape — and
+  still not enough to reverse the bench result.
+
+### Rejected
+- **A whiteness test on the innovations**, written to explain the bench result
+  and measured worse at every level, including a clean detector (1.22 → 1.72 ns)
+  and 8 ns of correlated noise (7.23 → 8.28). The reasoning was textbook: an
+  optimal filter's innovations are white, so a positive lag-1 correlation means
+  the MEASUREMENT noise is correlated and the right response is to inflate R
+  rather than widen Q. The flaw is that this filter's innovations were never
+  going to be white — its control writes its own frequency state every second —
+  so the test fires for reasons that have nothing to do with the detector and
+  the inflation only makes the loop sluggish. Not in the tree; written up at its
+  site so it does not get proposed again.
+
+### Added
+- **CPU load per task, measured on the cycle counter, with a true 100 s
+  window.** `SW` prints it once, busiest first, beside the stack marks; `TL 1`
+  puts the same numbers on the telemetry line and `TL 0` takes them off again.
+  Not stored, and off after every reset: it is a bench diagnostic that costs a
+  line of telemetry a second, and a setting that survives a reboot is one nobody
+  remembers turning on.
+
+  It is not sampled. FreeRTOS calls `traceTASK_SWITCHED_IN()` on every context
+  switch and the Cortex-M4 has a free-running cycle counter in the DWT block, so
+  the interval between two switches is known exactly and belongs, exactly, to
+  the task that was running — a handful of cycles per switch and no timer
+  consumed. A tick-driven sampling profiler was the obvious alternative and
+  would have been blind to any task that starts on a tick boundary and finishes
+  before the next one, which on this firmware is most of them.
+
+  The window is a hundred one-second buckets rather than an exponential average:
+  asked for a 100 s mean, an EWMA with a 100 s time constant still carries a
+  fifth of its weight from five minutes ago. Shares are of each second's own
+  total switched time, so no clock rate enters the arithmetic and the columns
+  add to 100. Each bucket closes under a critical section that also charges the
+  slice of the task running at that instant — without that the idle task, which
+  routinely holds the processor for most of a second uninterrupted, would
+  contribute nothing to the bucket it dominated.
+
+  What it attributes where is worth stating: interrupt time lands on whichever
+  task was interrupted, because an ISR does not switch context. The reading is
+  "the processor spent this long with this task current", which is honest and
+  not quite the same as "this task used this much".
+
+### Changed
+- **The whole-CPU figure now comes from the same accounting: 100% minus the idle
+  task's share.** It used to be an idle-hook spin counter with the highest count
+  ever seen taken as 0% load — which works, and has a flaw that cannot be
+  measured from inside it: a board that has never once been near idle has an
+  underestimated reference and therefore an optimistic reading, for ever. The
+  cycle counter has no reference to be wrong about. The idle hook and
+  `configUSE_IDLE_HOOK` are gone with it.
+
+  It is also no longer ticked from the telemetry line, which meant TAB (pause
+  telemetry) silently paused the load measurement too. It is driven from the
+  uptime task now, and rolls on elapsed milliseconds rather than on being called
+  exactly once a second, so a caller that skips or doubles cannot shorten or
+  stretch a bucket.
+
+### Changed
+- **Algorithm 13 takes its scale from CT and LC instead of from one board.** It
+  shipped with three numbers measured on the author's bench — R seeded at
+  (2.64 ns)^2, Q at 2e-6, and a cold-start phase covariance of (100 ns)^2 — and
+  on any other OCXO or detector they are simply wrong. A board with a 300 ns
+  detector would start with a prior four times wider than its whole band; one
+  with a 10 000 ns detector far tighter than the truth, rejecting good readings
+  for its first ten minutes. The 27.08 run shows the second failure on the very
+  board the constants came from: **281 rejections and 500 s** to pull in from
+  1300 ns.
+
+  Nothing in `kf_scale()` is now a constant. CT gives the counts that null a
+  nanosecond in a second; LC gives ns per volt and the usable range; the part
+  fixes the ADC at 12 bits over 3.3 V, so the detector's own quantum is
+  `ns_per_volt * 3.3/4096` — 1.01 ns on this board, against a measured noise of
+  2.6 ns, which is two and a half quanta and is where the R seed comes from.
+  From those:
+
+  | was | now | on this board |
+  |---|---|---|
+  | R seed (2.64 ns)^2 | (2.5 quanta)^2 | 6.4 ns^2 (measured: 6.6) |
+  | R floor 0.25 ns^2 | one quantum squared | 1.02 ns^2 |
+  | Q seed 2e-6 | R / KT^3 | 6.6e-6 (measured: 2e-6) |
+  | P00 (100 ns)^2 | (half the band)^2 | (1500 ns)^2 |
+  | P11 (1 ns/s)^2 | (band crossed in one horizon)^2 | (15 ns/s)^2 |
+  | aging Q 1e-12 | Q / (100 KT^2) | 6.6e-12 |
+  | arm gate 0.5 Hz | band / (2 x 100 x hold-off) | 0.25 Hz |
+  | trust floor 8 ns | two quanta | 2.0 ns |
+
+  Recomputed every second rather than cached, so re-running CT or LC takes
+  effect without restarting the loop, and printed once as a single `KAL: from
+  CT/LC ...` line when the filter starts — a derived constant nobody can read is
+  a constant nobody can check. Q's seed deserves a note: there is no measurement
+  of an oscillator's random walk at CT or LC time, but the filter adapts Q from
+  its own innovations within minutes, so the seed only has to set a sane
+  bandwidth for those minutes. `Q = R/KT^3` has units of (ns/s)^2 per second
+  exactly and lands within a factor of three of what the night run measured —
+  two unrelated routes to the same number, which is as much as a seed can be
+  asked for.
+
+  Measured, five seeds: phase sd **1.19 -> 0.81 ns** on the 26.08 algo-12 plant
+  and 1.24 -> 1.20 on the algo-11 plant.
+
+### Fixed
+- **The loop booked corrections the pin never received, and that is the standing
+  phase offset in the 27.08 log.** +18.7 ns held for thirty-eight minutes with
+  the PWM motionless and the filter reporting a slew of -0.19 ns/s it was not
+  applying. The clamp was accounted for; the ROUNDING was not.
+
+  Once the phase is home the corrections are a fraction of an LSB. Booking the
+  requested `du` into the frequency state tells the filter it is already slewing
+  at `-x0/T`; the next second the control computes `-(x1 + x0/T) = 0` and asks
+  for nothing. If that fraction never reached the pin, the filter is now certain
+  it is fixing a phase error that nothing is fixing — and the loop parks, at any
+  offset, for ever, because the state that would notice is written by the
+  control rather than estimated from the data.
+
+  The fix is not to round more carefully. It is to book the **difference between
+  the DAC values**, which covers the clamp, the rounding and the sub-LSB path
+  together and cannot be fooled by a future output stage either, and to carry
+  the remainder into the next second so a sub-LSB request is delayed rather than
+  discarded — a one-second sigma-delta, so a board without the fine path asks
+  again until a whole count moves. Same lesson as algorithm 12's zero-crossing,
+  one layer further down: a state updated with an unapplied control is a state
+  that lies.
+
+  Simulated on a 16-bit board (`LOOPSIM_FINE=0`), standing phase offset:
+  +0.29 -> +0.02 ns on a quiet plant, +0.16 -> +0.04 on the 26.08 plant, with
+  sd 0.65 -> 0.55.
+
+- **The detector-trust verdict could latch, and did.** Two faults, both found by
+  measurement rather than by reading. First, the test ran against the 1 s
+  frequency EMA when the gated 100 s average was not yet available; that EMA
+  lags by fifty seconds, so during a pull-in it says the phase should be moving
+  at a rate that was true a minute ago and convicts a perfectly good detector.
+  It now runs only when `have100` is true. Second, the verdict could never be
+  revisited: a distrusted detector leaves the loop steering on TIM2, which holds
+  the frequency well, so nothing is expected to move, no window can conclude,
+  and the conviction stands for ever on evidence that has expired. Thirty
+  minutes without a single conclusive window now returns the benefit of the
+  doubt — and the arm bridge no longer clears that clock, which re-created the
+  same deadlock through the 600 s back-off. A detector that has already been
+  caught is convicted again on one failing window instead of three, which halves
+  what the periodic re-hearing costs on a genuinely frozen one.
+
+  With the railed detector modelled properly (`LOOPSIM_RAIL` used to sit at
+  3.27 V, which is INSIDE the band for a 3000 ns LRN — it was a frozen-detector
+  test wearing the wrong name), the recovery is now one arm at t+106 s followed
+  by a run indistinguishable from a healthy one: phase sd 0.55 ns, frequency
+  0.0001 Hz. A permanently frozen detector holds frequency to 0.0002 Hz.
+
+### Added
+- **A build identity that cannot be stale: a CRC-32 of the flash image, computed
+  at boot from the flash itself.** The banner and the `V` command now print it
+  beside the compile time.
+
+  The compile stamp was believed and on 26.08 it lied — two captures from two
+  different builds carried the same one, and an hour went into arguing with a
+  log that was right all along. Nobody had done anything wrong. `__DATE__` is
+  baked into whichever translation unit mentions it, which is the sketch, and
+  the Arduino builder does not recompile a translation unit whose sources have
+  not changed. Edit `GPSDO_algorithms.cpp`, upload, and the sketch's object file
+  is reused with last week's timestamp inside it. The stamp is honest about when
+  the SKETCH was compiled and says nothing about the rest of the firmware.
+
+  A CRC of the image has none of that: nothing computes it until the board is
+  running, so it cannot come out of a build cache, and it changes if any byte of
+  any translation unit changed. Two boards flashed with the same binary print
+  the same number. When a log and a memory disagree, that is the one to trust.
+
+  It covers the vector table, code, read-only data and the `.data` initialisers
+  — every byte the programmer wrote — bounded by the linker's `_sidata`,
+  `_sdata` and `_edata`. Those are **weak** references: a toolchain that names
+  them differently reports "unavailable" instead of failing to link, because an
+  identity that is missing is a nuisance and one that stops the firmware
+  building is a fault. About 2.5 ms once at boot, and 64 bytes of table.
+
+- **`build_id.h` and `tools/bumpbuild.py`, so the timestamp is fresh too.** The
+  sketch includes `build_id.h` for no reason except its existence: touching it
+  is what makes the builder recompile the sketch, and nothing else — a fraction
+  of a second, against the full rebuild the same trick would cost through
+  `build_opt.h`, where a changed flag invalidates everything. `bumpbuild.py`
+  increments the serial; any edit at all does the same job, since the builder
+  keys on the file rather than its contents. The serial is printed in the
+  banner. If it is never bumped nothing breaks and nothing lies — the CRC is the
+  guarantee, this is the convenience.
+
+### Changed
+- **The tuner plots algorithm 13's phase estimate instead of a series it never
+  sends.** Algorithm 13 fell through to the PID family, so the top pane was
+  labelled "Learned drift (LSB) — LRN feed-forward" over an empty graph. It now
+  shows the filter's phase estimate, with Vphase and its band guides underneath,
+  because the question this loop most often raises is whether the detector is
+  alive at all. The guides now follow whichever pane is showing Vphase rather
+  than a hard-coded family. `ARM` joins the trend words it explains, and the
+  Learn line carries `arm=` once the divider has been re-armed.
+
+### Fixed
+- **Algorithm 13 had no LTIC bridge at all, and with the detector railed it
+  simply let the oscillator walk.** Reported from the bench as the frequency
+  climbing steadily under algorithm 13. The cause was structural rather than
+  subtle: the filter had ONE measurement, the phase. With the picDIV unsynced
+  there is no valid phase, so it had no measurement at all — it predicted from a
+  state still at zero, applied nothing, and reported HOLD while the OCXO drifted.
+  Algorithms 11 and 12 both have the TIM2 frequency for exactly this reason, and
+  algorithm 12 says it in as many words: while the phase detector is blind, the
+  frequency still reads true. Worse, the one thing that could have repaired it —
+  the stall watch that re-arms the picDIV — cleared its own counter whenever the
+  phase was invalid, which is the case it existed for.
+
+  **TIM2 is now the filter's second measurement**, as one more scalar update on
+  a state it already carries: no matrix inversion, no new concepts, about thirty
+  more multiply-adds. Holdover, pull-in from far off frequency and a dead
+  detector all stop being special cases.
+
+  **And it makes the detector checkable.** Phase and frequency are the same
+  quantity differentiated, so over a window the phase MUST move by the summed
+  frequency error. A detector that does not move when TIM2 says it must is not
+  measuring anything — which is the 26.08 21:47 fault, where a pinned 3.116 V
+  read as a perfectly valid +1295 ns that never changed, and a filter has no
+  defence against that alone: a constant reading is a consistent reading, the
+  innovations go to zero and it believes it MORE the longer it lies. This test
+  is algorithm 12's stall watch with the guesswork removed — that one predicted
+  the motion from the slew it had just commanded, which is the loop marking its
+  own homework; this compares against a second instrument. An untrusted detector
+  is then treated exactly as a railed one, and trust is NOT handed back on a
+  re-arm: doing that re-admitted a detector already proven dead and cost 1.35 Hz
+  in simulation where staying blind cost 0.01.
+
+  The picDIV arm bridge is algorithm 12's, gate and hold-off and all — arm only
+  once the frequency is close, because an arm lands the phase at a quantised
+  offset and with the frequency still off it rails again within seconds. On an
+  arm the filter widens its PHASE belief rather than resetting: nothing it
+  learned about frequency or aging came through the divider, and those are the
+  expensive ones to relearn. Algorithm 12 has to throw its whole accumulator
+  away here; this is what carrying a covariance buys.
+
+  Measured in `tools/loopsim` against the oscillator replayed from the 26.08 log,
+  with the detector failing the way the hardware fails (new `LOOPSIM_RAIL` and
+  the existing `LOOPSIM_STUCK`), before and after:
+
+  ```
+                                       BEFORE      AFTER
+    railed picDIV, 300 LSB off        -5.06 Hz    -0.0002 Hz (1 arm)
+    frozen at +1295 ns, 300 LSB off   -4.26 Hz    +0.0004 Hz
+    frozen at +1295 ns, on frequency  -4.17 Hz    -0.0005 Hz
+    healthy detector, 1500 ns out    sd 209.80    sd 209.77 ns
+    healthy detector (5 seeds)       sd  1.23     sd  1.19 ns
+  ```
+
+  Loop quality on a working detector is unchanged, which is the point: none of
+  this is in the control law.
+
+- **The simulator's frequency channel had the wrong sign**, and it went unnoticed
+  because nothing used both channels at once until this filter took the frequency
+  as a measurement. `loopsim` drove the detector and TIM2 from the same control
+  error with the frequency FALLING as the PWM rose, which makes the phase rate
+  and the frequency error the same sign; on this board they are opposite. Two
+  loops that run on the bench say so independently — algorithm 11 lowers the PWM
+  when the oscillator reads fast, and algorithm 12's TIM2 trim walked `f100` home
+  with negative steps on the 16.08 storm — and both need frequency to rise with
+  PWM, while the phase reconstruction has it fall. No earlier measurement moves:
+  algorithm 12's TIM2 term is gated well above the frequency errors these plants
+  produce and never fired.
+
+- **The sketch would not compile, and eleven clean configurations said nothing
+  about it.** Two errors reached the IDE together: `vApplicationIdleHook()` was
+  written with `extern "C"` on the line above the function rather than on it,
+  and `setup()` called `kf_store_load()` without the header that declares it.
+
+  The first is worth stating plainly, because it is not obvious. The Arduino
+  builder inserts a C++ prototype for every function a sketch defines, and its
+  ctags pass is LINE ORIENTED: `extern "C"` on the preceding line is not seen,
+  so the prototype is generated, and the definition below it — which does have C
+  linkage — conflicts with it. FreeRTOS itself declares no prototype for the
+  hook (it is called from C), so the generated one is the first declaration and
+  the compiler has nothing to prefer it to.
+
+  Neither error was visible to `tools/hostcheck`, which compiled every `.cpp` in
+  eleven configurations and never compiled the `.ino`. **It does now**:
+  `tools/hostcheck/ino2cpp.py` reproduces both things the Arduino builder does
+  to a sketch — prepend `<Arduino.h>`, insert the line-oriented prototypes — and
+  the sketch is compiled and linked alongside the rest in every configuration.
+  Reverting either fix now fails the run with the same wording the IDE gave.
+
+- **Algorithm 12 was three times worse than it needed to be, and the cause was
+  one CLI entry.** The 26.08 run: 2.25 h on algorithm 12 at phase sd 41 ns in a
+  ±70 ns limit cycle with a 2.3 hour period, against algorithm 11's 3.0 ns on
+  the same board the same afternoon. The detector noise floor was identical in
+  both segments — 2.47 ns against 2.45 — so the difference was entirely the
+  loop, which is what the slow-structure metric exists to say.
+
+  `MG` had been set to **2.130 LSB/ns**. That is algorithm 11's `LG`, its own
+  VCO gain; algorithm 12's `MG` is the counts needed to null one nanosecond of
+  phase in one second, and CT had measured **31.3**. Both are printed "LSB per
+  ns" and they are not the same quantity. Every correction was therefore 14.7×
+  too small — visible in the log as thirteen corrections moving the PWM a total
+  of four LSB while the oscillator's required control wandered 3.3.
+
+  The same entry did a second thing nobody asked for. `MF 0` meant "follow MG",
+  so typing a gain also swapped the limit table from the noise formula to the
+  stored one, whose level-6 limit is ~126 ns. The loop then corrected weakly AND
+  far too late.
+
+  Three changes, each measured rather than argued:
+
+  - **The limit table no longer follows the gain.** `MF 0` is the noise formula
+    now, whatever `MG` says; the hand-edited `MLP` table is asked for with
+    `MF 1`. The welding was already argued to be wrong when `MF` was introduced
+    — the gain belongs to the oscillator, the limits to the site's phase noise —
+    and only compatibility kept it. That compatibility is what this cost.
+  - **The zero-crossing test arms on both correction paths.** It armed only on
+    the limit path, on the argument that a scheduled correction has "no known
+    slew for the crossing to cancel". Both paths compute the same
+    `slew_lsb = -(p_ns/span)*lsb_per_ns` a few lines earlier and both store it,
+    so that argument describes Alan's loop rather than this one.
+  - **The board now says so when a hand-set `MG` cannot be a tuning choice.**
+    Beyond a factor of four from what CT measured it is an entry error, not
+    tuning. The value is still used — a deliberate experiment has to stay
+    possible — but `MG`, and the loop on first use after a settings recall, both
+    print the measured figure beside it. The recall path matters: that is the
+    one nobody tests.
+
+  New tool `tools/loopsim/` did the measuring, and it is the third of its kind:
+  `hostcheck` asks whether the tree compiles, `algoswitch` whether a loop
+  restarts, `loopsim` whether it holds the phase. It replays an oscillator
+  reconstructed from a log rather than one invented for the occasion — given the
+  PWM applied and the phase reported, the control the oscillator needed each
+  second is algebra — and builds the real algorithm twice, with and without a
+  change, so a column comparison is the change and nothing else. Phase sd, mean
+  of five noise seeds:
+
+  ```
+                          BEFORE   AFTER    algo 11
+    26.08 algo-12 window
+      MG 0  (derived)      3.57     2.95      3.64
+      MG 2.130 (as set)   53.81    21.06
+      MG 31.3 (CT)         6.63     2.95
+    26.08 algo-11 window
+      MG 0  (derived)      4.62     4.01      7.39
+      MG 2.130 (as set)   66.04    61.96
+      MG 31.3 (CT)        16.41     4.01
+  ```
+
+  With the gain right, algorithm 12 now holds better than algorithm 11 on both
+  windows — 2.95 against 3.64 on the shorter, 4.01 against 7.39 on the longer,
+  which carries four times the drift.
+
+  **Two repairs were written and rejected, and both are recorded at their
+  sites.** The zero-crossing test fired zero times in that log because the phase
+  took 810 to 3283 seconds to change sign after each correction, against a 300 s
+  give-up window; every return outlived it. Replacing that window with "hold the
+  arm while the phase is still coming home" is the obvious repair and measures
+  *worse* on the longer plant (4.01 → 6.76 ns), because on a drifting board a
+  phase creeping toward zero is often the oscillator rather than this
+  correction's slew. The long returns were the symptom of the 14.7× gain error,
+  not a fault in the constant. A second guard — arm only when the accumulator's
+  extrapolated phase agrees in sign with the phase on the pin — measured as
+  buying nothing and is not in the tree either. A rejected repair that leaves no
+  trace gets proposed again.
+
+  Existing installations: if `MG` is non-zero, check it against `CT`'s figure —
+  `ML` prints both — and `MG 0` if in doubt. If you deliberately hand-edited the
+  `MLP` limits, add `MF 1` to keep them, then `ES ALGO12`.
+- **The zero-crossing test was paying back a slew that never reached the pin.**
+  This is the one that made algorithm 12 unusable whenever the phase was far
+  out, and the 26.08 22:41 log is a clean recording of it: after the stall watch
+  re-armed the divider the phase came back honestly, reached −50 ns, and the
+  loop then threw the PWM 1038 counts in one second. It spent the next seventeen
+  minutes crossing the whole detector band — PWM 40348 to 41410, phase −1600 to
+  +20, five re-arms — and never once got inside ±200 ns.
+
+  A correction computes a deliberate slew and then clamps the total against the
+  detector band. The crossing later removes the slew, so that the oscillator is
+  left at the right frequency AND no phase error. But the value it removed was
+  the slew as COMPUTED, recorded before the clamp — and whenever the clamp bites,
+  which is exactly when the phase is far out, that is a different number. At
+  −1500 ns on this board the computed slew is 734 LSB and only 500 reach the
+  pin; the crossing then hands back 734, and the extra 234 is a fresh frequency
+  error pointing the other way. The phase sets off in the opposite direction,
+  hits the clamp at the far rail, and the loop paces the band forever.
+
+  It now records what survived the clamp — the clamped total minus the frequency
+  term, which is not a deliberate slew and is not cancelled. Pull-in from a large
+  offset, replayed against the oscillator from that day, mean over five noise
+  seeds:
+
+  ```
+     starting phase     before        after
+        ±500 ns          0.6 ns       1.1 ns
+       ±1000 ns          0.7 ns       1.1 ns
+       ±1500 ns      4.6e6 ns         1.0 ns
+  ```
+
+  Below about 1000 ns the clamp rarely bites and both behave; at 1500 the old
+  code diverges every time and the new one settles inside 2 ns. Holding is
+  unchanged (3.07 ns against algorithm 11's 3.62 on the same plant), and the
+  hand-set-gain case improves as well, 53.8 → 16.7 ns.
+
+- **A detector that has stopped tracking now gets noticed.** Second half of the
+  26.08 evening. The board reset straight into algorithm 12 with the picDIV
+  unsynced: the ramp sat near its top rail, Vphase flat at 3.116 V to ±5 mV for
+  the whole 5.5 minute capture. With `LRN` 3000 the usable band is ±1650 ns, so
+  that voltage is comfortably INSIDE it — the detector reported a perfectly
+  valid +1295 ns that never changed. The loop believed it had a phase, so it
+  never armed (`arm=0` throughout), fired one level-0 correction that saturated
+  the ±500 LSB clamp, and sat there.
+
+  **The test that ships is a prediction, not a threshold.** The loop knows the
+  slew it commanded, so it knows how far the phase should travel in a window:
+  `|slew_lsb| / lsb_per_ns` nanoseconds per second. Compare that with what the
+  phase actually did — the difference of two half-window means, whose noise is
+  `sigma*sqrt(2/W)` rather than `sigma`, so 1.8 ns here instead of 7. When the
+  prediction is large enough to be measurable and the phase delivers less than a
+  quarter of it, three 32-second windows running, the reading is not connected to
+  the oscillator any more. Then arm the picDIV and say so. Replayed against that
+  day's oscillator with the detector frozen at +1320 ns, it fires 229 s in.
+
+  **Three versions of this were written and two are not in the tree.** The first
+  compared single samples against a reference and reset on any four-sigma
+  excursion — which the per-second noise does almost every second, so it never
+  counted past one and never fired on the board it was written for. The second
+  added a gate that refused to act on a phase not yet shown to be moving, and
+  deadlocked: the gate blocked the correction whose job was to move it. Diagnose,
+  do not restrain.
+
+  **A fresh-entry arm was also tried and rejected**, on the model of algorithm
+  10's boot question. It fires when the detector is FINE and the phase merely
+  happens to be far out, and the arm then throws away a good measurement — the
+  divider re-syncs to a quantised offset of a few hundred nanoseconds. It is also
+  unnecessary: replayed from +1295 ns with a working detector and a real
+  frequency error, algorithm 12 pulls in by itself every time, 17 to 19
+  zero-crossings, back inside ±17 ns, without arming once. Arming is not a free
+  action, "the phase is far out" is not evidence that the divider is lost, and
+  the loop does not need help when the detector is honest.
+
+- **The accumulator is thrown away whenever the picDIV is armed.** Arming
+  re-syncs the divider to the 1PPS edge, so every phase already in the hierarchy
+  was measured against an alignment that no longer exists; keeping them mixes two
+  different zeros. Simulated, the first correction after an arm came out at
+  −436 LSB from a level-3 test that was half pre-jump and half post-jump. The
+  existing `s_mla_post_arm` does not cover this — it keeps the landing transient
+  OUT of the accumulator, but the accumulator was already full.
+- **Changing the algorithm now restarts the loop you change to.** Nothing did,
+  and it had never been asked to: every loop keeps its state in function
+  statics, and a static does not know that the operator typed `LA 12`. Reported
+  on the bench — algorithm 11 in LOCK, switch to 12, and 12 sat at level 0 with
+  zero corrections and the picDIV unarmed.
+
+  Three separate mechanisms, one cause. **Algorithm 12** was left holding
+  `s_mla_returning`, the flag a correction raises while its deliberate slew
+  walks the phase home; it gates BOTH correction paths (the per-level limit test
+  and the `MR` schedule) and the 300-second timeout that releases it only ticks
+  while algorithm 12 is the running loop — so leaving mid-slew and coming back
+  suppressed every correction until that timeout finally expired, with
+  `level=0 corr=0` in the telemetry and nothing to say why. Its accumulator
+  hierarchy also still held phase sums from before the switch, so the first
+  correction that did fire acted on minutes-old evidence. **Algorithm 10** keeps
+  `integ` as an ABSOLUTE PWM target, which is a control voltage chosen for
+  conditions that may be hours old, and `prev_state` still reading LOCK means
+  the entry transition never fires — so `ltic_autotune()` never runs and the
+  picDIV is never armed. **Algorithms 3–9** carried their PID integrators
+  across, which is a step correction nobody asked for on the first update after
+  the switch.
+
+  The hook lives in `adjustVctlPWM()` rather than in the `LA` handler, because
+  that is the one path every change goes through: the CLI, a settings recall at
+  boot, and anything else that ever writes `gCtrl.active_algo`. A hook on the
+  command would have missed the recall — exactly the case nobody tests. Each
+  loop takes the flag once and clears its own state; the legacy loops reuse the
+  ring-buffer flush they already had.
+
+  What deliberately SURVIVES a restart is everything the loops have MEASURED
+  about the board — algorithm 12's LSB-per-ns, its detector noise floor and its
+  measured thresholds, and algorithm 10's noise estimate. Those describe the
+  hardware, not the previous run, and rebuilding them would cost minutes of
+  running blind on every switch. The per-session counters are cleared for the
+  opposite reason: "zero corrections since the switch" is only a readable fact
+  if the count starts at zero.
+
+  One thing that was NOT a fault: algorithm 12 not arming the picDIV on entry
+  from a locked algorithm 11. It arms only when the detector is blind and the
+  frequency is close (`!have_phase && |f| < 0.5 Hz`); arriving from a lock the
+  phase is valid, so there is nothing to arm and disturbing the divider would
+  only throw the phase to a quantised offset. `arm=0` there is the loop working.
+
+  Verified before shipping, not after the next log. New tool
+  `tools/algoswitch/run.sh` builds `GPSDO_algorithms.cpp` for the PC twice —
+  once as it stands, once with `algo_take_restart()` forced false, which is the
+  code as it was — and runs both against a simulated board (319.5 µHz/LSB, the
+  detector at 1252 ns/V, LPOL −1). Same switch sequence, leaving algorithm 12
+  mid-slew: before, 30 minutes after the switch back it was still churning at
+  level 2 with 308 ns of phase error; after, it settles to level 7 at 4 ns.
+  Entering algorithm 10 with the phase 1200 ns off the ramp: before, the
+  persisted LOCK is believed and kept; after, it is re-checked, demoted to ACQ
+  and the divider re-armed. A centred lock is preserved in both — the point is
+  to re-check the claim, not to disturb a good one.
+- **Manual errata + clone-receiver support.** The DFU section now covers the
+  current WeAct v3.1 boards, which have a BOOT0 *button* instead of a jumper
+  (hold BOOT0 while plugging USB, then release — the hold-and-tap-NRST
+  recipe found elsewhere does not work), and Part 3 gained a GNSS
+  module-choice paragraph: Chinese u-blox clones ignore the binary
+  configuration, and on some the unanswered config frames derail the
+  auto-baud until a `T` tunnel re-probe rescues them (field report, Solder
+  Junkie). New compile switch `GPSDO_FAKE_UBLOX` (off by default): baud
+  probe only, zero UBX configuration — nothing the loop needs is lost, the
+  PPS never cared about UBX; gone are NMEA silencing, stationary mode,
+  survey-in/Time Mode and `qErr`.
+- **Algorithms 11 and 12 no longer guess the EFC polarity.** They used to treat an unset `LPOL` as +1 and steer — on an inverted-EFC board every correction pushed away. They now hold with a one-line warning until `LPOL ±1` is set (existing 11/12 installations: set `LPOL` once, then `ES LTIC`).
+- **The `ES` help hid the `ALGO12` group.** Both help lines (the `H` main
+  list and the `H TZ` page) read `obj: TZ/PID/LTIC/FLAGS/ALGO/PO`, yet the
+  parser has accepted `ES ALGO12` since the algo-12 block exists — a user
+  following the help would never find the group that persists MG/MR/MF/MFT
+  and the per-level limit table, while the `[not saved — run 'ES ALGO12']`
+  hints pointed at a command the help did not acknowledge. Both lines now
+  list `ALGO12`. The tuner's embedded help already had `ES` right but still
+  described `FR 0|1` as an on/off toggle and carried the unreachable
+  `LRN 0|1|R` line in the PID section — both corrected to match the firmware.
+- **The non-blocking report write silenced the 1 Hz telemetry on USB CDC.** The
+  guard added for the "USB in, display freezes" fault asked `availableForWrite()`
+  once and dropped the WHOLE report when it returned less than the report size.
+  On USB CDC that is every report: `USBSerial`'s transmit queue is
   `USB_FS_MAX_PACKET_SIZE * CDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER` = 64 × 2 =
-  **128 bytes** (stm32duino 2.12.0 defaults) and the human report is 400+.
-  Boot output and the CLI kept working — short lines, a different path — so
-  the build that was meant to cure "USB in, display freezes" would have
-  delivered a board whose display never froze but whose telemetry never
-  appeared either. The write is now chunked to the room the port reports, with
-  a 25 ms budget: a draining host takes the whole report in a few iterations,
-  a host that is not reading has its tail dropped and the display keeps
-  living. `room == 0` means "full, wait" — never blind-write the rest, on a
-  full CDC queue `USBSerial::write()` loops as long as the host stays
-  connected, which is the freeze the guard exists to prevent. The CDC
-  transmit queue is also enlarged to 1 KB
+  **128 bytes** (stm32duino 2.12.0 defaults) and the human report is 400+. Boot
+  output and the CLI kept working — short lines, different path — so a board
+  that had just logged fine over a UART (512-byte TX buffer via `build_opt.h`,
+  where the report happened to fit) went silent the moment logging moved to
+  USB, which is why the failure looked configuration-dependent.
+
+  The report is now written in CHUNKS no larger than the room the port reports,
+  with a 25 ms budget: a draining host takes the whole report in a few
+  iterations (it empties the queue in well under a millisecond of polling); a
+  host that is not reading has its tail dropped after the budget and the
+  display keeps living, which was the point of the guard. `room == 0` is read
+  as "full, wait" and never as a licence to blind-write the rest — on a full
+  CDC queue `USBSerial::write()` loops for as long as the host stays connected,
+  which is precisely the freeze the guard exists to prevent.
+
+  The CDC transmit queue is also enlarged to 1 KB
   (`-DCDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER=16` in `build_opt.h`; the macro
-  is `#ifndef`-guarded in the USBDevice library, verified on core 2.12.0), so
-  a healthy host has ~2.5 s of slack and nothing is dropped at all. The patch
-  file carries the corrected version.
+  is `#ifndef`-guarded in the USBDevice library, so the flag reaches it from
+  the sketch — effective on cores where that guard exists, verified on 2.12.0).
+  A healthy host now has ~2.5 s of slack and nothing is dropped at all; the
+  chunked write remains as the backstop for a connected-but-not-reading host,
+  which no buffer size saves.
+- **The link failed with `GPSDO_LTIC` off, even after the header fix above.**
+  `g_freq_damp_win_dpll` and `g_freq_damp_win_lock` — the FA / FAD / FAL damping
+  windows — were defined inside the `GPSDO_LTIC` block in `gpsdo_tasks.cpp`, but
+  they are part of the persisted settings block and the CLI prints and sets them
+  unconditionally, so `settings_store.cpp` and `gpsdo_cli.cpp` reference them
+  whatever the configuration. Four bytes of RAM against a firmware that cannot
+  be built without a phase detector is not a trade worth making; the definitions
+  moved out of the guard.
+- **The firmware would not build with `GPSDO_LTIC` off.** `GPSDO_algorithms.cpp`
+  defines the algorithm-12 state, globals and accessors *outside* its own
+  `#ifdef GPSDO_LTIC` block, and `gpsdo_cli.cpp` reads them unconditionally —
+  but every one of those declarations lived *inside* the `#ifdef GPSDO_LTIC`
+  block in `GPSDO_algorithms.h`. Turning the detector off produced fourteen "was
+  not declared in this scope" errors from `GPSDO_algorithms.cpp:1437` and the
+  whole `ML`/`MLP`/`MG`/`MF` group in the CLI. Separately, the `#endif` closing
+  the guard around `multi_level_accum()` sat one line *above* that function's
+  closing brace, so with the guard off the brace was orphaned. Nobody had hit
+  either, because every board of this design has the detector — the first person
+  to build without one was Dave (Solder_Junkie) on EEVblog, whose M8N board has
+  no TIC front end. A declaration costs nothing when the definition is absent,
+  so the guard now covers the two functions that genuinely need the hardware and
+  nothing else. Verified both ways: the tree compiles and links clean with
+  `GPSDO_LTIC` on and with it off, and no symbol defined only under the guard is
+  referenced from outside one.
+- **A blocking USB CDC write froze the display.** `vDisplayTask` drives the
+  OLED, LCD, TM1637 and TFT *and* writes the 1 Hz telemetry report, and
+  STM32duino's `USBSerial::write()` spins while the endpoint is busy for as long
+  as the host is connected. A host that had enumerated the port but was not
+  draining it therefore stopped that task dead, inside the write, on the far
+  side of the 30 ms serial-mutex timeout — so the visible symptom was a frozen
+  display, which reads as a crashed board and was nothing of the kind: the
+  frequency and control tasks never touch serial and went on disciplining the
+  oscillator throughout. There was no `availableForWrite()` guard anywhere in
+  the firmware. The report now asks for room first and drops the whole line if
+  it will not fit; telemetry is a live stream, not a log, and the next one is a
+  second away. `TeeSerial` gained its own `availableForWrite()`, returning the
+  smaller of its two ports, because `Stream`'s default returns 0 and would
+  otherwise silence a `GPSDO_BLUETOOTH_PARALLEL` build completely. Reported by
+  Dave (Solder_Junkie) on EEVblog.
+- **Uptime was counted on a free-running MCU timer, in a GPS-disciplined
+  clock.** Measured over thirteen captures on two boards, 1 to 21 hours each:
+  the printed uptime gained on the printed UTC by +129 to +169 ppm, best
+  estimate **+159 ppm** from the three longest records (+12 s in 20.8 h, +13 s
+  in 22.9 h, +7 s in 11.9 h). Both boards agree, so this is not a crystal
+  tolerance — the 2 Hz tick that drove the counter simply is not 2 Hz.
+
+  That rate error also produced the ±1 s jitter, which is what a reader notices
+  first: the report is printed on the PPS and the counter advanced on TIM9, so
+  the two edges slid across each other once every ~6530 s (= 1/159 ppm) and
+  each crossing threw a burst of repeated and skipped seconds before settling.
+  The bursts in the 19.08 record begin at 325, 6854, 13383 and 19907 s —
+  spacing 6529, 6529, 6524.
+
+  Uptime is now advanced by the validated PPS, at the same point where
+  `ppscount` is incremented — which is also the event that triggers the report,
+  so the printed value cannot be a beat between two clocks. `vUptimeTask` keeps
+  the clock running in holdover only, after the PPS has been silent for over
+  1.5 s. Simulated against a 159-ppm-fast crystal: exactly 86 400 s over 24 h
+  locked, exactly 3600 over an hour of pure holdover, and zero error across 20
+  dropout cycles and an hour with 2 % of pulses missing (`tools/uptime_test.cpp`).
+
+- **Two silent drops in the old uptime path.** It took the uptime mutex with a
+  5 ms timeout and `continue`d on failure, discarding that second with no
+  record that one was owed; and it counted half-second ticks by parity, which
+  a binary semaphore's dropped give inverts. Neither exists now: there is no
+  mutex, and what is counted is elapsed milliseconds, so a missed, late or
+  doubled tick all come out the same and a task stalled for a minute makes the
+  minute up.
+
+- **The LOCK update tick used `ppscount % period` while the period could
+  change.** The modulo form is correct only for a fixed period, and the cadence
+  bound above makes it anything but: with `LIV 300` and a bound of ~110 s the
+  tick fired on multiples of whatever `period` happened to be that second, which
+  in a 6 h simulation gave intervals from 7 s to 551 s and a MEDIAN of 300 — the
+  bound computed the right number every second and almost never got to use it.
+  LOCK now gates on elapsed time; ACQ and DPLL keep the modulo form, their
+  periods being fixed. Confirmed on hardware: every correction interval in the
+  21.08 run is an exact multiple of the 30 s setting, bar one 12 s interval
+  during settling where the bound legitimately fired.
+
+- **The LOCK step cap is per UPDATE, not per second.** The 4 mHz cap granted the
+  loop a thirtieth of the authority at a 300 s cadence that it had at 30 s, with
+  the same drift to cancel; the integrator sat against the cap for update after
+  update and overshot when it caught up (simulated phase RMS 174 ns at
+  `LIV 300`, against 34 with this fixed). The cap now has a floor at four times
+  the frequency step the slope test has just computed, and is unchanged on a
+  board with no resolvable slope.
+
+- **Both window lengths were assumed to be `lock_interval_s`.** They are not,
+  once the cadence bound can shorten the interval: on a board asking for 300 s
+  and running at 73 the slope came out four times too small and the
+  extrapolation reached four times too far. Both lengths are now read off the
+  PPS counter.
+
+- **The window roll sat inside the pair test, so LOCK would have done nothing at
+  all.** After the sample reset at DPLL→LOCK the older window is empty, so the
+  test did not run, so the roll did not happen, so the older window stayed
+  empty. It survived simulation only because the simulator seeded the first
+  window by hand — a difference between model and firmware that the model
+  existed to rule out. The roll is now unconditional once there is a newer
+  window.
+
+- **The picDIV re-arm was fed straight into the PI.** The divider lands the
+  phase at a quantised offset — about ±3 µs on this build — and that jump is not
+  a phase error the loop should answer. Algorithm 12 has skipped it since v1.05;
+  the three-stage loop armed at three separate places and skipped nothing. All
+  three now blank the detector for 5 s.
+
+- **The frequency digits changed colour on `LOCK` only**, so algorithm 12 —
+  which reports `CORR` and `ZC` — showed an unlocked colour while locked. The
+  stale-echo guard was also ±0.050 Hz against a 10 s average quantised to
+  0.1 Hz, so a single legitimate count read as a stale echo; it is now ±0.150.
+
+- **Every plot in the tuner has been squashed 4:1 along the time axis.** The
+  shared time buffer was appended to whenever *any* field parsed out of a line —
+  which is four of the six lines in a telemetry block — while each individual
+  series was appended to once per second. The two therefore filled at different
+  rates, and the drawing code paired the newest N samples of a series with the
+  newest N *timestamps*, which covered only the last quarter of the span those
+  samples occupied. Measured on the 21.08 capture: 1725 telemetry seconds,
+  6872 time samples. The "30 h" buffer was 30 h of phase against 7.5 h of clock,
+  and the "seconds held" readout was four times the truth. The tick is now the
+  `Up:` line, printed exactly once a second by every algorithm, and every series
+  is padded forward to it so the lengths match by construction rather than by
+  coincidence.
+- **`HDOP:TIME` was dropped as unparseable.** A LEA-T that has completed
+  survey-in reports its fix mode in the HDOP field, and that flag is the more
+  useful of the two facts — it is the mode in which the 1PPS is worth trusting.
+  It now passes through as written.
+
+### Added
+- **`tools/hostcheck/` — compile and link every switch combination on a PC.**
+  Three build failures in a row came out of one person building without a phase
+  detector, each hiding the next, and only the last was a LINK error that no
+  amount of reading a single file would have caught. This runs the host compiler
+  over seven configurations in about thirty seconds and reports any symbol that
+  exists in one and not another. It is not a substitute for an Arduino build —
+  the stubs are only deep enough to satisfy the includes and the ARM target is
+  not exercised — but the class of bug it catches is exactly the one that cost
+  three round trips.
+
+- **Measured per-level thresholds for algorithm 12 (`MF`, `MFT`).** The `auto`
+  table was not adaptive: sigma pins at its 5 ns floor on every board of this
+  design, so the table came out identical everywhere, and its level scaling
+  assumes white phase noise (exponent 0.5) where both boards here measure
+  0.95–1.03. `MF 3` replaces the assumption with a per-level EMA of the test
+  statistic, a least-squares fit of the exponent, and a quantile at the target
+  interval set by `MFT`. `ML` reports which source is in use, the fitted
+  exponent and the level count. Verified against the firmware's own `ML` output
+  and against two hardware records offline; **not yet flown in a closed loop** —
+  that measurement is outstanding, and on the quieter of the two boards the
+  measured table replayed WORSE than the assumed one (median 13-min RMS 11.6 ns
+  against 5.5), because the two tables ask different questions.
+- **GPS position redaction in the tuner.** A checkbox, latched when the capture
+  file is opened and greyed out while logging, replaces Lat/Lon/Alt in the
+  captured log and writes a two-line provenance header. Sat count and HDOP are
+  kept.
+- **`tools/lock_sim_algo10.py`** — the LOCK-stage simulator the numbers above
+  came from, so they can be checked independently.
+- **The tuner writes CSV as well as the raw log, and holds a week.** It was
+  built as a tuning tool and says so, but it is being used as a logger, and a
+  stability run that ends because the buffer wrapped is a run that has to be
+  repeated. The plot history goes from 30 h to 604 800 samples — one week at the
+  1 Hz telemetry rate — and a dropdown beside **Start logging** chooses *Full
+  log*, *CSV only* or *Both*, latched for the life of the file like the
+  redaction checkbox.
+
+  The CSV is one row per telemetry second and carries what every analysis of
+  these logs has actually needed rather than everything the firmware prints:
+  `utc, up_s, algo, state, dph_ns, qerr_ns, vphase_v, pwm, f10, f100, ph_ns,
+  level, corr, sig_ns, zc, bmp_c, sat, hdop`. About 65 MB a week against 217 for
+  the full log. `Vctl` is left out because it is `pwm` through an RC network and
+  `pwm` is the exact number; humidity, pressure and the INA rails are left out
+  because across every capture so far they have never moved enough to explain
+  anything. There are no position columns at all, so a CSV is redacted by
+  construction whatever the checkbox says.
+
+  The row builder assumes nothing about the order of the six lines in a
+  telemetry block, because that order is not fixed — the sensor line is printed
+  by a different task from the loop line, and a capture from 20.08 has it last
+  where one from 21.08 has it first. A row is closed the moment a line tries to
+  write a field that is already set, which can only mean the next second has
+  begun.
+
+- **Three manual sections that answering the same questions twice earned.**
+  *10.1 How to report a problem* asks for the four things every diagnosis here
+  has needed — boot log as text, the compiled `gpsdo_config.h`, which GNSS
+  module (genuine timing, genuine navigation, or clone), and where the antenna
+  sees sky — plus the one check worth doing first: a banner without a
+  `compiled <date>` line means a build from before v1.05, and several reports
+  have turned out to be bugs already fixed. *Making a survey permanent* (Part
+  3.2) covers doing the survey once in u-center V8.29 and saving it to the
+  module's battery-backed configuration, which beats the firmware's 300 s / 5 m
+  compromise and survives power cycles — Alan Cashin's recommendation, and the
+  cheapest accuracy in the build. And *Appendix C — Glossary* defines the
+  twenty-one terms this project uses in a particular sense, ADEV through ZC,
+  because half of them mean something else elsewhere.
 
 ---
 
