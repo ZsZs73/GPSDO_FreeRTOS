@@ -11,3 +11,4 @@ void gpsdo_sensor_measurements_begin();
 void gpsdo_sensor_measurements_read();
 
 bool gpsdo_sensor_bmp280_available();
+bool gpsdo_sensor_ina219_available();

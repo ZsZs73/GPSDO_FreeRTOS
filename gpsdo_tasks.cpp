@@ -140,14 +140,6 @@ void ltic_read_fast(void)
   static const bool s_aht_ok = false;
 #endif
 
-#ifdef GPSDO_INA219
-  #include <Adafruit_INA219.h>
-  static Adafruit_INA219 s_ina;
-  static bool s_ina_ok = false;
-#else
-  static const bool s_ina_ok = false;
-#endif
-
 /* Set true by vSensorTask once all sensor detection has completed, so the
  * TFT boot splash (in vDisplayTask) can wait briefly for valid flags. */
 static volatile bool s_sensors_probed = false;
@@ -170,15 +162,6 @@ void vSensorTask(void *pvParameters)
     OUT_SERIAL.println(s_aht_ok ? "HW: AHT10/AHT20 sensor    OK  (I2C 0x38)"
                                 : "HW: AHT10/AHT20 sensor    not found");
 #endif
-#ifdef GPSDO_INA219
-    s_ina_ok = s_ina.begin();
-    if (s_ina_ok) {
-        s_ina.setCalibration_32V_1A();
-        OUT_SERIAL.println("HW: INA219 sensor         OK  (I2C 0x40)");
-    } else {
-        OUT_SERIAL.println("HW: INA219 sensor         not found");
-    }
-#endif
 
     gpsdo_sensor_measurements_begin();
 
@@ -200,14 +183,6 @@ void vSensorTask(void *pvParameters)
             s_aht.getEvent(&hum, &tmp);
             g_encl_temp = tmp.temperature;
             g_encl_humi = hum.relative_humidity;
-            xSemaphoreGive(xWireMutex);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-#endif
-#ifdef GPSDO_INA219
-        if (s_ina_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            g_ocxo_volt = s_ina.getBusVoltage_V();
-            g_ocxo_curr = s_ina.getCurrent_mA();
             xSemaphoreGive(xWireMutex);
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -2965,7 +2940,7 @@ void vDisplayTask(void *pvParameters)
         bmp_ok = gpsdo_sensor_bmp280_available();
 #endif
 #ifdef GPSDO_INA219
-        ina_ok = s_ina_ok;
+        ina_ok = gpsdo_sensor_ina219_available();
 #endif
         tft_splash(oled_ok, lcd_ok, ht_ok, aht_ok, bmp_ok, ina_ok);
         tft_draw_layout();
@@ -3355,7 +3330,7 @@ void vDisplayTask(void *pvParameters)
                     if (lcd_line2_mode == 1) avail = snap_g.pos_valid;
                     if (lcd_line2_mode == 2) avail = snap_g.valid;
                     if (lcd_line2_mode == 3) avail = s_aht_ok;
-                    if (lcd_line2_mode == 4) avail = s_ina_ok;
+                    if (lcd_line2_mode == 4) avail = gpsdo_sensor_ina219_available();
                     if (lcd_line2_mode == 5) avail = gpsdo_sensor_bmp280_available();
                     if (avail) break;
                 }
@@ -3406,7 +3381,7 @@ void vDisplayTask(void *pvParameters)
                     }
                     break;
                 case 4: /* INA219 */
-                    if (s_ina_ok) {
+                    if (gpsdo_sensor_ina219_available()) {
                         static char fv[6],fi[7];
                         dtostrf(g_ocxo_volt,4,2,fv); dtostrf(g_ocxo_curr,5,0,fi);
                         snprintf(line,sizeof(line),"INA:%sV %smA",fv,fi);
@@ -3475,7 +3450,7 @@ void vDisplayTask(void *pvParameters)
 #ifdef GPSDO_TFT
         if (s_tft_ok)
             tft_update(&snap_g, &snap_f, &snap_c, &snap_u,
-                       s_aht_ok, gpsdo_sensor_bmp280_available(), s_ina_ok);
+                       s_aht_ok, gpsdo_sensor_bmp280_available(), gpsdo_sensor_ina219_available());
 #endif
 
 

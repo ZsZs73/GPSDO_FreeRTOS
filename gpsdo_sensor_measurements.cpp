@@ -16,6 +16,12 @@ static Adafruit_BME280 s_bme;
 static bool s_bme_ok = false;
 #endif
 
+#ifdef GPSDO_INA219
+#include <Adafruit_INA219.h>
+static Adafruit_INA219 s_ina;
+static bool s_ina_ok = false;
+#endif
+
 #ifdef GPSDO_BMP280_I2C
 #include <Adafruit_BMP280.h>
 static Adafruit_BMP280 s_bmp;
@@ -44,6 +50,16 @@ void gpsdo_sensor_measurements_begin()
     OUT_SERIAL.println(s_bme_ok ? "HW: BME280 sensor         OK  (I2C 0x76)"
                                 : "HW: BME280 sensor         not found");
 #endif
+
+#ifdef GPSDO_INA219
+    s_ina_ok = s_ina.begin();
+    if (s_ina_ok) {
+        s_ina.setCalibration_32V_1A();
+        OUT_SERIAL.println("HW: INA219 sensor         OK  (I2C 0x40)");
+    } else {
+        OUT_SERIAL.println("HW: INA219 sensor         not found");
+    }
+#endif
 }
 
 void gpsdo_sensor_measurements_read()
@@ -68,12 +84,28 @@ void gpsdo_sensor_measurements_read()
         g_encl_pres = (s_bme.readPressure() + g_pressure_offset) / 100.0f;
     }
 #endif
+
+#ifdef GPSDO_INA219
+    if (s_ina_ok) {
+        g_ocxo_volt = s_ina.getBusVoltage_V();
+        g_ocxo_curr = s_ina.getCurrent_mA();
+    }
+#endif
 }
 
 bool gpsdo_sensor_bmp280_available()
 {
 #ifdef GPSDO_BMP280_I2C
     return s_bmp_ok;
+#else
+    return false;
+#endif
+}
+
+bool gpsdo_sensor_ina219_available()
+{
+#ifdef GPSDO_INA219
+    return s_ina_ok;
 #else
     return false;
 #endif
