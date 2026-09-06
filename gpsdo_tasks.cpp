@@ -8,7 +8,7 @@
  * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
- * vSensorTask   — reads AHT/BMP/INA sensors every 2 s under xWireMutex
+ * vSensorTask   — reads sensor measurements every 2 s under xWireMutex
  * vDisplayTask  — drives OLED, LCD, TFT, TM1637, serial report, and LEDs
  * vUptimeTask   — increments uptime counter, formats dd hh:mm:ss
  *
@@ -383,9 +383,9 @@ static void print_tab_report(const GpsData_t *g, const FreqSnap_t *f,
     p = sd  (buf, p, (c->avg_vctl_adc/4096.0)*3.3, 3);        buf[p++] = '\t';
     p = sd  (buf, p, (c->avg_vcc_adc /4096.0)*3.3*2.0, 2);    buf[p++] = '\t';
     p = sd  (buf, p, (1.21*4096.0)/(double)c->avg_vdd_adc, 3); buf[p++] = '\t';
-    p = sd  (buf, p, g_encl_temp, 1);                buf[p++] = '\t';
-    p = sd  (buf, p, g_encl_pres, 1);               buf[p++] = '\t';
     p = sd  (buf, p, g_encl_temp, 1);               buf[p++] = '\t';
+    p = sd  (buf, p, g_encl_pres, 1);               buf[p++] = '\t';
+    p = sd  (buf, p, g_ocxo_temp, 1);               buf[p++] = '\t';
     p = sd  (buf, p, g_encl_humi, 1);               buf[p++] = '\t';
     p = sd  (buf, p, g_ocxo_volt, 2);               buf[p++] = '\t';
     p = sd  (buf, p, g_ocxo_curr, 0);               buf[p++] = '\t';
@@ -532,12 +532,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
     buf[p++]='\r'; buf[p++]='\n';
 
     /* Sensors */
-    p=sa(buf,p,"BMP:"); p=sd(buf,p,g_encl_temp,1); p=sa(buf,p,"C ");
-                         p=sd(buf,p,g_encl_pres,1); p=sa(buf,p,"hPa  ");
-    p=sa(buf,p,"AHT:"); p=sd(buf,p,g_encl_temp,1); p=sa(buf,p,"C ");
-                         p=sd(buf,p,g_encl_humi,1); p=sa(buf,p,"%rH  ");
-    p=sa(buf,p,"INA:"); p=sd(buf,p,g_ocxo_volt,2); p=sa(buf,p,"V ");
-                         p=sd(buf,p,g_ocxo_curr,0); p=sa(buf,p,"mA");
+    p=sa(buf,p,"Encl:"); p=sd(buf,p,g_encl_temp,1); p=sa(buf,p,"C ");
+                        p=sd(buf,p,g_encl_pres,1); p=sa(buf,p,"hPa ");
+                        p=sd(buf,p,g_encl_humi,1); p=sa(buf,p,"%rH  ");
+    p=sa(buf,p,"OCXO:"); p=sd(buf,p,g_ocxo_temp,1); p=sa(buf,p,"C ");
+                        p=sd(buf,p,g_ocxo_volt,2); p=sa(buf,p,"V ");
+                        p=sd(buf,p,g_ocxo_curr,0); p=sa(buf,p,"mA");
 #ifdef GPSDO_LTIC
     p=sa(buf,p,"  Vphase:"); p=sd(buf,p,(double)g_ltic_voltage,3); p=sa(buf,p,"V");
     /* Derived phase in ns, once LC has calibrated the detector. Measured
