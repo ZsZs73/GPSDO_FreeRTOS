@@ -1442,7 +1442,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   static void tft_update(const GpsData_t *g, const FreqSnap_t *f,
                          const CtrlData_t *c, const Uptime_t *u,
                          bool aht_ok, bool bmp_ok, bool bme_ok,
-                         bool ina_ok)
+                         bool ina_ok, bool lm75_ok)
   {
       char s[28];
 
@@ -2098,62 +2098,55 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       tft_val(11, TFT_COL_L, TFT_SENS_Y, TFT_S(156), TFT_COL_VALUE, s);
 #endif
 
-      if (encl_humi_ok) { static char ft[8],fh[8];
-          dtostrf(g_encl_temp,4,2,ft); dtostrf(g_encl_humi,4,2,fh);
 #if defined(GPSDO_TFT_ILI9488)
-          /* temp left-anchored in the right column; humidity right-anchored to
-           * the screen edge (like Vdd) so the "% rH" stays pinned. Draw them
-           * as two separate slots so neither floats when the other changes. */
-          snprintf(s,sizeof(s),"EN: %s C",ft);
-#else
-          snprintf(s,sizeof(s),"EN: %sC %s%%rH",ft,fh);
-#endif
-      }
-      else {
-#if defined(GPSDO_TFT_ILI9488)
-          snprintf(s,sizeof(s),"EN: ---");
-#else
-          snprintf(s,sizeof(s),"EN: ---");
-#endif
-      }
-#if defined(GPSDO_TFT_ILI9488)
-      /* Enclosure humidity sits in the LEFT column of the second sensor row,
-       * directly under enclosure temperature + pressure. The enclosure fields
-       * share a column, while the electrical fields — phase, then the supply
-       * rails — share the other. It swapped places with Vph/dph, which is
-       * drawn further down in this file because the phase field has to stay
-       * inside the LTIC guard; source order and screen order part company here.
-       *
-       * Temp left-anchored, humidity right-anchored to TFT_COL_LVAL so the
-       * "% rH" stays pinned. Two separate slots, so neither floats when the
-       * other changes width. Padding: temp TFT_S(70) = 105 px covers
-       * "EN: 25.50 C" (~103); humidity TFT_S(60) = 90 px covers "45.50 % rH"
-       * (~88). They fill 12..117 and 147..237, and the 30 px between is written
-       * by neither, so it stays background.
-       *
-       * The right anchor is align_L — the same line "hPa" ends on in the row
-       * above and "Vct: … V" ends on further up, so the column has one edge
-       * rather than three near-misses. That also keeps it clear of Vcc, which
-       * starts at 252 in the next column. */
-      { const int16_t rh_pad = TFT_S(60);            /* fits "45.30 % rH" */
-        tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
-                (uint16_t)(align_L - rh_pad - TFT_COL_L), TFT_COL_VALUE, s);
-        if (encl_humi_ok) { static char fh[8]; dtostrf(g_encl_humi,4,2,fh);
-            snprintf(s,sizeof(s),"%s %% rH",fh);
-            tft_val_r(16, align_L, TFT_SENS_Y + TFT_ROW_H,
-                      (uint16_t)rh_pad, TFT_COL_VALUE, s);
-        } else {
-            tft_val_r(16, align_L, TFT_SENS_Y + TFT_ROW_H,
-                      (uint16_t)rh_pad, TFT_COL_VALUE, "");
-        }
+      /* Second sensor row: enclosure humidity on the left, OCXO temperature
+       * on the right. The two padded fields tile the enclosure column so
+       * neither can erase the other during selective redraw. */
+      {
+          const int16_t ox_pad = TFT_S(65);
+          const int16_t ox_x   = align_L;
+          const int16_t rh_pad = (uint16_t)(ox_x - ox_pad - TFT_COL_L);
+
+          if (encl_humi_ok) {
+              static char fh[8];
+              dtostrf(g_encl_humi,4,2,fh);
+              snprintf(s,sizeof(s),"EN:%s %% rH",fh);
+          } else {
+              snprintf(s,sizeof(s),"EN:---");
+          }
+          tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
+                  rh_pad, TFT_COL_VALUE, s);
+
+          if (lm75_ok) {
+              static char fot[8];
+              dtostrf(g_ocxo_temp,4,1,fot);
+              snprintf(s,sizeof(s),"OX:%s C",fot);
+          } else {
+              snprintf(s,sizeof(s),"OX:---");
+          }
+          tft_val_r(16, ox_x, TFT_SENS_Y + TFT_ROW_H,
+                    (uint16_t)ox_pad, TFT_COL_VALUE, s);
       }
 #else
-      /* Enclosure humidity sits below enclosure temperature + pressure in the left column —
-       * sensors together, phase data on the right. Same grouping as the 480.
-       * "EN: 50.0C 11.7%rH" is 18 ch = 144 px at 8 px per character, inside
-       * the 156 px left cell with room to spare; it was already fitting the
-       * narrower 148 px right cell it came from. */
-      tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H, TFT_S(156), TFT_COL_VALUE, s);
+      /* Second sensor row: enclosure humidity + OCXO temperature.
+       * Compact form keeps both measurements inside the 156 px left cell. */
+      if (encl_humi_ok || lm75_ok) {
+          static char fh[8], fot[8];
+          if (encl_humi_ok) dtostrf(g_encl_humi,4,1,fh);
+          if (lm75_ok)      dtostrf(g_ocxo_temp,4,1,fot);
+
+          if (encl_humi_ok && lm75_ok)
+              snprintf(s,sizeof(s),"EN:%s%% OX:%sC",fh,fot);
+          else if (encl_humi_ok)
+              snprintf(s,sizeof(s),"EN:%s%%",fh);
+          else
+              snprintf(s,sizeof(s),"OX:%sC",fot);
+      } else {
+          snprintf(s,sizeof(s),"EN:--- OX:---");
+      }
+
+      tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
+              TFT_S(156), TFT_COL_VALUE, s);
 #endif
 
 #ifdef GPSDO_LTIC
