@@ -574,7 +574,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
  * Layout:
  *   Line 0: Frequency — right-justified, "F:  10000000.0000 Hz" (20 chars)
  *   Line 1: UTC time HH:MM:SS + uptime days
- *   Line 2: Rotating view — GPS coords / Sats+HDOP / AHT / INA / BMP
+ *   Line 2: Rotating view — GPS coords / Sats+HDOP / enclosure / OCXO
  *   Line 3: PWM + Vctl + trend  OR  PWM + Vctl + blinking [H] (holdover)
  *
  * Holdover indication: trend field on line 3 replaced by blinking '[H]'
@@ -620,17 +620,17 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
  *     Row 1: F 9999999.9999Hz      (frequency, best precision + Hz at pos 14-15)
  *     Row 2: La  52.12345          (latitude  OR "GPS: acquiring")
  *     Row 3: Lo  23.12345          (longitude OR "Sat: XX        ")
- *     Row 4: Al  175m Sat: 9       (alt+sats  OR BMP temp+pres)
+ *     Row 4: Al  175m Sat: 9       (alt+sats OR enclosure temp+pressure)
  *     Row 5: Up 000d 00:00:00      (uptime)
- *     Row 6: 12:34:56  23.4C       (UTC time + AHT temperature)
+ *     Row 6: 12:34:56  23.4C       (UTC time + enclosure temperature)
  *     Row 7: PWM:40908 ___[H]      (PWM, trend, holdover blink)
  *
  *   Page B — sensors focus:
  *     Row 0: LMT:hh.mm.ss DAY      (same)
  *     Row 1: F 9999999.9999Hz      (frequency, Hz at pos 14-15)
- *     Row 2: BM:23.4C 1013hPa      (BMP280: temp 1dec + pressure 0dec, 16 chars)
- *     Row 3: AH:22.1C 45.3%rH     (AHT20: temp 1dec + humidity 1dec, 16 chars)
- *     Row 4: IN:12.05V  250mA     (INA219: voltage 2dec + current 0dec, 16 chars)
+ *     Row 2: EN:23.4C 1013hPa      (enclosure: temp 1dec + pressure 0dec, 16 chars)
+ *     Row 3: EN: 45.3%rH           (enclosure: humidity 1dec, 11 chars)
+ *     Row 4: OX:55.0C12.05V250     (OCXO: temp 1dec + voltage 2dec + current 0dec, 16 chars)
  *     Row 5: Sat:09 HDOP:0.90     (GPS quality indicators)
  *     Row 6: UTC:hh:mm:ss DAY      (UTC time + day of week)
  *     Row 7: PWM:40908 ___[H]      (same as page A)
@@ -712,7 +712,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
  *                  11/06/2026        │  Lat: 52.123456
  *                  Up 000d 02:15:33  │  Lon: 23.123456
  *                  Algo:5  hit       │  Alt: 175m
- *                  PWM:44653 V:1.97  │  IN:12.05V 250mA
+ *                  PWM:44653 V:1.97  │  OX:12.05V 250mA
  *                (480 panel only: the Alt cell is split and its right half
  *                 carries qErr, so the fix data sits together; Vcc — the 5 V
  *                 rail — then sits beside Vdd in the phase row below, so the
@@ -720,12 +720,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
  *                 and qErr stays in the phase row: Alt and qErr want ~168 px
  *                 there and the cell is 148.)
  *  y=156..195 ── sensor row, font 2:
- *                  BMP:23.4C 1013hPa │  AHT:22.1C 45.3%rH
+ *                  EN:23.4C 1013hPa │  EN:22.1C 45.3%rH
  *                (480 panel: two rows, grouped by column rather than by
- *                 sensor — BMP and AHT take the left column, the phase field
+ *                 sensor — enclosure fields take the left column, the phase field
  *                 and the supply rails the right:
- *                  BMP: 23.40 C 1013.25 hPa │ Vph: 3.077 V dph: +1390ns
- *                  AHT: 22.10 C    45.30 % rH │ Vcc: 4.98 V     Vdd: 3.29 V
+ *                  EN: 23.40 C 1013.25 hPa │ Vph: 3.077 V dph: +1390ns
+ *                  EN: 22.10 C    45.30 % rH │ Vcc: 4.98 V     Vdd: 3.29 V
  *                 Without LTIC the phase field is absent and its half stays
  *                 empty; the rails do not depend on it.)
  *  y=204..239 ── status bar, font 4, full width, colour-coded background:
@@ -896,8 +896,8 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   #define TFT_COL_LVAL    (TFT_S(158))
 
   /* Previous-value cache for selective redraw. One entry per drawn field, and
-   * fields have been split into label+value repeatedly (AHT humidity, qErr,
-   * dph, the INA current) so this has grown past the 16 it started at. Slot 22
+   * fields have been split into label+value repeatedly (enclosure humidity, qErr,
+   * dph, the OCXO current) so this has grown past the 16 it started at. Slot 22
    * is the 320×240 panel's "d:" label. Highest slot used must stay below the
    * bound: an out-of-range slot writes past the array with no diagnostic. */
   static char tft_prev[23][28];
@@ -1127,7 +1127,8 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   }
 
   static void tft_splash(bool oled_ok, bool lcd_ok, bool ht_ok,
-                         bool aht_ok, bool bmp_ok, bool ina_ok)
+                         bool aht_ok, bool bmp_ok, bool bme_ok,
+                         bool ina_ok, bool lm75_ok)
   {
       s_tft.fillScreen(TFT_COL_BG);
 
@@ -1367,8 +1368,8 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #elif defined(GPSDO_TM1637)
           { "TM1637 clock HH:MM",     true,   true   },
 #endif
-          { "Sensors AHT/BMP/INA",   (aht_ok||bmp_ok||ina_ok),
-#if defined(GPSDO_AHT10) || defined(GPSDO_BMP280_I2C) || defined(GPSDO_INA219)
+          { "Sensors EN/OCXO",       (aht_ok||bmp_ok||bme_ok||ina_ok||lm75_ok),
+#if defined(GPSDO_AHT10) || defined(GPSDO_BMP280_I2C) || defined(GPSDO_BME280_I2C) || defined(GPSDO_INA219) || defined(GPSDO_LM75)
                                               true
 #else
                                               false
@@ -1440,9 +1441,15 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   /* Per-second update — called from vDisplayTask main loop */
   static void tft_update(const GpsData_t *g, const FreqSnap_t *f,
                          const CtrlData_t *c, const Uptime_t *u,
-                         bool aht_ok, bool bmp_ok, bool ina_ok)
+                         bool aht_ok, bool bmp_ok, bool bme_ok,
+                         bool ina_ok)
   {
       char s[28];
+
+      const bool encl_humi_ok = aht_ok || bme_ok;
+      const bool encl_pres_ok = bmp_ok || bme_ok;
+
+      const bool ocxo_power_ok = ina_ok;
 
       /* ---- header right: LMT clock + day ---- */
       if (g->valid) {
@@ -1747,7 +1754,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #if defined(GPSDO_TFT_ILI9488)
       /* One right-hand alignment line per column, measured once.
        *
-       * The left column reads down to "hPa" on the BMP row and the right column
+       * The left column reads down to "hPa" on the enclosure row and the right column
        * to "ns" on the phase row: those are the widest strings in their columns,
        * so the eye already takes their right edges as the columns' edges. The
        * remaining fields are pulled onto those lines instead of being left to
@@ -1763,7 +1770,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
        * shape. */
       static int16_t align_L = 0, align_R = 0;
       if (align_L == 0) {
-          align_L = TFT_COL_L + tft_text_w("BMP: 00.00 C 0000.00 hPa");
+          align_L = TFT_COL_L + tft_text_w("EN: 00.00 C 0000.00 hPa");
           align_R = TFT_COL_R + tft_text_w("Vph: 0.000 V dph: +0000ns");
       }
 #endif
@@ -1940,7 +1947,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            *
            * The anchor is 314, not the cell's own 316: it is the alignment
            * line this panel already uses for Vdd (TFT_W - TFT_S(6)), and dph
-           * and the INA current are pinned to it too, so the four right edges
+           * and the OCXO current are pinned to it too, so the four right edges
            * form one column instead of four near-misses.
            *
            * The label got its 'r' back. It was cut to "qE:" when the field was
@@ -1966,7 +1973,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
        * the number jumps a digit's width the moment the value crosses a power of
        * ten, which is exactly what the pressure field did below 1000 hPa.
        *   voltage 6: "12.050" / " 4.920".  Reads ~4.9 V today, but the changelog
-       *     has this field as "IN:12.05V" in v0.92, so the crossing is a real
+       *     has this field as "OX:12.05V" in v0.92, so the crossing is a real
        *     configuration rather than a hypothetical.
        *   current 7: "1250.00" / " 178.00".  Draws ~180 mA today with an OCXO,
        *     but a DOCXO's oven pulls well over an amp on warm-up, and the point
@@ -1980,15 +1987,15 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       { static char fv[10],fi[10];
         static int16_t ina_ma_w = 0;
         if (ina_ma_w == 0) ina_ma_w = tft_text_w("0000.00 mA");
-        if (ina_ok) {
+        if (ocxo_power_ok) {
             dtostrf(g_ocxo_volt,6,3,fv); dtostrf(g_ocxo_curr,7,2,fi);
-            snprintf(s,sizeof(s),"INA: %s V",fv);
+            snprintf(s,sizeof(s),"OX: %s V",fv);
         } else {
-            snprintf(s,sizeof(s),"INA: ---");
+            snprintf(s,sizeof(s),"OX: ---");
         }
         tft_val(10, TFT_COL_R, TFT_GRID_Y+4*TFT_ROW_H,
                 (uint16_t)(align_R - ina_ma_w - TFT_COL_R), TFT_COL_VALUE, s);
-        if (ina_ok) snprintf(s,sizeof(s),"%s mA",fi);
+        if (ocxo_power_ok) snprintf(s,sizeof(s),"%s mA",fi);
         else        s[0] = '\0';
         tft_val_r(20, align_R, TFT_GRID_Y+4*TFT_ROW_H,
                   (uint16_t)ina_ma_w, TFT_COL_VALUE, s);
@@ -2001,8 +2008,8 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
        *
        * The paddings are the MEASURED widths of each field's widest form, not
        * 8 px per character — font 2 is proportional, and the difference is not
-       * small: "INA:4.920V" measures 68 px where counting characters says 80.
-       *     voltage  TFT_S(76) = 76 px   168..244   ("INA:12.050V" 76)
+       * small: "OX:4.920V" measures 68 px where counting characters says 80.
+       *     voltage  TFT_S(76) = 76 px   168..244   ("OX:12.050V" 76)
        *     current  TFT_S(70) = 70 px   244..314   ("1250.00mA"   69)
        * 76 + 70 = 146 = TFT_COL_R..314, so the two fills tile the row exactly
        * and neither erases the other's edge.
@@ -2017,12 +2024,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
        * whether the 12 V form fits, and it also puts this row in step with
        * "Alt:", "Vph:", "Vcc:" and "Vdd:", none of which carries one. */
       { static char fv[10],fi[10];
-        if (ina_ok) { dtostrf(g_ocxo_volt,5,3,fv);
-                      snprintf(s,sizeof(s),"INA:%sV",fv); }
-        else          snprintf(s,sizeof(s),"INA:---");
+        if (ocxo_power_ok) { dtostrf(g_ocxo_volt,5,3,fv);
+                      snprintf(s,sizeof(s),"OX:%sV",fv); }
+        else          snprintf(s,sizeof(s),"OX:---");
         tft_val(10, TFT_COL_R, TFT_GRID_Y+4*TFT_ROW_H,
                 TFT_S(76), TFT_COL_VALUE, s);
-        if (ina_ok) { dtostrf(g_ocxo_curr,6,2,fi);
+        if (ocxo_power_ok) { dtostrf(g_ocxo_curr,6,2,fi);
                       snprintf(s,sizeof(s),"%smA",fi); }
         else          s[0] = '\0';
         tft_val_r(20, TFT_COL_R + TFT_S(146), TFT_GRID_Y+4*TFT_ROW_H,
@@ -2032,9 +2039,9 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 
       /* ---- sensor row ---- */
       /* ft/fp declared at function scope so the split-field path below (which
-       * lives outside the bmp_ok block) can still see them. */
+       * lives outside the encl_pres_ok block) can still see them. */
       static char ft[8], fp[10];
-      if (bmp_ok) {
+      if (encl_pres_ok) {
           /* Pressure width is 7 (480) / 6 (320), not 6 / 5. dtostrf's width is a
            * MINIMUM, not a field size: "1013.25" overruns a 6 and prints seven
            * characters, while "999.87" fits and prints six. So every time the
@@ -2044,7 +2051,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            * with a leading space instead, and the unit stops moving.
            *
            * This is also what the left column's alignment line is measured
-           * against ("BMP: 00.00 C 0000.00 hPa"), so below 1000 hPa the field
+           * against ("EN: 00.00 C 0000.00 hPa"), so below 1000 hPa the field
            * was not even reaching its own line. */
 #if defined(GPSDO_TFT_ILI9488)
           dtostrf(g_encl_temp,5,2,ft); dtostrf(g_encl_pres,7,2,fp);
@@ -2053,7 +2060,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #endif
       }
 #if defined(GPSDO_TFT_ILI9488)
-      /* On 480×320 BMP is split like AHT/Vct: label+temp left-anchored, pressure
+      /* On 480×320 the enclosure row is split like Vct: label+temp left-anchored, pressure
        * right-anchored to align_L so "hPa" sits exactly on the column's
        * alignment line (same edge as "% rH" below and "V" in Vct above). The
        * old single-string form let the right edge drift, because dtostrf pads
@@ -2069,13 +2076,13 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           const int16_t pres_pad = TFT_S(70);
           const int16_t pres_x   = align_L;
           const int16_t temp_pad = (uint16_t)(pres_x - pres_pad - TFT_COL_L);
-          if (bmp_ok) {
-              snprintf(s,sizeof(s),"BMP: %s C",ft);
+          if (encl_pres_ok) {
+              snprintf(s,sizeof(s),"EN: %s C",ft);
           } else {
-              snprintf(s,sizeof(s),"BMP: ---");
+              snprintf(s,sizeof(s),"EN: ---");
           }
           tft_val(11, TFT_COL_L, TFT_SENS_Y, temp_pad, TFT_COL_VALUE, s);
-          if (bmp_ok) {
+          if (encl_pres_ok) {
               snprintf(s,sizeof(s),"%s hPa",fp);
           } else {
               snprintf(s,sizeof(s),"");
@@ -2083,44 +2090,44 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           tft_val_r(19, pres_x, TFT_SENS_Y, pres_pad, TFT_COL_VALUE, s);
       }
 #else
-      if (bmp_ok) {
+      if (encl_pres_ok) {
           /* ft/fp from the function-scope declaration above */
-          snprintf(s,sizeof(s),"BMP: %sC %shPa",ft,fp);
+          snprintf(s,sizeof(s),"EN: %sC %shPa",ft,fp);
       }
-      else snprintf(s,sizeof(s),"BMP: ---");
+      else snprintf(s,sizeof(s),"EN: ---");
       tft_val(11, TFT_COL_L, TFT_SENS_Y, TFT_S(156), TFT_COL_VALUE, s);
 #endif
 
-      if (aht_ok) { static char ft[8],fh[8];
+      if (encl_humi_ok) { static char ft[8],fh[8];
           dtostrf(g_encl_temp,4,2,ft); dtostrf(g_encl_humi,4,2,fh);
 #if defined(GPSDO_TFT_ILI9488)
           /* temp left-anchored in the right column; humidity right-anchored to
            * the screen edge (like Vdd) so the "% rH" stays pinned. Draw them
            * as two separate slots so neither floats when the other changes. */
-          snprintf(s,sizeof(s),"AHT: %s C",ft);
+          snprintf(s,sizeof(s),"EN: %s C",ft);
 #else
-          snprintf(s,sizeof(s),"AHT: %sC %s%%rH",ft,fh);
+          snprintf(s,sizeof(s),"EN: %sC %s%%rH",ft,fh);
 #endif
       }
       else {
 #if defined(GPSDO_TFT_ILI9488)
-          snprintf(s,sizeof(s),"AHT: ---");
+          snprintf(s,sizeof(s),"EN: ---");
 #else
-          snprintf(s,sizeof(s),"AHT: ---");
+          snprintf(s,sizeof(s),"EN: ---");
 #endif
       }
 #if defined(GPSDO_TFT_ILI9488)
-      /* AHT sits in the LEFT column of the second sensor row, directly under
-       * BMP: the two environmental sensors now share a column and the
-       * electrical fields — phase, then the supply rails — share the other. It
-       * swapped places with Vph/dph, which is drawn further down in this file
-       * because the phase field has to stay inside the LTIC guard; source order
-       * and screen order part company here.
+      /* Enclosure humidity sits in the LEFT column of the second sensor row,
+       * directly under enclosure temperature + pressure. The enclosure fields
+       * share a column, while the electrical fields — phase, then the supply
+       * rails — share the other. It swapped places with Vph/dph, which is
+       * drawn further down in this file because the phase field has to stay
+       * inside the LTIC guard; source order and screen order part company here.
        *
        * Temp left-anchored, humidity right-anchored to TFT_COL_LVAL so the
        * "% rH" stays pinned. Two separate slots, so neither floats when the
        * other changes width. Padding: temp TFT_S(70) = 105 px covers
-       * "AHT: 25.50 C" (~103); humidity TFT_S(60) = 90 px covers "45.50 % rH"
+       * "EN: 25.50 C" (~103); humidity TFT_S(60) = 90 px covers "45.50 % rH"
        * (~88). They fill 12..117 and 147..237, and the 30 px between is written
        * by neither, so it stays background.
        *
@@ -2131,7 +2138,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       { const int16_t rh_pad = TFT_S(60);            /* fits "45.30 % rH" */
         tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
                 (uint16_t)(align_L - rh_pad - TFT_COL_L), TFT_COL_VALUE, s);
-        if (aht_ok) { static char fh[8]; dtostrf(g_encl_humi,4,2,fh);
+        if (encl_humi_ok) { static char fh[8]; dtostrf(g_encl_humi,4,2,fh);
             snprintf(s,sizeof(s),"%s %% rH",fh);
             tft_val_r(16, align_L, TFT_SENS_Y + TFT_ROW_H,
                       (uint16_t)rh_pad, TFT_COL_VALUE, s);
@@ -2141,9 +2148,9 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
         }
       }
 #else
-      /* AHT joins BMP in the left column, one row below it — environmental
+      /* Enclosure humidity sits below enclosure temperature + pressure in the left column —
        * sensors together, phase data on the right. Same grouping as the 480.
-       * "AHT: 50.0C 11.7%rH" is 18 ch = 144 px at 8 px per character, inside
+       * "EN: 50.0C 11.7%rH" is 18 ch = 144 px at 8 px per character, inside
        * the 156 px left cell with room to spare; it was already fitting the
        * narrower 148 px right cell it came from. */
       tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H, TFT_S(156), TFT_COL_VALUE, s);
@@ -2214,7 +2221,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
               ns -= (double)ubx_timtp_correction_ns();
           }
 #if defined(GPSDO_TFT_ILI9488)
-          /* FIRST sensor row, RIGHT column — swapped with AHT so the
+          /* FIRST sensor row, RIGHT column — swapped with enclosure humidity so the
            * environmental sensors share the left column and the electrical
            * fields the right, with the supply rails directly beneath.
            *
@@ -2284,7 +2291,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            *     "dp:"  TFT_S(18) = 18 px   241..259   ("dp:"         17)
            *     phase  TFT_S(55) = 55 px   259..314   ("+1030ns"     51)
            * 73 + 18 + 55 = 146 = TFT_COL_R..314, the alignment line Vdd, qErr
-           * and the INA current all sit on.
+           * and the OCXO current all sit on.
            *
            * The value's pad is sized for a FOUR-digit phase, which is what the
            * detector's unambiguous range allows and what this field was sized
@@ -2337,7 +2344,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            * measured Vdd instead of the nominal and the two will stop disagreeing
            * by ~0.5%. */
           if (c->avg_vcc_adc > 0) {
-              /* Three decimals, like Vctl and the INA voltage — the divider
+              /* Three decimals, like Vctl and the OCXO voltage — the divider
                * halves the rail, so the ADC's own LSB is worth ~1.6 mV at the
                * input and the third digit is carrying real information rather
                * than dressing up noise. */
@@ -2898,7 +2905,8 @@ void vDisplayTask(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(10));
 
         bool oled_ok = false, lcd_ok = false, ht_ok = false;
-        bool aht_ok = false, bmp_ok = false, ina_ok = false;
+        bool aht_ok = false, bmp_ok = false, bme_ok = false,
+             ina_ok = false, lm75_ok = false;
 #ifdef GPSDO_OLED
         oled_ok = s_oled_ok;
 #endif
@@ -2917,7 +2925,14 @@ void vDisplayTask(void *pvParameters)
 #ifdef GPSDO_INA219
         ina_ok = gpsdo_sensor_ina219_available();
 #endif
-        tft_splash(oled_ok, lcd_ok, ht_ok, aht_ok, bmp_ok, ina_ok);
+#ifdef GPSDO_BME280_I2C
+        bme_ok = gpsdo_sensor_bme280_available();
+#endif
+#ifdef GPSDO_LM75
+        lm75_ok = gpsdo_sensor_lm75_available();
+#endif
+        tft_splash(oled_ok, lcd_ok, ht_ok,
+                   aht_ok, bmp_ok, bme_ok, ina_ok, lm75_ok);
         tft_draw_layout();
     }
 #endif
@@ -3153,7 +3168,7 @@ void vDisplayTask(void *pvParameters)
                 } else {
                     snprintf(line,sizeof(line),"GPS: acquiring  ");  oled_set_line(2,line);
                     snprintf(line,sizeof(line),"Sat: %2d         ",snap_g.sats); oled_set_line(3,line);
-                    { static char ft[6],fp[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,0,fp); snprintf(line,sizeof(line),"BM:%sC%shPa",ft,fp); }
+                    { static char ft[6],fp[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,0,fp); snprintf(line,sizeof(line),"EN:%sC%shPa",ft,fp); }
                     oled_set_line(4, line);
                 }
                 /* Row 5: uptime */
@@ -3172,17 +3187,22 @@ void vDisplayTask(void *pvParameters)
             } else {
 
                 /* PAGE B: sensors + date focus */
-                /* Row 2: BMP280 */
-                /* BM: + temp(4,1) + C + pres(5,0) + hPa = 3+4+1+5+3 = 16 chars */
-                { static char ft[6],fp[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,0,fp); snprintf(line,sizeof(line),"BM:%sC%shPa",ft,fp); }
+                /* Row 2: enclosure temperature + pressure */
+                /* EN: + temp(4,1) + C + pres(5,0) + hPa = 3+4+1+5+3 = 16 chars */
+                { static char ft[6],fp[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,0,fp); snprintf(line,sizeof(line),"EN:%sC%shPa",ft,fp); }
                 oled_set_line(2, line);
-                /* Row 3: AHT */
-                /* AH: + temp(4,1) + C + humi(5,1) + %rH = 3+4+1+5+3 = 16 chars */
-                { static char ft[6],fh[7]; dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_humi,5,1,fh); snprintf(line,sizeof(line),"AH:%sC%s%%rH",ft,fh); }
+                /* Row 3: enclosure humidity */
+                /* EN: + humi(5,1) + %rH = 3+5+3 = 11 chars */
+                { static char fh[7]; dtostrf(g_encl_humi,5,1,fh); snprintf(line,sizeof(line),"EN:%s%%rH",fh); }
                 oled_set_line(3, line);
-                /* Row 4: INA219 */
-                /* IN: + volt(5,2) + V + curr(5,0) + mA = 3+5+1+5+2 = 16 chars */
-                { static char fv[7],fi[7]; dtostrf(g_ocxo_volt,5,2,fv); dtostrf(g_ocxo_curr,5,0,fi); snprintf(line,sizeof(line),"IN:%sV%smA",fv,fi); }
+                /* Row 4: OCXO */
+                /* OX: + temp(4,1) + C + volt(4,2) + V + curr(3,0) = 3+4+1+4+1+3 = 16 chars */
+                { static char ft[6],fv[6],fi[5];
+                  dtostrf(g_ocxo_temp,4,1,ft);
+                  dtostrf(g_ocxo_volt,4,2,fv);
+                  dtostrf(g_ocxo_curr,3,0,fi);
+                  snprintf(line,sizeof(line),"OX:%sC%sV%s",ft,fv,fi);
+                }
                 oled_set_line(4, line);
                 /* Row 5: satellites + HDOP */
                 { static char fh[6];
@@ -3292,8 +3312,17 @@ void vDisplayTask(void *pvParameters)
                 snprintf(line,sizeof(line),"UTC:--:--:-- Up %s",snap_u.days_str);
             lcd_set_line(1, line);
 
+            const bool lcd_encl_humi_ok =
+                gpsdo_sensor_aht_available() || gpsdo_sensor_bme280_available();
+
+            const bool lcd_encl_pres_ok =
+                gpsdo_sensor_bmp280_available() || gpsdo_sensor_bme280_available();
+
+            const bool lcd_ocxo_ok =
+                gpsdo_sensor_lm75_available() && gpsdo_sensor_ina219_available();
+
             /* ---- Line 2: rotating view ----
-             * Modes: 0=GPS coords, 1=Sats+HDOP, 2=Date+day, 3=AHT, 4=INA, 5=BMP
+             * Modes: 0=GPS coords, 1=Sats+HDOP, 2=Date+day, 3=enclosure RH, 4=OCXO, 5=enclosure pressure
              * Skips unavailable modes automatically. */
             if (++lcd_line2_counter >= LCD_LINE2_SWITCH_SECS) {
                 lcd_line2_counter = 0;
@@ -3304,9 +3333,9 @@ void vDisplayTask(void *pvParameters)
                     if (lcd_line2_mode == 0) avail = snap_g.pos_valid;
                     if (lcd_line2_mode == 1) avail = snap_g.pos_valid;
                     if (lcd_line2_mode == 2) avail = snap_g.valid;
-                    if (lcd_line2_mode == 3) avail = gpsdo_sensor_aht_available();
-                    if (lcd_line2_mode == 4) avail = gpsdo_sensor_ina219_available();
-                    if (lcd_line2_mode == 5) avail = gpsdo_sensor_bmp280_available();
+                    if (lcd_line2_mode == 3) avail = lcd_encl_humi_ok;
+                    if (lcd_line2_mode == 4) avail = lcd_ocxo_ok;
+                    if (lcd_line2_mode == 5) avail = lcd_encl_pres_ok;
                     if (avail) break;
                 }
             }
@@ -3346,32 +3375,30 @@ void vDisplayTask(void *pvParameters)
                         snprintf(line,sizeof(line),"--/--/---- --- --:--");
                     }
                     break;
-                case 3: /* AHT */
-                    if (gpsdo_sensor_aht_available()) {
+                case 3: /* Enclosure temperature + humidity */
+                    {
                         static char ft[6],fh[6];
-                        dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_humi,4,1,fh);
-                        snprintf(line,sizeof(line),"AHT:%sC %s%%rH",ft,fh);
-                    } else {
-                        snprintf(line,sizeof(line),"AHT: not found      ");
+                        dtostrf(g_encl_temp,4,1,ft);
+                        dtostrf(g_encl_humi,4,1,fh);
+                        snprintf(line,sizeof(line),"EN:%sC %s%%rH",ft,fh);
                     }
                     break;
-                case 4: /* INA219 */
-                    if (gpsdo_sensor_ina219_available()) {
-                        static char fv[6],fi[7];
-                        dtostrf(g_ocxo_volt,4,2,fv); dtostrf(g_ocxo_curr,5,0,fi);
-                        snprintf(line,sizeof(line),"INA:%sV %smA",fv,fi);
-                    } else {
-                        snprintf(line,sizeof(line),"INA: not found      ");
+                case 4: /* OCXO temperature + voltage + current */
+                    {
+                        static char ft[6],fv[6],fi[7];
+                        dtostrf(g_ocxo_temp,4,1,ft);
+                        dtostrf(g_ocxo_volt,4,2,fv);
+                        dtostrf(g_ocxo_curr,5,0,fi);
+                        snprintf(line,sizeof(line),"OX:%sC %sV %smA",ft,fv,fi);
                     }
                     break;
-                case 5: /* BMP280 */
+                case 5: /* Enclosure temperature + pressure */
                 default:
-                    if (gpsdo_sensor_bmp280_available()) {
+                    {
                         static char ft[6],fp[7];
-                        dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_pres,5,1,fp);
-                        snprintf(line,sizeof(line),"BMP:%sC %shPa",ft,fp);
-                    } else {
-                        snprintf(line,sizeof(line),"BMP: not found      ");
+                        dtostrf(g_encl_temp,4,1,ft);
+                        dtostrf(g_encl_pres,5,1,fp);
+                        snprintf(line,sizeof(line),"EN:%sC %shPa",ft,fp);
                     }
                     break;
             }
@@ -3425,7 +3452,11 @@ void vDisplayTask(void *pvParameters)
 #ifdef GPSDO_TFT
         if (s_tft_ok)
             tft_update(&snap_g, &snap_f, &snap_c, &snap_u,
-                       gpsdo_sensor_aht_available(), gpsdo_sensor_bmp280_available(), gpsdo_sensor_ina219_available());
+                        gpsdo_sensor_aht_available(),
+                        gpsdo_sensor_bmp280_available(),
+                        gpsdo_sensor_bme280_available(),
+                        gpsdo_sensor_ina219_available(),
+                        gpsdo_sensor_lm75_available());
 #endif
 
 
