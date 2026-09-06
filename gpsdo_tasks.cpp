@@ -131,15 +131,6 @@ void ltic_read_fast(void)
 
 #endif /* GPSDO_LTIC */
 
-/* ---- Sensor objects & safe compile-time fallbacks --------------------- */
-#ifdef GPSDO_AHT10
-  #include <Adafruit_AHTX0.h>
-  static Adafruit_AHTX0 s_aht;
-  static bool s_aht_ok = false;
-#else
-  static const bool s_aht_ok = false;
-#endif
-
 /* Set true by vSensorTask once all sensor detection has completed, so the
  * TFT boot splash (in vDisplayTask) can wait briefly for valid flags. */
 static volatile bool s_sensors_probed = false;
@@ -157,11 +148,6 @@ void vSensorTask(void *pvParameters)
     /* ---- Hardware detection report (sensors) ----
      * Every optional I2C device reports both outcomes so the startup log
      * gives a complete picture of what was found on the bus.            */
-#ifdef GPSDO_AHT10
-    s_aht_ok = s_aht.begin();
-    OUT_SERIAL.println(s_aht_ok ? "HW: AHT10/AHT20 sensor    OK  (I2C 0x38)"
-                                : "HW: AHT10/AHT20 sensor    not found");
-#endif
 
     gpsdo_sensor_measurements_begin();
 
@@ -177,17 +163,6 @@ void vSensorTask(void *pvParameters)
 
     for (;;)
     {
-#ifdef GPSDO_AHT10
-        if (s_aht_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            sensors_event_t hum, tmp;
-            s_aht.getEvent(&hum, &tmp);
-            g_encl_temp = tmp.temperature;
-            g_encl_humi = hum.relative_humidity;
-            xSemaphoreGive(xWireMutex);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-#endif
-
         if (xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             gpsdo_sensor_measurements_read();
             xSemaphoreGive(xWireMutex);
@@ -2934,7 +2909,7 @@ void vDisplayTask(void *pvParameters)
         ht_ok = s_ht_ok;
 #endif
 #ifdef GPSDO_AHT10
-        aht_ok = s_aht_ok;
+        aht_ok = gpsdo_sensor_aht_available();
 #endif
 #ifdef GPSDO_BMP280_I2C
         bmp_ok = gpsdo_sensor_bmp280_available();
@@ -3329,7 +3304,7 @@ void vDisplayTask(void *pvParameters)
                     if (lcd_line2_mode == 0) avail = snap_g.pos_valid;
                     if (lcd_line2_mode == 1) avail = snap_g.pos_valid;
                     if (lcd_line2_mode == 2) avail = snap_g.valid;
-                    if (lcd_line2_mode == 3) avail = s_aht_ok;
+                    if (lcd_line2_mode == 3) avail = gpsdo_sensor_aht_available();
                     if (lcd_line2_mode == 4) avail = gpsdo_sensor_ina219_available();
                     if (lcd_line2_mode == 5) avail = gpsdo_sensor_bmp280_available();
                     if (avail) break;
@@ -3372,7 +3347,7 @@ void vDisplayTask(void *pvParameters)
                     }
                     break;
                 case 3: /* AHT */
-                    if (s_aht_ok) {
+                    if (gpsdo_sensor_aht_available()) {
                         static char ft[6],fh[6];
                         dtostrf(g_encl_temp,4,1,ft); dtostrf(g_encl_humi,4,1,fh);
                         snprintf(line,sizeof(line),"AHT:%sC %s%%rH",ft,fh);
@@ -3450,7 +3425,7 @@ void vDisplayTask(void *pvParameters)
 #ifdef GPSDO_TFT
         if (s_tft_ok)
             tft_update(&snap_g, &snap_f, &snap_c, &snap_u,
-                       s_aht_ok, gpsdo_sensor_bmp280_available(), gpsdo_sensor_ina219_available());
+                       gpsdo_sensor_aht_available(), gpsdo_sensor_bmp280_available(), gpsdo_sensor_ina219_available());
 #endif
 
 
