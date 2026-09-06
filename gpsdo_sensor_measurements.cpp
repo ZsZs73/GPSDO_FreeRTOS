@@ -7,6 +7,7 @@ float g_encl_temp = 0.0f;
 float g_encl_humi = 0.0f;
 float g_encl_pres = 0.0f;
 
+float g_ocxo_temp = 0.0f;
 float g_ocxo_volt = 0.0f;
 float g_ocxo_curr = 0.0f;
 
@@ -32,6 +33,31 @@ static bool s_bme_ok = false;
 #include <Adafruit_INA219.h>
 static Adafruit_INA219 s_ina;
 static bool s_ina_ok = false;
+#endif
+
+#ifdef GPSDO_LM75
+#include <Wire.h>
+static uint8_t s_lm75_addr = GPSDO_LM75_ADDRESS;
+static bool s_lm75_ok = false;
+#endif
+
+#ifdef GPSDO_LM75
+static bool lm75_read_temperature(float *out_temp)
+{
+    Wire.beginTransmission(s_lm75_addr);
+    Wire.write((uint8_t)0x00);
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    if (Wire.requestFrom(s_lm75_addr, (uint8_t)2) != 2) {
+        return false;
+    }
+
+    int16_t raw = ((int16_t)Wire.read() << 8) | Wire.read();
+    *out_temp = raw / 256.0f;
+    return true;
+}
 #endif
 
 void gpsdo_sensor_measurements_begin()
@@ -69,6 +95,19 @@ void gpsdo_sensor_measurements_begin()
         OUT_SERIAL.println("HW: INA219 sensor         OK  (I2C 0x40)");
     } else {
         OUT_SERIAL.println("HW: INA219 sensor         not found");
+    }
+#endif
+
+#ifdef GPSDO_LM75
+    Wire.beginTransmission(s_lm75_addr);
+    s_lm75_ok = (Wire.endTransmission() == 0);
+
+    if (s_lm75_ok) {
+        OUT_SERIAL.print("HW: LM75-family sensor    OK  (I2C 0x");
+        OUT_SERIAL.print(s_lm75_addr, HEX);
+        OUT_SERIAL.println(")");
+    } else {
+        OUT_SERIAL.println("HW: LM75-family sensor    not found");
     }
 #endif
 }
@@ -110,6 +149,15 @@ void gpsdo_sensor_measurements_read()
         g_ocxo_curr = s_ina.getCurrent_mA();
     }
 #endif
+
+#ifdef GPSDO_LM75
+    if (s_lm75_ok) {
+        float temp;
+        if (lm75_read_temperature(&temp)) {
+            g_ocxo_temp = temp;
+        }
+    }
+#endif
 }
 
 bool gpsdo_sensor_aht_available()
@@ -143,6 +191,15 @@ bool gpsdo_sensor_ina219_available()
 {
 #ifdef GPSDO_INA219
     return s_ina_ok;
+#else
+    return false;
+#endif
+}
+
+bool gpsdo_sensor_lm75_available()
+{
+#ifdef GPSDO_LM75
+    return s_lm75_ok;
 #else
     return false;
 #endif

@@ -129,6 +129,8 @@ extern "C" {
 //#define GPSDO_BMP280_I2C
 #define GPSDO_BME280_I2C
 #define GPSDO_INA219
+#define GPSDO_LM75          /* LM75-compatible: LM75, PCT2075, TMP1075 */
+#define GPSDO_LM75_ADDRESS 0x48
 //#define GPSDO_BLUETOOTH
 /* GPSDO_BLUETOOTH_PARALLEL — USB + Bluetooth at the same time: telemetry, CLI
  * and boot output mirror to BOTH ports, and commands are accepted from either.
