@@ -1,7 +1,7 @@
 /*
  * gpsdo_dac.h — single point where the control voltage leaves the firmware.
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * Before this existed, analogWrite(PIN_VCTL_PWM, ...) appeared in 23 places
  * across three files. Adding a second output path by editing all of them would
@@ -36,6 +36,42 @@
 /* Bring up whichever output path is compiled in. Call once from setup(), before
  * the control task starts. Returns false only if the sigma-delta path failed to
  * start; the PWM path cannot fail. */
+/* ---- WHICH PATH DRIVES THE PIN, CHOSEN AT RUNTIME -------------------------
+ *
+ * All three output paths are compiled together and the DAC command picks which
+ * one is live. The SIGNAL is switched by jumpers on the board — there is no
+ * soft multiplexer and there must not be one, because two drivers fighting over
+ * the control voltage is a hardware fault, not a mode. The firmware's job is
+ * only to know which path it is steering, so that the step size, the telemetry
+ * and the fine-path arithmetic describe the thing that is actually connected.
+ *
+ * PWM and DITH share PB9 / TIM4 CH4. Where the dither engine is compiled in it
+ * owns that timer, so selecting PWM does not tear the DMA down and hand the pin
+ * back to analogWrite — it writes the same 24-bit code with the low eight bits
+ * cleared. Every table entry is then identical, the duty cycle is constant, and
+ * the voltage on the pin is bit-for-bit what plain PWM produced. It is the same
+ * output, reached without a reconfiguration that could fail halfway. On a build
+ * with no dither engine, PWM is the literal analogWrite path.
+ *
+ * DEFAULT IS DITH. An unset stored value asks for the dither path, because that
+ * is the one worth having and the one every current board is wired for; if it
+ * is not compiled in, the resolver falls back to what is. */
+enum {
+    DAC_PATH_PWM  = 0,   /* 16-bit, no dither                */
+    DAC_PATH_DITH = 1,   /* 24-bit dithered PWM (default)    */
+    DAC_PATH_EXT  = 2    /* external AD5680 over bit-bang SPI */
+};
+
+extern volatile uint8_t g_dac_path;
+
+/* Is this path compiled into THIS build? */
+bool        gpsdo_dac_path_available(uint8_t path);
+/* The path that will actually be used if `want` is asked for: `want` when it is
+ * available, otherwise the first of DITH, PWM, EXT that is. Never returns a
+ * path that cannot drive the pin. */
+uint8_t     gpsdo_dac_path_resolve(uint8_t want);
+const char *gpsdo_dac_path_name(uint8_t path);
+
 bool gpsdo_dac_begin(void);
 
 /* Command in the loop's native 16-bit units. This is what every existing call

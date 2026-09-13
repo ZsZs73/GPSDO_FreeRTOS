@@ -1,7 +1,7 @@
 /* ======================================================================
  * ubx_timtp.cpp — UBX-TIM-TP sawtooth (quantization-error) correction
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * u-blox timing receivers generate the 1PPS by dividing an internal
  * oscillator, so each pulse lands on a clock edge — up to one clock period
@@ -44,6 +44,13 @@ volatile float    g_qerr_ns       = 0.0f;    /* latest qErr [ns]              */
 volatile uint32_t g_qerr_count    = 0;       /* total TIM-TP frames parsed    */
 volatile uint32_t g_qerr_last_ms  = 0;       /* millis() of last valid frame  */
 volatile uint8_t  g_qerr_flags    = 0;       /* raw flags byte (offset 14)    */
+volatile uint32_t g_qerr_paired   = 0;      /* paired lookups that matched   */
+volatile uint32_t g_qerr_unpaired = 0;      /* paired lookups that did not   */
+volatile uint32_t g_qerr_lag[QERR_LAG_BINS] = {0};  /* and by how much, see .h */
+volatile uint32_t g_qerr_latchlag[QERR_LAG_BINS] = {0};
+static volatile uint32_t s_latch_pps = 0;   /* the pulse whose ramp was sampled */
+static volatile float    s_latch_ns  = 0.0f;
+static volatile bool     s_latch_ok  = false;
 volatile bool     g_qerr_mode_next = false;  /* mode bit: 1=qErr for NEXT PPS */
 
 /* ppscount captured at the moment this TIM-TP was decoded. vFreqRelayTask
@@ -204,8 +211,61 @@ float ubx_timtp_correction_ns(void)
  * The mode bit is still captured and published (g_qerr_mode_next) for
  * diagnostics, but the pairing arithmetic is identical because the two modes
  * differ only in when the frame is emitted, and the +1 offset absorbs that. */
+void ubx_timtp_latch(uint32_t ppscount)
+{
+    s_latch_ok  = (g_qerr_enable && g_qerr_valid);
+    s_latch_ns  = s_latch_ok ? g_qerr_ns : 0.0f;
+    s_latch_pps = ppscount;
+}
+
 float ubx_timtp_correction_for_pps(uint32_t ppscount)
 {
     if (!g_qerr_enable || !g_qerr_valid) return 0.0f;
-    return (ppscount == s_qerr_at_pps + 1u) ? g_qerr_ns : 0.0f;
+    /* THE LATCHED VALUE FIRST, because it is the one that measures right — see
+     * ubx_timtp_latch() in the header for the four numbers that settle it. The
+     * offset is recorded rather than assumed, exactly as for the old rule
+     * below, so a build where this stops matching says so in SAW instead of
+     * quietly going back to steering on an uncorrected phase. */
+    if (s_latch_ok) {
+        int32_t dl = (int32_t)(ppscount - s_latch_pps);
+        uint32_t bl = (dl <= -1) ? 0u : (dl >= 4) ? (QERR_LAG_BINS - 1u)
+                                                  : (uint32_t)(dl + 1);
+        g_qerr_latchlag[bl]++;
+        /* 0 OR 1, AND THE REASON IS NOT A TOLERANCE. ltic_read_fast() captures
+         * the ramp voltage and the sawtooth TOGETHER, in the same two lines, for
+         * the same pulse; the loop later reads that same g_ltic_voltage, so it
+         * must use the qErr latched WITH it. The pulse counter is only there to
+         * say which latch is current, and it increments between the sample and
+         * the control task - measured 828 times out of 828 in one bucket on
+         * build 26, which is a fixed ordering, not a race. Either offset returns
+         * the same latched pair, so accepting both is exact rather than lax;
+         * anything further back means the loop is running on a stale ramp, which
+         * is a different fault and still refused. */
+        if (dl == 0 || dl == 1) { g_qerr_paired++; return s_latch_ns; }
+    }
+    /* Record HOW FAR OFF the pairing is, not just that it failed. On 02.09 SAW
+     * reported paired=8439/36757 - 23% - on a receiver delivering a TIM-TP frame
+     * every second (frames=36755 in the same 10 h). So the frames are all there
+     * and the +1 rule is simply looking at the wrong pulse most of the time,
+     * which means algorithm 13 has been steering on a phase with the receiver's
+     * sawtooth left in it for three quarters of every run while every display
+     * and every log line showed the corrected one. Replayed against the night's
+     * dph, that one fact accounts for the whole discrepancy: R reads 6.2 ns
+     * where the corrected phase gives 2.93, and Sf reads zero where it should
+     * be 0.15 - because a white 5 ns term swamps the difference between the two
+     * lags that Sf is measured from.
+     *
+     * The offset that WOULD pair is a property of task ordering on this build
+     * and this receiver, so it is measured here rather than reasoned about. One
+     * capture with SAW now says which bucket dominates, and the rule follows
+     * from that. */
+    {
+        int32_t d = (int32_t)(ppscount - s_qerr_at_pps);
+        uint32_t b = (d <= -1) ? 0u : (d >= 4) ? (QERR_LAG_BINS - 1u)
+                                               : (uint32_t)(d + 1);
+        g_qerr_lag[b]++;
+    }
+    if (ppscount == s_qerr_at_pps + 1u) { g_qerr_paired++;   return g_qerr_ns; }
+    g_qerr_unpaired++;
+    return 0.0f;
 }

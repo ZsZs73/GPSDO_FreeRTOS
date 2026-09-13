@@ -1,7 +1,7 @@
 /**
  * GPSDO_FreeRTOS.ino — Main entry point — hardware init and FreeRTOS scheduler start
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -41,6 +41,14 @@
 #include "gpsdo_config.h"
 #include "gpsdo_dac.h"
 #include "gpsdo_state.h"
+#include "gpsdo_health.h"
+#include "GPSDO_algorithms.h"
+#include "gpsdo_build.h"
+/* Not used for anything except its own existence: including it is what
+ * makes the Arduino builder recompile this file, so __DATE__ below is the
+ * date of THIS build and not of whenever the sketch last changed. See
+ * build_id.h — and the CRC in the banner, which cannot be stale either way. */
+#include "build_id.h"
 #include <Arduino.h>
 #include <Wire.h>
 /* EEPROM library removed in v0.96 — persistence via flash_ring (sector 7). */
@@ -181,6 +189,12 @@ extern "C" void vApplicationMallocFailedHook(void)
     interrupts();
 }
 
+/* The idle hook that used to live here is gone with the spin counter it fed:
+ * the CPU figure now comes out of the per-task cycle accounting as 100% minus
+ * the idle task's share, which needs no hook and has no reference to
+ * mis-calibrate. See gpsdo_health.h. */
+
+
 void setup()
 {
     delay(500);   /* let power stabilise */
@@ -244,8 +258,29 @@ void setup()
         int hh = (__TIME__[0]-'0')*10 + (__TIME__[1]-'0');
         int mi = (__TIME__[3]-'0')*10 + (__TIME__[4]-'0');
         int ss = (__TIME__[6]-'0')*10 + (__TIME__[7]-'0');
-        OUT_SERIAL.print(PROGRAM_NAME " " PROGRAM_VERSION " compiled ");
-        OUT_SERIAL.printf("%04d-%02d-%02d %02d:%02d:%02d\r\n", yr, mo, dy, hh, mi, ss);
+        /* Composed once into the shared stamp so the banner here and the V
+         * command print the same characters — see gpsdo_build.h. */
+        snprintf(g_fw_stamp, sizeof(g_fw_stamp),
+                 "compiled %04d-%02d-%02d %02d:%02d:%02d  build %d",
+                 yr, mo, dy, hh, mi, ss, (int)BUILD_SERIAL);
+        OUT_SERIAL.print(PROGRAM_NAME " " PROGRAM_VERSION " ");
+        OUT_SERIAL.println(g_fw_stamp);
+    }
+    /* WHICH BINARY IS THIS, REALLY. The line above is the compile time of THIS
+     * FILE, which is not the same thing as the age of the firmware — the
+     * builder reuses object files whose sources have not changed, so a sketch
+     * that has not been edited keeps its old stamp however much else changed.
+     * On 26.08 two captures from two different builds carried the same one.
+     *
+     * The CRC is computed at boot from the flash itself, so it cannot be
+     * carried over from a cache and it changes if any byte of any translation
+     * unit changed. When a log and a memory disagree, believe this number. */
+    {
+        uint32_t n = fw_image_bytes();
+        if (n) OUT_SERIAL.printf("image CRC32 %08lX  (%lu bytes of flash)\r\n",
+                                 (unsigned long)fw_image_crc32(),
+                                 (unsigned long)n);
+        else   OUT_SERIAL.println("image CRC32 unavailable (linker symbols absent)");
     }
     OUT_SERIAL.println("FreeRTOS port by J. M. Niewinski  with Claude, GLM-5.3 Max & Qwen3.8-Max AI");
     OUT_SERIAL.println("https://github.com/jmnlabs/GPSDO_FreeRTOS");
@@ -257,6 +292,7 @@ void setup()
     OUT_SERIAL.println("Algo 10 (LTIC 3-stage) inspired by Dan Wiering's measurements");
     OUT_SERIAL.println("Algo 11 (LTIC-Lars) after Lars Walenius' PI loop");
     OUT_SERIAL.println("Algo 12 (multi-level accumulator) after Alan Cashin (MIS42N)");
+    OUT_SERIAL.println("Algo 13 (Kalman filter) by J. M. Niewinski - original to this project");
 #endif
     OUT_SERIAL.println("Type H = help  SW = stack diagnostics");
     OUT_SERIAL.println("================================================\r\n");
@@ -338,6 +374,13 @@ void setup()
     gpsdo_dac_write16(gCtrl.pwm_output);
 
     /* recall learned/calibration values from the ring (if present) */
+#ifdef GPSDO_LTIC
+    /* Algorithm 13's three numbers live in their own ring record — see
+     * kf_store_load(). Silent when there is nothing stored: the defaults are
+     * "measure R, adapt Q", which is what a fresh board should do anyway. */
+    if (kf_store_load())
+        OUT_SERIAL.println("Kalman: KR/KQ/KT recalled from flash ring");
+#endif
     if (live_store_begin())
         OUT_SERIAL.println("Live store: LRN + LC applied from flash ring");
 
@@ -384,7 +427,6 @@ void setup()
     xFreqMutex      = xSemaphoreCreateMutex();
     xGpsMutex       = xSemaphoreCreateMutex();
     xCtrlMutex      = xSemaphoreCreateMutex();
-    xUptimeMutex    = xSemaphoreCreateMutex();
     xTwoHzSemaphore = xSemaphoreCreateBinary();
 
     xPpsQueue  = xQueueCreate(2, sizeof(PpsEvent_t));
@@ -413,6 +455,10 @@ void setup()
     FreqTim->resume();
     Tim2Hz->resume();
     OUT_SERIAL.println("Timers started");
+
+    /* The DWT cycle counter, before any context switch can happen: it is what
+     * the per-task load accounting measures with. */
+    cpu_trace_begin();
 
     OUT_SERIAL.println("Starting FreeRTOS scheduler");
 

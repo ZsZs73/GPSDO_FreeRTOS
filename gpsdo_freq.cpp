@@ -1,7 +1,7 @@
 /**
  * gpsdo_freq.cpp — vFreqRelayTask — frequency measurement processing
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -207,6 +207,14 @@ void vFreqRelayTask(void *pvParameters)
                     log_freq_offset(f);
                     f->ppscount++;
                     f->must_adjust = true;
+
+                    /* The clock advances HERE, on the same validated pulse
+                     * that will trigger the report — not on a free-running
+                     * timer that the report then samples asynchronously. See
+                     * Uptime_t in gpsdo_state.h. Cheap enough to run inside
+                     * the frequency mutex: two stores and, once every 1024 s,
+                     * a subtract and a divide. */
+                    uptime_tick_pps();
 
                     /* Recompute averages every PPS — fast integer math only */
                     gpsdo_calc_averages(f);

@@ -1,7 +1,7 @@
 /* ======================================================================
  * ubx_timtp.h — UBX-TIM-TP sawtooth (quantization-error) correction
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * See ubx_timtp.cpp for the full description. Passive UBX sniffer that
  * extracts qErr (quantization error) from UBX-TIM-TP and offers it as a
@@ -73,6 +73,37 @@ float ubx_timtp_correction_ns(void);
  * race between vGpsTask publishing qErr and vControlTask reading it, because
  * a qErr that hasn't arrived yet (or arrived for the wrong pulse) yields 0
  * instead of a stale value off by one PPS. */
+/* Pairing diagnostics for the "which pulse does qErr describe?" question.
+ * UBX-13003221-R15 p.66: the TIM-TP sent after pulse N-1 describes pulse N.
+ * These count how often the paired lookup actually found its pulse, so the
+ * assumption can be CHECKED on any receiver instead of trusted. Reported by
+ * the SAW command together with the mode bit the receiver itself sets. */
+extern volatile uint32_t g_qerr_paired;    /* lookups that matched a pulse   */
+extern volatile uint32_t g_qerr_unpaired;  /* lookups with no matching pulse */
+/* AND BY HOW MUCH THEY MISS, which is the number that repairs the rule rather
+ * than merely reporting that it is broken. Bucketed on (ppscount - the pulse
+ * the held qErr was recorded against): [<=-1, 0, +1, +2, +3, >=+4]. The rule
+ * in force accepts +1 only. SAW prints the whole row. */
+#define QERR_LAG_BINS 6u
+extern volatile uint32_t g_qerr_lag[QERR_LAG_BINS];
+extern volatile uint32_t g_qerr_latchlag[QERR_LAG_BINS];
+
+/* Latch the sawtooth for the pulse whose ramp has just been sampled.
+ *
+ * THE DISPLAY PATH WAS ALWAYS THE CORRECT ONE and the loop's was not. Measured
+ * on 34 240 seconds of the 01/02.09 capture, taking the raw phase and putting
+ * the sawtooth back in different places:
+ *
+ *     no correction at all ............ first-difference floor 7.57 ns
+ *     qErr latched at this pulse ...... 2.55 ns
+ *     qErr shifted by one pulse ....... 13.25 ns
+ *     qErr shifted by two ............. 9.30 ns
+ *
+ * So the value latched at the ramp sample is right, everything else is worse
+ * than nothing, and there is no argument left about pairing models: the loop
+ * should use the number the sampler already holds. This records it with the
+ * pulse it belongs to so the loop can ask for exactly that one. */
+void ubx_timtp_latch(uint32_t ppscount);
 float ubx_timtp_correction_for_pps(uint32_t ppscount);
 
 #ifdef __cplusplus

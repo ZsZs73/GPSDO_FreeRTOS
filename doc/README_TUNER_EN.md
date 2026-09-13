@@ -1,5 +1,9 @@
 # GPSDO Tuner
 
+**English** | [Polski](README_TUNER_PL.md) | [Español](README_TUNER_ES.md)
+
+📖 [Project home](../README.md) · [README](README_EN.md) · Manual: [MD](MANUAL_EN.md) · [PDF](MANUAL_EN.pdf)
+
 A desktop console for tuning the loop live and watching what it does: three
 scrolling plots, one tab per parameter group, and a manual command box for
 anything the tabs do not cover.
@@ -40,7 +44,21 @@ available in case a traceback needs reading.
 The tuner carries a `TOOL_VERSION` tracking the firmware release it was written
 for. On connect it reads the board's own version and compares:
 
-- **match** — the status bar shows `connected — firmware vX.YZ`
+- **match** — the status bar shows the board's whole identity, as far as it
+  offered one:
+
+  ```
+  connected — firmware v1.06-rtos  build 27  2026-09-02 09:46  CRC 78B08D26
+  ```
+
+  The three facts answer different questions. The **version** says which
+  protocol the tuner is talking. The **build** and compile time say which source
+  tree it came from. The **CRC** says which binary is actually running, and it
+  is the only one that cannot be stale — the board computes it from its own
+  flash at boot, so it stays honest even when the Arduino builder reuses an
+  object file and the timestamp does not. Everything past the version is
+  optional: an older firmware answers `V` with the name alone and the line
+  simply says less.
 - **mismatch** — the status bar and the Raw monitor both say so
 
 A mismatch is not fatal and the tuner will still talk to the board, but expect
@@ -61,7 +79,7 @@ of. Use the pair that shipped together.
 | **PID algo 3-9** | Kp / Ki / Kd / I_LIMIT for the frequency-domain algorithms |
 | **Calibration** | `LC`, `CT` and the detector constants |
 | **Raw monitor** | Everything the board sends, unparsed |
-| **Help** | The full firmware command reference |
+| **Help** | The full firmware command reference, in the algorithms' own order |
 
 Every parameter group is read on connect, so the panels start populated rather
 than empty.
@@ -73,11 +91,11 @@ than empty.
 Three panes, updated once per second. What the upper two show depends on which
 algorithm the board reports:
 
-| | Algorithms 10 / 11 (LTIC) | Algorithm 12 | Algorithms 0-9 |
-|---|---|---|---|
-| Top | Phase `dph` (ns) | Phase error `ph` (ns) | Learned drift (LSB) |
-| Middle | Detector `Vphase` (V), with band guides | Control voltage `Vctl` (V) | Control voltage `Vctl` (V) |
-| Bottom | Frequency error (Hz) | Frequency error (Hz) | Frequency error (Hz) |
+| | Algorithms 10 / 11 (LTIC) | Algorithm 12 | Algorithm 13 | Algorithms 0-9 |
+|---|---|---|---|---|
+| Top | Phase `dph` (ns) | Phase error `ph` (ns) | Phase **estimate** `ph` (ns) | Learned drift (LSB) |
+| Middle | Detector `Vphase` (V), with band guides | Control voltage `Vctl` (V) | Detector `Vphase` (V), with band guides | Control voltage `Vctl` (V) |
+| Bottom | Frequency error (Hz) | Frequency error (Hz) | Frequency error (Hz) | Frequency error (Hz) |
 
 Only the LTIC loops have a phase detector, so under any other algorithm those
 two panes would sit empty for the entire session. They are repointed instead,
@@ -88,6 +106,13 @@ does not use the self-learning feed-forward, so the drift trace would be flat,
 and its phase comes straight from the detector rather than through a loop
 filter, so it is not the same quantity `dph` plots. The detector band guides
 come down whenever the middle pane is showing a control voltage instead.
+
+Algorithm 13 plots what the Kalman filter BELIEVES the phase to be rather than
+this second's reading — that estimate is the whole point of having a filter —
+and puts `Vphase` underneath it, because the question this loop most often
+raises is whether the detector is alive at all. It fell through to the 0-9
+pairing at first, so the top pane was labelled "Learned drift" over a series
+algorithm 13 never sends.
 
 ### Span and Follow
 
@@ -110,18 +135,89 @@ nothing scrolls back into view afterwards.
 
 ## Limitations
 
-**History is capped at 30 hours.** The tuner holds 108 000 samples at the
-1 Hz telemetry rate. That covers a full 24-hour acquisition with room to spare,
-but anything older is discarded as new data arrives and cannot be recovered.
-Nothing is written to disk.
+**History is capped at one week.** The tuner holds 604 800 samples at the
+1 Hz telemetry rate. Anything older is discarded as new data arrives and cannot
+be recovered; nothing on the plots is written to disk. The buffers are arrays of
+doubles rather than lists of Python floats, so a full week of every series costs
+about 82 MB of host RAM instead of 406 — and nothing is preallocated, so a
+five-minute session still costs kilobytes.
 
 **The plots are not a logger.** Plotted data lives in memory only and is lost
 when the window closes. Use **Start logging** (Raw monitor tab) for anything you
-intend to keep: it writes every received line to
-`gpsdo_YYYY-MM-DD_HH-MM-SS.log` next to the script, line-buffered, so a run that
-ends badly still leaves usable data. Note it captures the *raw telemetry text*,
-not the plotted series — for ADEV and long comparisons against a reference, feed
-that file to TimeLab or similar.
+intend to keep — see below.
+
+### What logging writes
+
+The dropdown beside **Start logging** chooses the format, and it is fixed for
+the life of the file:
+
+| Setting | Writes | About a week |
+|---|---|---|
+| **Full log** | every received line, exactly as printed, to `gpsdo_YYYY-MM-DD_HH-MM-SS.log` | ~217 MB |
+| **CSV only** | one row per telemetry second, analysis columns only, to `…​.csv` | ~65 MB |
+| **Both** | the same capture written to both files | ~282 MB |
+
+Both are opened line-buffered next to the script, so a run that ends badly
+leaves usable data rather than an empty file of unflushed buffers.
+
+The **full log** is the raw telemetry text — everything the board said,
+including CLI replies and boot banners. It is what to send someone who is going
+to look at the run rather than compute from it, and it is the only format that
+preserves anything the CSV has no column for.
+
+The **CSV** is for computation: `pandas.read_csv` and `numpy.loadtxt` both read
+it with default settings, since the two provenance lines start with `#`. The
+columns are what every analysis of these logs has actually needed, not
+everything the firmware prints:
+
+```
+utc, up_s, algo, state, dph_ns, qerr_ns, vphase_v, pwm, f10, f100,
+ph_ns, level, corr, sig_ns, zc, bmp_c, sat, hdop
+```
+
+`ph_ns`, `level`, `corr`, `sig_ns` and `zc` are the algorithm-12 diagnostics and
+stay empty under any other algorithm; `f100` is empty until the 100 s window has
+filled. An empty cell always means *that field was absent from that second's
+telemetry*, never zero.
+
+Three columns deserve a note:
+
+- **`up_s` is trustworthy only from firmware v1.06 onwards.** Measured over
+  75 055 blocks captured under v1.05: UTC advanced by exactly one second every
+  single time, while the uptime counter repeated or skipped a second 118 times
+  (0.16 %) and gained 12 s over 20.8 h. It was counted from a free-running MCU
+  timer that runs about 159 ppm fast; v1.06 counts it from the PPS instead. The
+  tuner writes both columns exactly as received and repairs neither — a logger
+  that quietly fixes its input is not one you can use to find this sort of
+  thing — so for a capture from v1.05 or earlier, use `utc`.
+- **`hdop` is not always a number.** A LEA-T that has completed survey-in prints
+  `HDOP:TIME`, and that flag is the more useful of the two facts — it is the
+  mode in which the 1PPS is worth trusting. Parse the column with
+  `errors="coerce"` if you want it numeric.
+- **`vphase_v`** is the raw detector ramp voltage, and the only column that
+  reveals a railed phase detector. `dph_ns` derived from a railed ramp looks
+  like an ordinary number.
+
+Left out on purpose: `Vctl` (it is `pwm` through an RC network, and `pwm` is the
+exact figure), humidity, pressure and the INA rails (across every capture so far
+they have never moved enough to explain anything). **There are no position
+columns at all**, so a CSV is redacted by construction whatever the checkbox
+says.
+
+**Redact position** (beside the logging button, on by default) applies to the
+**full log** — the CSV has no position columns to redact. It replaces the
+receiver's `Lat` / `Lon` / `Alt` with placeholders **in the saved file only** —
+the Raw monitor and the plots keep showing your real fix. Satellite count, HDOP
+and the TIME flag stay: they are diagnostic and say nothing about where you are.
+
+A telemetry log is the thing that ends up on a forum or in the hands of whoever
+offered to measure your board, and every second of it carries a fix to six
+decimal places — about ten centimetres. Scrubbing it afterwards works but
+depends on remembering, and the once it is forgotten is the once the file has
+already been sent. The setting is fixed when the file opens and the box greys
+out until logging stops, so a log is wholly redacted or wholly not; a file
+redacted in parts reads as safe at a glance and is not. Either way the log says
+which it is, on its second line.
 
 **Generate tz_table.h** rebuilds the firmware's timezone table from this
 machine's IANA data and writes `tz_table.h` next to the script. It replaces the

@@ -1,7 +1,7 @@
 /**
  * gpsdo_control.cpp — vControlTask — OCXO control loop
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -173,10 +173,15 @@ static void wait_secs_pwm(uint16_t n, uint16_t cur_pwm)
         /* countdown of the WHOLE procedure (set by the caller at start,
          * topped up when adaptive phases add time), not of this segment */
         if (g_calib_remaining > 0) g_calib_remaining--;
+        /* Same ADC interlock as the main loop: suspend for the conversion
+         * only, then publish under the usual mutex. */
+        vTaskSuspendAll();
+        int16_t cal_vctl = movavg_update(&s_avg_vctl,
+                               (int16_t)analogRead(PIN_VCTL_ADC));
+        xTaskResumeAll();
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             gCtrl.pwm_output   = cur_pwm;
-            gCtrl.avg_vctl_adc = movavg_update(&s_avg_vctl,
-                                   (int16_t)analogRead(PIN_VCTL_ADC));
+            gCtrl.avg_vctl_adc = cal_vctl;
             xSemaphoreGive(xCtrlMutex);
         }
         vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
@@ -937,16 +942,25 @@ static void do_warmup(void)
          * sampled — so without this the displays showed 0.000 V for the whole
          * warmup (the ADC averages had never been filled). Same pattern as
          * wait_secs_pwm() uses during calibration. */
-        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            gCtrl.avg_vctl_adc = movavg_update(&s_avg_vctl,
-                                   (int16_t)analogRead(PIN_VCTL_ADC));
+        vTaskSuspendAll();
+        int16_t wu_vctl = movavg_update(&s_avg_vctl,
+                              (int16_t)analogRead(PIN_VCTL_ADC));
 #ifdef GPSDO_VCC
-            gCtrl.avg_vcc_adc  = movavg_update(&s_avg_vcc,
-                                   (int16_t)analogRead(PIN_VCC_DIV2));
+        int16_t wu_vcc  = movavg_update(&s_avg_vcc,
+                              (int16_t)analogRead(PIN_VCC_DIV2));
 #endif
 #ifdef GPSDO_VDD
-            gCtrl.avg_vdd_adc  = movavg_update(&s_avg_vdd,
-                                   (int16_t)analogRead(AVREF));
+        int16_t wu_vdd  = movavg_update(&s_avg_vdd,
+                              (int16_t)analogRead(AVREF));
+#endif
+        xTaskResumeAll();
+        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            gCtrl.avg_vctl_adc = wu_vctl;
+#ifdef GPSDO_VCC
+            gCtrl.avg_vcc_adc  = wu_vcc;
+#endif
+#ifdef GPSDO_VDD
+            gCtrl.avg_vdd_adc  = wu_vdd;
 #endif
             xSemaphoreGive(xCtrlMutex);
         }
@@ -1047,6 +1061,19 @@ void vControlTask(void *pvParameters)
 
         /* ---- ADC readings ---- */
         {
+            /* SCHEDULER SUSPENDED FOR THE CONVERSIONS. These share ADC1 with
+             * the LTIC phase read on PA1, and the core's analogRead()
+             * reconfigures the channel on a shared handle without any
+             * interlock - see the long note in ltic_read_fast(). Preempting
+             * that read corrupts a phase measurement; being preempted here
+             * corrupted this average, visibly: 1.800 V -> 1.620 V, exactly
+             * 0.9x, which is one conversion returning zero into a 10-deep
+             * moving average, seven times in the 03.09 10:08 capture.
+             *
+             * Three conversions is about 60 µs with interrupts still enabled.
+             * The phase read cannot wait - its 50 µs settle is a deadline on a
+             * 5 ms decay - so this side is the one that becomes atomic. */
+            vTaskSuspendAll();
             int16_t raw;
             raw = (int16_t)analogRead(PIN_VCTL_ADC);
             int16_t avg_vctl = movavg_update(&s_avg_vctl, raw);
@@ -1062,6 +1089,7 @@ void vControlTask(void *pvParameters)
 #else
             int16_t avg_vdd = 0;
 #endif
+            xTaskResumeAll();
             if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                 gCtrl.avg_vctl_adc = avg_vctl;
                 gCtrl.avg_vcc_adc  = avg_vcc;

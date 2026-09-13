@@ -55,6 +55,27 @@
 #undef INCLUDE_xTaskGetSchedulerState
 #define INCLUDE_xTaskGetSchedulerState    1
 
+/* CPU load, measured by counting how fast the idle task spins.
+ *
+ * The alternative is configGENERATE_RUN_TIME_STATS, which wants a spare timer
+ * and a base clock and gives per-task figures nobody has asked for. What is
+ * actually wanted is one number on the telemetry line, and the idle task
+ * already carries it: whatever fraction of the second it does NOT get is the
+ * load. One volatile increment in the hook is the entire cost. */
+/* Per-task CPU load. FreeRTOS calls this on every context switch, with the
+ * scheduler suspended, so the hook does one cycle-counter read and one add —
+ * see gpsdo_health.h for why a trace hook rather than a sampling profiler.
+ * pxCurrentTCB is in scope wherever tasks.c expands this; it is passed as an
+ * opaque identity and never dereferenced by the hook. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cpu_trace_switch_in(void *tcb);
+#ifdef __cplusplus
+}
+#endif
+#define traceTASK_SWITCHED_IN()   cpu_trace_switch_in((void *)pxCurrentTCB)
+
 /* configASSERT in the Default config is `taskDISABLE_INTERRUPTS(); for(;;);`
  * which makes any assertion an unrecoverable white screen. Override it to
  * print the fault and the file:line before trapping, so the cause is visible

@@ -1,7 +1,7 @@
 /**
  * gpsdo_config.h — Compile-time configuration
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -31,7 +31,7 @@ extern "C" {
 
 /* ── Version ─────────────────────────────────────────────────────────── */
 #define PROGRAM_NAME     "GPSDO"
-#define PROGRAM_VERSION  "v1.05-rtos"
+#define PROGRAM_VERSION  "v1.06-rtos"
 
 /* ---- Serial output macro ----
  * OUT_SERIAL routes user-facing output to Serial2 (Bluetooth) or Serial
@@ -137,7 +137,6 @@ extern "C" {
  * Needs the Serial2 wiring (PA2/PA3). This switch supersedes GPSDO_BLUETOOTH;
  * leave that one off when using parallel mode. */
 #define GPSDO_BLUETOOTH_PARALLEL
-
 #define GPSDO_VCC
 #define GPSDO_VDD
 #define GPSDO_UBX_CONFIG
@@ -150,7 +149,7 @@ extern "C" {
  * else. Discipline is unaffected (PPS never needed UBX); you lose NMEA
  * silencing, stationary mode, survey-in/Time Mode and qErr.
  * Leave commented out for genuine u-blox modules. */
-
+ 
 //#define GPSDO_FAKE_UBLOX
 
 /* ── GPS timing module (LEA-6T / LEA-M8T) ─────────────────────────────
@@ -182,9 +181,15 @@ extern "C" {
 #define GPSDO_GPS_TIMING     /* u-blox timing rx: LEA-6T / LEA/NEO-M8T / ZED-F9T */
 #define GPSDO_SVIN_MIN_SECS   300u    /* minimum survey-in duration [s]     */
 #define GPSDO_SVIN_ACC_LIMIT  5000u   /* position accuracy limit [mm] (5 m) */
-
-
 #define GPSDO_PICDIV
+/* GPSDO_LTIC REQUIRES THE PHYSICAL RAMP DETECTOR ON PA1. It is not a software
+ * option: the algorithms behind it (10, 11 and 12) read a real voltage ramp
+ * built by an external charge/discharge circuit — the PPS starts the ramp, the
+ * OCXO-derived edge stops it, and PA1 samples what is left. Without that
+ * circuit PA1 is a floating analog input, ADC noise is read as a phase in
+ * nanoseconds, and the loop disciplines the oscillator against nothing.
+ * Enable this ONLY if the detector hardware is fitted; a counter-only board
+ * leaves it commented out and uses algorithms 0-9. See doc/MANUAL_*.md 1.3. */
 #define GPSDO_LTIC           /* Lars' TIC: read Vphase on PA1, discharge 1nF capacitor */
 /* GPSDO_EEPROM removed in v1.00: persistence is 100% flash ring
  * (settings_store + live_store, sector 7). See doc/FLASH_RING_BRINGUP_*. */
@@ -200,6 +205,7 @@ extern "C" {
  *
  * No hardware SPI is needed: the DAC is written once per second, so bit-banging
  * costs microseconds. See dac_ext.h for the pin proposal and the reasoning. */
+ 
 /* GPSDO_PWM_DITHER replaces the plain 16-bit PWM with a shorter PWM whose duty
  * is dithered from period to period, giving 24 bits after the filter. Idea from
  * Alan Cashin (MIS42N); the table is replayed by DMA rather than run in an
@@ -244,9 +250,13 @@ extern "C" {
  *
  * If a board needs both, move PIN_DAC_CS — PB2, PB14, PA4, PA6, PA8, PA9 and PA10
  * are free at the time of writing. Nothing in the firmware depends on which. */
-#if defined(GPSDO_PWM_DITHER) && defined(GPSDO_DAC_EXT)
-  #error "GPSDO_PWM_DITHER and GPSDO_DAC_EXT both drive the control voltage. Pick one."
-#endif
+/* BOTH MAY NOW BE COMPILED TOGETHER. They used to be mutually exclusive because
+ * both drive the control voltage — but the thing that must not happen is two
+ * drivers fighting over one node, and that is settled by the JUMPERS on the
+ * board, not by the build. Compiling both lets one binary serve either wiring
+ * and lets the DAC command switch between them at runtime for a back-to-back
+ * comparison, which is otherwise a reflash apart. The pins do not collide:
+ * dither is PB9/TIM4, the AD5680 is PB4/PB0/PB2. See gpsdo_dac.h. */
 /* With the external DAC on, TM1637 and the 2 kHz generator yield their pins
  * instead of failing the build: TM1637's data line is the DAC's chip-select
  * (PB4), and both options are historical anyway — the HT16K33 on I2C is the

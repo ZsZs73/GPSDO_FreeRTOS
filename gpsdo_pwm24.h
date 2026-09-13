@@ -1,6 +1,6 @@
 /* =======================================================================
  * gpsdo_pwm24.h — 24-bit control voltage from a short PWM plus dithering
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * The idea is Alan Cashin's (MIS42N on EEVblog), from his Budget GPSDO: run the
  * PWM at fewer bits than you need, and vary the duty cycle from one period to the

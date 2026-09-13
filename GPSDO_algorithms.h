@@ -1,7 +1,7 @@
 /**
  * GPSDO_algorithms.h — Control loop algorithm declarations and tunable parameters
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -12,7 +12,12 @@
  * holding runtime-tunable PID coefficients for algorithms 3-9.
  *
  * Physical system: 16-bit PWM DAC, ~48.8 uV/LSB, dual RC filter
- * (tau ~ 200 ms), OCXO gain ~ 5 uHz/LSB (NDK ENE3311B typical).
+ * (tau ~ 200 ms). The OCXO gain is NOT a constant of this firmware: it is
+ * measured by CT, and this file must not name a figure that only ever applied
+ * to one part. Measured on the two boards of this design: +319.5 and
+ * -379.4 uHz/LSB, both with a Vectron C4550A1-0213 (5 V supply, 0-4 V EFC).
+ * The header used to quote "~5 uHz/LSB (NDK ENE3311B typical)", which is a
+ * different oscillator entirely and roughly seventy times off.
  * Error convention: e = avg_freq - 10 MHz; e > 0 -> decrease PWM.
  */
 #pragma once
@@ -264,6 +269,62 @@ typedef struct {
     bool     valid;                 /* a fit exists and is driving the table  */
 } mlacc_fit_t;
 void mlacc_get_fit(mlacc_fit_t *out);
+
+/* ---- Algorithm 13: three-state Kalman filter -------------------------
+ *
+ * Phase, frequency and aging, with a scalar phase measurement once a second.
+ * Scalar means there is no matrix to invert — the Kalman gain is one division —
+ * so the whole filter costs about 140 multiply-adds and 36 bytes of state. It
+ * runs on this Cortex-M4F in roughly a microsecond, once per second.
+ *
+ * What it buys over a PI loop is that its bandwidth is not a constant: it
+ * weighs the detector against the oscillator by their measured variances, so it
+ * trusts the OCXO at short tau where GPS is noisy and yields to GPS at long tau
+ * where the OCXO walks. And because the state carries frequency AND aging with
+ * their uncertainties, losing the phase is not a special case — the filter
+ * simply stops updating and keeps steering, which is holdover for free.
+ *
+ * Both noise figures are MEASURED rather than set: R from the detector's own
+ * first differences, Q from the innovation sequence. KR and KQ override them
+ * for an experiment; zero means measure. */
+extern float    g_kf_r_ns;        /* KR: measurement noise [ns], 0 = measure  */
+extern float    g_kf_q;           /* KQ: process noise [(ns/s)^2/s], 0 = adapt */
+extern uint16_t g_kf_horizon_s;   /* KT: ESTIMATOR horizon [s] - Q ceiling    */
+extern uint16_t g_kf_ctl_s;       /* KC: CONTROLLER horizon [s], 0 = KT/3     */
+
+typedef struct {
+    float    phase_ns;      /* estimated phase                                */
+    float    freq_ns_s;     /* estimated frequency error, ns per second       */
+    float    aging_ns_s2;   /* estimated aging, ns per second per second      */
+    float    sigma_ns;      /* sqrt(P00): how well the phase is known         */
+    float    r_ns;          /* measurement noise in use                       */
+    float    q;             /* process noise in use (Sg: frequency walk)       */
+    float    sf;            /* Sf: phase process noise, ns^2/s, measured       */
+    float    q_max;         /* ceiling the adaptation may not pass             */
+    bool     q_at_max;      /* and true while it is sitting against it         */
+    float    q_min;         /* and the numerical floor under it                */
+    bool     q_at_min;      /* true while it is sitting on THAT                 */
+    bool     q_held;        /* adaptation stood still this second              */
+    uint32_t q_freeze_s;    /* and this many seconds of post-arm freeze remain  */
+    uint16_t ctl_s;         /* KC in force: how fast a known phase is nulled   */
+    float    q_ratio;       /* Pobs/Ppred the adaptation last acted on         */
+    float    q_lo;          /* lowest Q since the algorithm restarted          */
+    float    q_hi;          /* and the highest - one KL then reads a whole run */
+    bool     q_adapting;    /* false when KQ pinned Q instead of adapting it    */
+    float    innov_ns;      /* last innovation                                */
+    uint32_t rejects;       /* samples the innovation gate threw away         */
+    float    rej_pct;       /* and the RATE of that, over ~300 s, in per cent  */
+    bool     r_pinned;      /* true when KR fixed R instead of measuring it    */
+    uint32_t holdover_s;    /* seconds running on the model alone             */
+    uint32_t arms;          /* picDIV re-arms this session                    */
+} kf_stats_t;
+void kf_get_stats(kf_stats_t *out);
+void kf_store_save(void);   /* write KR/KQ/KT to their own ring record */
+bool kf_store_load(void);   /* read them back at boot                  */
+
+#ifdef GPSDO_LTIC
+uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount);
+#endif
 
 /* ---- Helper exposed to ControlTask ---------------------------------- */
 void gpsdo_calc_averages(FreqData_t *f);

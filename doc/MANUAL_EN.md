@@ -46,6 +46,7 @@ should see. Nothing important is left as an exercise.
 - [Appendix A — How a GPSDO works, in plain words](#appendix-a--how-a-gpsdo-works-in-plain-words)
 - [Appendix B — PID for the reluctant](#appendix-b--pid-for-the-reluctant)
 - [Appendix C — Glossary](#appendix-c--glossary)
+- [Appendix D — The Kalman filter in plain words](#appendix-d--the-kalman-filter-in-plain-words)
 
 ---
 
@@ -845,6 +846,45 @@ one line saying what it concluded:
 KAL: from CT/LC  res 1.01ns  R0 2.52ns  Q0 0.000006600  P0 1500ns  lim 939LSB  arm<0.25Hz
 ```
 
+**Two process noises, not one.** The clock model this filter implements carries
+`Sf`, the white frequency noise that shows up as a random walk in phase, and
+`Sg`, the frequency random walk — `Q = [[Sf·t + Sg·t³/3, Sg·t²/2], [Sg·t²/2,
+Sg·t]]`. Until 01.09 only `Sg` existed here, and that single omission was the
+whole of the over-actuation: with no `Sf`, the only way to explain a phase that
+moved more than predicted is to decide the *frequency* is wandering, which raises
+the gain that writes the frequency state, which is what the DAC follows. `Sf` is
+now measured rather than adapted — the phase differences at lag 1 and at lag 16
+carry `sigma_R² + Sf·k/2`, so two lags separate white noise from walk where one
+cannot — and a difference that does not clear two sigma of its own estimator
+noise is reported as zero, which on a clean detector is the right answer. `KL`
+shows it beside `R` and `Q`.
+
+**Q adapts, but it may not outrun its horizon.** The filter nudges the process
+noise `Q` toward whatever makes its own innovations come out the size it
+predicted. That has one systematic bias, and on the bench it bit: when the
+detector's error is *correlated* — a zero that wanders over minutes — the
+innovations are bigger than the filter expects for a reason that has nothing to
+do with the oscillator, so `Q` ratchets up second after second until the
+covariance has grown enough to explain them. It stops, but it stops high. On
+30.08 the board was running with `Q` 195x its seed: a filter five times faster
+than the horizon it was told to steer over, moving the DAC 1.80 LSB per second
+against algorithm 11's 0.49 on the same night — and no better phase for it.
+
+`(R/Q)^(1/3)` is a time, and it is the filter's own time constant; `Q = R/KT³`
+is exactly the statement *run as fast as the horizon you were given*. So the
+adaptation is now bounded there: **the filter may not run faster than `KT`**,
+with `R` taken as measured rather than as seeded — which is what makes the rule
+say the same thing on every board. Measured over two plants, five noise seeds
+and three levels of detector wander: short-tau ADEV twice better, DAC motion
+2.4× lower, against 7% on phase sd. Nothing is lost by refusing to let `Q`
+absorb correlated detector error, because `R` already has it: `R` is measured
+from differences taken at a sixteen-second lag, so a zero that wanders on those
+scales is in the measurement noise where it belongs. Want a faster loop? Shorten
+`KT` — that is now the only thing that moves it. A value you pin yourself with
+`KQ` passes as given: the bound is on the adaptation, not on you. `KL` says
+`[at ceiling]` when it is sitting against it, and a loop that sits there for a
+whole run is telling you `KT` is longer than this oscillator supports.
+
 **Parameters** — all four are optional and the defaults are the ones to use:
 
 | Command | Default | Meaning |
@@ -852,7 +892,7 @@ KAL: from CT/LC  res 1.01ns  R0 2.52ns  Q0 0.000006600  P0 1500ns  lim 939LSB  a
 | `KR [ns]` | `0` = measure | Measurement noise. Zero means "measure it from the detector's own differences at a sixteen-second lag" — white noise and slow zero wander together, which is what you want. Set it only to pin the filter for an experiment. |
 | `KQ [v]` | `0` = adapt | Process noise, (ns/s)² per second. Zero means "adapt it from the innovation sequence". |
 | `KT [s]` | `100` | Phase horizon: how quickly the control nulls the estimated phase. Shorter follows GPS harder, longer leans on the oscillator. It also sets the patience of the stall check — five horizons far out and the picDIV is re-armed. |
-| `KL` | — | List the state: phase, frequency and aging, how well each is believed, the R and Q in use, and how many readings the innovation gate threw away. |
+| `KL` | — | List the state: phase, frequency and aging, how well each is believed, the R and Q in use, and how many readings the innovation gate threw away. `[at ceiling]` next to Q means the adaptation is against its bound. |
 
 `KR`, `KQ` and `KT` are saved the moment you type them, in their own flash-ring
 record — no `ES` needed, and an older firmware simply never asks for that record.
@@ -891,17 +931,24 @@ was too white; treat its numbers as relative, never absolute (4.6a).
 rolls forward one second. Then up to two *measurements* correct it — the
 phase from the LTIC detector (unless railed, frozen or out of band) and the
 frequency from TIM2 (always; it keeps the loop alive when the detector is
-blind). Then the *control*: `u = -(freq + phase/T)` — cancel the estimated
-frequency error and null the estimated phase over the horizon `T`, clamped
+blind). Then the *control*: `u = -(freq + phase/KC)` — cancel the estimated
+frequency error and null the estimated phase over the **controller's**
+horizon `KC` (in force from the loop's first settle; before that, during
+acquisition, at the gentler `KT` pace), clamped
 to the detector band, sub-LSB remainder carried to the next second. What
 actually reached the pin is booked back into the frequency state. Around
 this core: the 4σ innovation gate, the trust test (does the phase move the
-way TIM2 says it must?), the start re-referencing arm, and holdover.
+way TIM2 says it must? — ignoring wobbles smaller than the counter's own
+resolution), four seconds of deliberate phase silence after a divider arm
+(ramp readings then are the rail, not a phase), the start re-referencing
+arm, and holdover.
 
-**The honest-R insight.** Detector noise is measured from its own
-differences at a sixteen-second lag — white noise (~2.5 ns) **and** slow
-zero wander (~5.9 ns) together, R ≈ 6.5 ns. That number is the loop's
-whole character: it is why algorithm 13 refuses to chase slow detector
+**The honest-R insight.** The R that `KL` reports (~2.9 ns on this bench)
+is measured from the detector's own differences at a sixteen-second lag:
+the white floor (~2.5 ns) plus the growth of the slow zero wander over
+those 16 s. The **full** zero wander is a separate structure (~2.6 ns over
+~45 s on this bench) that the filter **deliberately does not chase** — it
+is why algorithm 13 refuses to follow slow detector
 structure that algorithm 11 follows without question. Measured: with the
 loop quiet, dph shows a flat 5–9 ns floor from 10 s to 600 s averaging
 **regardless of loop bandwidth** — wide, adapted and stiff all landed on
@@ -915,29 +962,55 @@ quiet hours, but the 4σ gate narrows with R, so real GPS events (tens of
 ns) get rejected — rejects rose from 163 to 5021 per night. Pin only to
 bracket an experiment; `KR 0` is the better default.
 
-**`KQ [v]`** (default 0 = adapt). The adaptation sees innovations colored
-by the loop's own control, so **Q ratchets up** — measured 195× the seed
-after one night (clamped at 1000×). Known and tolerated: the adapted loop
-handled the night's GPS episodes visibly better. Pinning at the seed
-(`KQ 0.000006359` — read the exact seed from the `KAL: from CT/LC` line)
-stiffens the loop ~14× and nearly freezes the PWM; in the measured A/B it
-changed nothing at mid-tau and handled episodes slightly worse. **KQ saves
-when you type it** — put it back with `KQ 0`.
+**`KQ [v]`** (default 0 = adapt). The adaptation used to ratchet: correlated
+detector error keeps the innovations larger than the covariance predicts, so
+**Q climbed** — 195× the seed after one night, a filter five times faster than
+its horizon moving the DAC 1.80 LSB/s against algorithm 11's 0.49. It is now
+bounded at `R/KT³` — **the filter may not run faster than `KT`** — which cuts
+the DAC motion 2.4× and doubles short-tau ADEV (4.6). Dan Wiering's board, same
+firmware, nothing touched, went the whole way to the old rail: `Q` 1000× its
+seed within 2h37m, the DAC moving 11.05 LSB/s, and ADEV at 20 s of 8.6e-11
+against 3.1e-12 for algorithm 11 on the same board and the same rubidium. `KL` prints `[at ceiling]` when the adaptation is
+against the bound. Pinning at the seed (`KQ 0.000006359` — read the exact seed
+from the `KAL: from CT/LC` line) stiffens the loop further and nearly freezes
+the PWM; a value you pin passes as given, the bound is on the adaptation.
+**KQ saves when you type it** — put it back with `KQ 0`.
 
-**`KT [s]`** (default 100). How quickly the control nulls the estimated
-phase: shorter follows GPS harder (and copies more detector noise), longer
-leans on the oscillator's own stability. Also the stall-check patience —
-five horizons far out re-arms the picDIV. On a site with detector wander
-it decides how much of that wander reaches the oscillator.
+**`KT [s]`** (default 100). Since build 36 this is the **estimator's**
+horizon — the patience of the understanding, not the speed of the hands.
+A shorter KT means a wider belief bandwidth (and a higher Q ceiling, since
+the bound is `R/KT³`); a longer one leans on the oscillator's own
+stability. It is also the stall-check patience — five horizons far out
+re-arms the picDIV. The phase-nulling pace is `KC`'s job now.
+
+**`KC [s]`** (default 0 = auto = KT/3; **in force only from the loop's
+first settle** — during acquisition and after an algorithm restart the
+control falls back to KT). How fast the *hands* null a phase error the
+*understanding* already has: the estimate is already smoothed, so nulling
+it quickly amplifies the correction, not the noise. Measured on a
+20-hour log: output ADEV ~23% better at tau 256–4096, with DAC dither
+rising from 0.37 to 0.52 LSB/s — a budget, not a free lunch. A sweep
+found no knee (gain monotone, cost ∝ 1/KC), so the default is a
+compromise rather than an optimum; `KC` with no argument prints the
+configured value and the one actually in force.
 
 **`KL` — read the state** before, during and after any experiment:
-estimates, phase-belief sigma, the R and Q actually in use (Q vs the seed
-is the ratchet speed), last innovation, reject count. The most informative
-habit: `KL`, then `SW`, then a one-hour log.
+estimates, phase-belief sigma, the R and Q actually in use (`[at ceiling]`
+beside Q means the adaptation has run into its bound of `R/KT³` — on a
+site with nonstop GPS micro-events that is most of the night, a property
+of the sky rather than a fault), last
+innovation, reject count, the **adaptation ratio** (innovations larger
+than predicted, >1 presses Q up, <1 down) and the **Q water marks** since
+tracking started (`lo..hi` — did Q ever leave the ceiling overnight). The
+most informative habit: `KL`, then `SW`, then a one-hour log.
 
-**Trends:** `KAL` (normal), `REJ` (gate rejected a reading), `ARM`
+**Trends:** `KAL` (normal), `REJ` (gate rejected a reading — singles and
+pairs at GPS events are normal), `ARM`
 (divider re-armed — start, railed or stalled), `HOLD` (no phase, steering
-on the model), `NoPL`/`NoCT` (calibration missing), `WAIT` (no data yet).
+on the model; **four seconds of HOLD right after `ARM` are deliberate
+silence** — the ramp then reads the rail, and that is not a phase),
+`NoPL`/`NoCT` (calibration missing), `WAIT` (no data yet). What a good
+night looks like — see [Appendix D](#appendix-d--the-kalman-filter-in-plain-words).
 
 ## Part 5 — Displays: what every field means
 
@@ -1150,7 +1223,8 @@ limits source, default 0), `MFT` (0=3600 s, or 2048..65535 s),
 
 ### Algo 13 (Kalman) — saved on entry, no `ES` needed
 `KR` (0..1000 ns, 0 = measure), `KQ` (0..1, 0 = adapt), `KT` (10..10000 s,
-default 100), `KL` (list the filter state) — meanings in Part 4.6.
+default 100), `KC` (10..10000 s, 0 = auto KT/3; in force after the first
+settle), `KL` (list the filter state) — meanings in Part 4.6.
 
 ### GPS, time, sensors
 | Command | Range | What it does |
@@ -1623,3 +1697,97 @@ that half of them are used differently elsewhere.
 | **trend** | The four-character word in the telemetry and on the display naming what the loop is doing right now: `ACQ`, `DPLL`, `LOCK`, `CORR`, `ZC`, `NOPH`, … |
 | **Vctl / Vphase** | Vctl is the control voltage going *to* the oscillator; Vphase is the detector voltage coming *back* from the phase measurement. Two different pins, easy to confuse. |
 | **ZC** | Zero-crossing cancellation (algorithm 12): removing a deliberate slew at the instant the phase crosses zero, leaving both frequency and phase correct at once. |
+
+## Appendix D — The Kalman filter in plain words
+
+Part 4.6 describes algorithm 13 by its knobs; this appendix describes it by
+its intuition. No formulas — a few pictures, that is all.
+
+### D.1 Three beliefs, and a pencil for each
+
+The filter carries three beliefs: **how far the oscillator's phase is
+displaced** (in nanoseconds), **how fast that displacement is growing**
+(picoseconds per second), and **how that drift itself changes with age**
+(aging). With each belief it also carries the **thickness of a pencil**:
+the interval it knows it does not know. "Phase = 2 ns ± 1 ns" means:
+certain to one nanosecond — and over a night that certainty grows and
+shrinks on its own.
+
+The pencils are half the filter. When a measurement arrives, the belief
+moves **toward it, but only as far as the measurement's pencil allows
+against the belief's own**. A confident measurement against a fuzzy belief
+— a big step. A fuzzy measurement against a confident belief — a light
+nudge. That is the whole "Kalman filter": belief with weights, renewed
+every second.
+
+### D.2 Two witnesses
+
+- The **phase detector** is fresh but chatty: every second it reports the
+  phase with ~2.5 ns of noise, and its zero wanders on its own (~2.6 ns
+  over ~45 s). The filter measures that noise itself — from the
+  differences between successive readings — and calls it R.
+- The **TIM2 counter** is honest but blunt: it speaks frequency with a
+  precision that only becomes useful after a hundred seconds. But it falls
+  silent only when everything does — and it is what keeps the loop alive
+  when the detector goes blind.
+
+In short: over seconds the oscillator decides, over months GPS decides,
+and the filter picks the proportions **anew every second** — instead of
+once and forever, like algorithm 11's time constant.
+
+### D.3 The understanding and the hands: KT and KC
+
+Since build 36 these are two separate knobs, and the difference is worth
+having:
+
+- **KT** is the patience of the **understanding**: how widely the filter
+  spreads belief across time, and how fast it may be allowed to conclude
+  (it also sets the Q ceiling — the filter may not run faster than its
+  horizon).
+- **KC** is the speed of the **hands**: given that the filter already
+  *knows* the phase sits 5 ns too far — over what time is that closed?
+  Default KT/3, but only **after the first settle**: at a cold start the
+  loop walks into band at the gentle KT pace, and the quick hands switch
+  themselves on once there is something quick to close. Faster hands mean
+  a smaller phase error (ADEV ~23% better at mid tau) but more DAC
+  dither — a budget, not a free lunch.
+
+### D.4 Healthy scepticism, or what the filter does when things go wrong
+
+- **The 4σ gate.** A reading too wild for the filter's own predictions is
+  refused — in singles and pairs at GPS events that is normal (the
+  build 42 night: 320 rejects in 20 hours, longest run two).
+- **The trust test.** Phase and frequency are the same show seen from two
+  sides: if the counter says frequency is being carried, the phase *must*
+  be moving. A detector that does not move when it must is lying. The
+  test ignores wobbles smaller than the counter's own resolution (so it
+  cannot convict a healthy detector on the reference's own noise), and a
+  convicted detector gets its voice back after half an hour.
+- **Silence after an arm.** Arming the divider stops it for a second,
+  while the ramp keeps being sampled and reads the top rail (~1400 ns —
+  it looks like a phase, but it is not one). For four seconds after an
+  arm the filter simply does not hear the word "phase". Four seconds of
+  `HOLD` right after `ARM` in a log are a sign of health, not a fault.
+- **TIM2 silence after a restart.** For the first hundred seconds the
+  counter's hundred-second average still carries the oscillator's warm-up;
+  the filter waits for a clean measurement rather than believing history.
+
+### D.5 What a good night looks like
+
+Trend `KAL` for ~99% of the time. Single `REJ`s at GPS events. `HOLD` only
+the four seconds after an `ARM`. R holds ~2.9 ns, `sig` ~1 ns. `[at
+ceiling]` beside Q — on this bench the GPS micro-events press on the
+adaptation all night, so Q spends it at the ceiling; that is a property of
+the sky, not a fault. `KL` after the night adds the adaptation ratio and
+the Q water marks (`lo..hi`) — from which you can see whether Q ever left
+the ceiling.
+
+### D.6 When not to touch anything
+
+The KR/KQ/KT/KC defaults are **measured from the board itself** — R from
+its detector, Q from its oscillator, the rest from the horizons. Pinning
+(`KR` to the white floor, `KQ` at the seed) is for comparative
+experiments, not daily work: every pin tells the filter it knows better
+than the board — and the board usually does not lie. If you want to see
+*whether* the filter is right, the best single habit remains: `KL`, `SW`,
+a one-hour log — and Appendix A, to know what to watch.

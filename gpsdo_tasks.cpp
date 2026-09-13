@@ -1,7 +1,7 @@
 /**
  * gpsdo_tasks.cpp — Sensor, Display and Uptime tasks
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -10,7 +10,7 @@
  *
  * vSensorTask   — reads sensor measurements every 2 s under xWireMutex
  * vDisplayTask  — drives OLED, LCD, TFT, TM1637, serial report, and LEDs
- * vUptimeTask   — increments uptime counter, formats dd hh:mm:ss
+ * vUptimeTask   — holdover-only uptime tick (the PPS drives it otherwise)
  *
  * Display update uses dirty-flag comparison per row — only changed rows
  * trigger I2C writes, minimising bus traffic.
@@ -24,6 +24,7 @@
 
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
+#include "gpsdo_health.h"
 #include "ubx_timtp.h"
 #include "GPSDO_algorithms.h"   /* g_ltic (calibrated span) for the ADC outlier gate */
 #include <Arduino.h>
@@ -66,6 +67,32 @@ volatile bool g_ltic_must_read = false;
 int16_t       g_ltic_adc_raw   = 0;
 int16_t       g_ltic_adc_avg   = 0;
 float         g_ltic_voltage   = 0.0f;
+/* THE SAWTOOTH THAT BELONGS TO THIS PULSE, LATCHED AT THE PULSE.
+ *
+ * Both display paths — the serial report and the TFT phase row — used to call
+ * ubx_timtp_correction_ns() at the moment they were drawn, which returns
+ * whatever qErr was decoded most recently. That is fine for the report, which
+ * is gated on a change of ppscount and therefore runs on the first wake after
+ * the pulse. It is wrong for the TFT, which redraws on EVERY wake of
+ * vDisplayTask — and one of those wakes comes from the GPS parser, after the
+ * receiver's serial burst has been consumed. The TIM-TP frame is inside that
+ * burst, so by then g_qerr_ns has already advanced to the NEXT pulse, while
+ * g_ltic_voltage is still this pulse's ramp. The panel was subtracting
+ * qErr(N+1) from phase(N).
+ *
+ * On a receiver whose sawtooth is slow that would merely be imprecise. On this
+ * one successive values are anti-correlated (corr = -0.30, period near 2-3 s),
+ * so the wrong pulse's qErr ADDS the sawtooth instead of removing it: measured
+ * 25.08, subtracting the neighbouring pulse takes the residual from 11.46 ns
+ * to 13.6 ns, which is worse than applying no correction at all. Hence a panel
+ * reading visibly larger than the log line printed in the same second, which
+ * is what put us onto it.
+ *
+ * ltic_read_fast() runs ~50 us after the PPS edge, before the burst that
+ * carries the next frame, so g_qerr_ns there is still this pulse's. Latch it
+ * once and let every reader use the latch: the two paths then agree with each
+ * other and with the loop by construction, whenever they happen to be drawn. */
+static float  s_ltic_qerr_ns   = 0.0f;
 
 /* ltic_read_fast — read PA1 (the TIC ramp) ~50 µs after the PPS edge, from
  * vFreqRelayTask (which is woken directly by the GPS-PPS ISR). Oversamples
@@ -77,6 +104,38 @@ float         g_ltic_voltage   = 0.0f;
  * The pin stays INPUT_ANALOG for the whole life of the program. */
 void ltic_read_fast(void)
 {
+    /* THE WHOLE MEASUREMENT IS ATOMIC AGAINST OTHER TASKS, AND IT HAD TO BE.
+     *
+     * This part is 50 µs of settling followed by sixteen conversions, and both
+     * halves were interruptible by any other task. Two things follow from that,
+     * and both were measured on the bench rather than reasoned about here:
+     *
+     * 1. THE ADC IS SHARED. PA1 is ADC1_IN1 and PIN_VCTL_ADC (PB1) is
+     *    ADC1_IN9 - one ADC on this part - and the core's analogRead()
+     *    reconfigures the channel on a shared handle and is not reentrant.
+     *    ControlTask reads Vctl/Vcc/Vdd every 200 ms with no interlock at all.
+     *    The 03.09 10:08 capture caught the consequence on the harmless side:
+     *    Vctl, a 10-deep moving average, dropped to exactly 0.900 of its value
+     *    seven times - which is one conversion returning zero, to four figures
+     *    (1.800 -> 1.620). On this side the same collision corrupts a PHASE.
+     * 2. THE 50 µs IS A DEADLINE, not a delay. The ramp decays with a ~5 ms
+     *    leakage constant, so a read that slips by 1 ms lands 20 % down it.
+     *    A task switch inside the settle was therefore a 20 % phase error with
+     *    no outward sign.
+     *
+     * Suspending the scheduler fixes both without a mutex and without the PPS
+     * path ever waiting on anything: no task can run here, so no task can touch
+     * the ADC or displace the deadline. INTERRUPTS STAY ENABLED - the PPS
+     * capture, the timers and SysTick are untouched - and the section is about
+     * 350 µs, which is 7 % of the leakage constant and 0.035 % of a second.
+     *
+     * ControlTask does the same around its own three conversions (about 60 µs),
+     * so the cheap side yields to the deadline instead of the other way round.
+     * A mutex was considered and rejected: the only correct timeout on this
+     * side is zero, and a zero-timeout take that fails leaves the choice
+     * between racing anyway and dropping a phase measurement. */
+    vTaskSuspendAll();
+
     /* Settle onto the ramp peak. Charging ends on the picPPS edge, at most
      * ~2 µs after the GPS-PPS edge that woke the caller; 50 µs clears the
      * widest pulse while sitting only ~1 % down the ~5 ms leakage decay. */
@@ -89,6 +148,9 @@ void ltic_read_fast(void)
         while (j > 0 && s[j-1] > x) { s[j] = s[j-1]; j--; }
         s[j] = x;
     }
+
+    xTaskResumeAll();
+
     int16_t med = s[LTIC_OVERSAMPLE / 2];
     g_ltic_adc_raw = med;
 
@@ -111,6 +173,11 @@ void ltic_read_fast(void)
     last_ok = accepted;
     g_ltic_adc_avg = accepted;
     g_ltic_voltage = ((float)accepted / 4096.0f) * 3.3f;
+    s_ltic_qerr_ns = ubx_timtp_correction_ns();   /* this pulse's, latched */
+    /* ...and tell the loop which pulse it belongs to, so it can use THIS number
+     * instead of re-deriving one that measured 3x noisier. See
+     * ubx_timtp_latch(). */
+    ubx_timtp_latch(gFreqSnap.ppscount);
 
 #ifdef GPSDO_LTIC_ACTIVE_RESET
     /* Active discharge for the current-source ramp detector. The classic RC
@@ -154,9 +221,18 @@ void vSensorTask(void *pvParameters)
 #ifdef GPSDO_LTIC
     /* Initialise PA1 as analog input and take the first reading */
     pinMode(PIN_LTIC_VPHASE, INPUT_ANALOG);
+    /* Same interlock as everywhere else that touches ADC1: this one's value is
+     * thrown away, but the conversion itself can still land in the middle of
+     * ControlTask's and corrupt THAT. */
+    vTaskSuspendAll();
     analogRead(PIN_LTIC_VPHASE);   /* dummy read to settle ADC mux */
+    xTaskResumeAll();
     ltic_read_fast();              /* no discharge; pin stays analog */
-    OUT_SERIAL.println("HW: LTIC phase input      OK  (PA1 analog)");
+    /* NOT "OK": nothing here can tell a fitted ramp detector from a floating
+     * pin. All this line may claim is that the firmware was built with the
+     * detector path compiled in and PA1 configured for it. Dave's board was
+     * built without the hardware and this line told him it was fine. */
+    OUT_SERIAL.println("HW: LTIC phase input      enabled (PA1) - needs the ramp detector hw");
 #endif
 
     s_sensors_probed = true;   /* signal vDisplayTask the flags are valid */
@@ -181,53 +257,166 @@ void vSensorTask(void *pvParameters)
 }
 
 /* ======================================================================
- * vUptimeTask — increments uptime counter at 1 Hz via 2Hz semaphore
+ * Uptime — counted from the PPS, formatted on demand
+ *
+ * See the block comment on Uptime_t in gpsdo_state.h for the measurement that
+ * motivated this and the reason the two writers need no lock.
  * ====================================================================== */
 extern SemaphoreHandle_t xTwoHzSemaphore;
 
+/* Seconds between MCU-clock checks. 1024 rather than 1000 so the ppm is a
+ * shift, and long enough that the 1 ms resolution of millis() contributes
+ * under 1 ppm to the result. */
+#define UP_CLKCHK_S   1024u
+
+/* Advance the clock one second on a VALIDATED PPS.
+ *
+ * Called from the frequency task at the point where ppscount is incremented,
+ * i.e. only for a pulse whose interval the OCXO measured as plausible. A
+ * spurious edge or a lost fix therefore does not move the clock; the holdover
+ * path below picks it up 1.5 s later instead. */
+/* When the clock last advanced, from EITHER path, in millis(). This is the
+ * whole of the shared state: ONE anchor, not one per source.
+ *
+ * The first version kept a separate holdover baseline that was reset whenever
+ * the PPS spoke, so a single missing pulse was simply dropped — the holdover
+ * path woke 1.5 s later, found no baseline, started a fresh one and credited
+ * nothing. Simulated at 2 % of pulses missing over an hour it lost 77 seconds,
+ * which is worse than the free-running counter it replaced. Anchoring both
+ * sources to the same instant fixes it by construction: the holdover path adds
+ * whole seconds measured FROM THE LAST ONE COUNTED, wherever it came from, so
+ * a gap in the pulses is made up rather than skipped, and the next pulse
+ * re-anchors the phase to GPS.
+ *
+ * The handover is also the one place a second can be counted TWICE: holdover
+ * credits a second, the first pulse back arrives 300 ms later and credits
+ * another, and one second of wall time has become two. A second is worth
+ * crediting at most once,
+ * so require 750 ms since the last one: no real pulse ever fails that, pulses
+ * being 1000 ms apart, and exactly the one pulse that lands inside a holdover
+ * second does. (500 ms was the first attempt and let the case through — the
+ * traced handover put the holdover tick at 10501 ms and the first pulse at
+ * 11001, exactly on the boundary.) */
+static uint32_t s_up_last_ms = 0;
+
+static inline void up_advance(uint32_t at_ms)
+{
+    gUpSecs++;
+    s_up_last_ms = at_ms ? at_ms : 1u;   /* 0 is the "never" sentinel */
+}
+
+void uptime_tick_pps(void)
+{
+    uint32_t now = millis();
+    if (s_up_last_ms == 0u || (uint32_t)(now - s_up_last_ms) >= 750u)
+        up_advance(now);
+    gUpPpsMs = now ? now : 1u;           /* 0 is reserved for "no PPS yet" */
+
+    /* MCU clock against GPS, as a by-product. millis() runs on the same clock
+     * as everything else the MCU times, and the PPS is the reference, so the
+     * difference over a known number of pulses IS the ppm error. Reported by
+     * the CLI; nothing in the loop uses it. */
+    static uint32_t chk_ms  = 0;
+    static uint32_t chk_cnt = 0;
+    if (chk_ms == 0u) { chk_ms = gUpPpsMs; chk_cnt = 0u; return; }
+    if (++chk_cnt >= UP_CLKCHK_S) {
+        uint32_t elapsed = gUpPpsMs - chk_ms;        /* MCU ms over 1024 GPS s */
+        int32_t  err     = (int32_t)elapsed - (int32_t)(UP_CLKCHK_S * 1000u);
+        gMcuPpm  = (err * 1000) / (int32_t)UP_CLKCHK_S;   /* err/1.024e6 * 1e6 */
+        chk_ms   = gUpPpsMs;
+        chk_cnt  = 0u;
+    }
+}
+
+/* Format the counter. Pure function of gUpSecs — no shared state, no lock, so
+ * the caller gets the value as it is at the moment it asks rather than as some
+ * other task last left it. That is what removes the beat: the report task
+ * calls this on the same PPS that advanced the counter. */
+void uptime_snapshot(Uptime_t *out)
+{
+    uint32_t t = gUpSecs;
+
+    uint32_t days  = t / 86400u; t -= days * 86400u;
+    uint8_t  hours = (uint8_t)(t / 3600u); t -= (uint32_t)hours * 3600u;
+    uint8_t  mins  = (uint8_t)(t / 60u);
+    uint8_t  secs  = (uint8_t)(t - (uint32_t)mins * 60u);
+
+    out->days  = (uint16_t)days;
+    out->hours = hours;
+    out->mins  = mins;
+    out->secs  = secs;
+
+    out->time_str[0] = '0' + hours / 10;
+    out->time_str[1] = '0' + hours % 10;
+    out->time_str[2] = ':';
+    out->time_str[3] = '0' + mins  / 10;
+    out->time_str[4] = '0' + mins  % 10;
+    out->time_str[5] = ':';
+    out->time_str[6] = '0' + secs  / 10;
+    out->time_str[7] = '0' + secs  % 10;
+    out->time_str[8] = '\0';
+
+    /* Three digits is 2.7 years; clamp rather than print a wrapped number that
+     * looks like a fresh boot. */
+    uint32_t d = (days > 999u) ? 999u : days;
+    out->days_str[0] = '0' + (char)(d / 100u);
+    out->days_str[1] = '0' + (char)((d % 100u) / 10u);
+    out->days_str[2] = '0' + (char)(d % 10u);
+    out->days_str[3] = 'd';
+    out->days_str[4] = '\0';
+}
+
+/* ======================================================================
+ * vUptimeTask — HOLDOVER ONLY. The PPS advances the clock whenever there is
+ * one; this task exists so that losing GPS stops the discipline, not the
+ * clock.
+ *
+ * The previous version counted here unconditionally, and dropped the second
+ * outright when the uptime mutex was busy — `continue` on a 5 ms timeout, with
+ * no record that a tick had been owed. Nothing here can silently lose a second
+ * any more: there is no mutex to miss, and the catch-up loop below settles a
+ * backlog rather than discarding it.
+ * ====================================================================== */
 void vUptimeTask(void *pvParameters)
 {
     (void)pvParameters;
-    bool half = false;
 
+    /* No half-second parity filter any more. The old one advanced the clock on
+     * every second tick and therefore depended on never missing one — and
+     * xTwoHzSemaphore is a BINARY semaphore, so a give that arrives before the
+     * previous take is simply dropped, which inverts the parity and shifts the
+     * whole clock by half a second. What is counted below is elapsed
+     * milliseconds, so a missed tick, a late tick or a doubled tick all come
+     * out the same. */
     for (;;)
     {
         xSemaphoreTake(xTwoHzSemaphore, portMAX_DELAY);
-        half = !half;
-        if (!half) continue;   /* advance only on 1Hz edge */
 
-        if (xSemaphoreTake(xUptimeMutex, pdMS_TO_TICKS(5)) != pdTRUE) continue;
+        /* Before the PPS test below, not after: this loop skips its body
+         * whenever the PPS has already counted the second, and the load
+         * measurement must not skip with it. */
+        cpu_second_tick();
 
-        Uptime_t *u = &gUptime;
-        if (++u->secs > 59) {
-            u->secs = 0;
-            if (++u->mins > 59) {
-                u->mins = 0;
-                if (++u->hours > 23) {
-                    u->hours = 0;
-                    u->days++;
-                }
-            }
+        uint32_t last = gUpPpsMs;
+        if (last != 0u && (millis() - last) < 1500u)
+            continue;                     /* the PPS has this second */
+
+        /* Holdover, or the first seconds of a cold boot. Count from the
+         * crystal and remember when, so a long stall — a blocked task, a
+         * flash erase — is made up rather than lost. */
+        uint32_t now = millis();
+        if (s_up_last_ms == 0u) {
+            /* Cold boot, before anything has been counted: there is no elapsed
+             * time to make up, so set the anchor and credit nothing. */
+            s_up_last_ms = now ? now : 1u;
+            continue;
         }
-
-        u->time_str[0] = '0' + u->hours / 10;
-        u->time_str[1] = '0' + u->hours % 10;
-        u->time_str[2] = ':';
-        u->time_str[3] = '0' + u->mins  / 10;
-        u->time_str[4] = '0' + u->mins  % 10;
-        u->time_str[5] = ':';
-        u->time_str[6] = '0' + u->secs  / 10;
-        u->time_str[7] = '0' + u->secs  % 10;
-        u->time_str[8] = '\0';
-
-        uint16_t d = u->days;
-        u->days_str[0] = '0' + (d / 100);
-        u->days_str[1] = '0' + ((d % 100) / 10);
-        u->days_str[2] = '0' + (d % 10);
-        u->days_str[3] = 'd';
-        u->days_str[4] = '\0';
-
-        xSemaphoreGive(xUptimeMutex);
+        /* Whole seconds since the last one counted, anchored to that instant so
+         * the remainder is carried rather than discarded. A missed tick, a late
+         * tick or a doubled tick all come out the same, and a task stalled for a
+         * minute makes the minute up. */
+        while ((int32_t)(now - s_up_last_ms) >= 1000)
+            up_advance(s_up_last_ms + 1000u);
     }
 }
 
@@ -294,50 +483,53 @@ static int s2(char *buf, int pos, uint8_t v)
     return pos;
 }
 
-/* Write a report only if it can go out WITHOUT BLOCKING.
+/* Write a report without ever blocking the caller for long.
  *
- * STM32duino's USBSerial::write() spins while the endpoint is busy for as long
- * as the host is connected. A host that has enumerated the CDC port but is not
- * draining it — a closed terminal, a Windows box that opened the port and
- * walked away, a `screen` session someone suspended — therefore stops the
- * calling task dead, inside the write, after the mutex is taken. The 30 ms
- * mutex timeout does not help: the block is on the far side of it.
+ * STM32duino's USBSerial::write() loops while the transmit queue is full for
+ * as long as the host is connected. A host that has enumerated the CDC port
+ * but is not draining it — a closed terminal, a Windows box that opened the
+ * port and walked away, a `screen` session someone suspended — therefore
+ * stops the calling task dead, inside the write, after the mutex is taken.
+ * The 30 ms mutex timeout does not help: the block is on the far side of it.
  *
  * The task that calls this is vDisplayTask, which also drives the OLED, the
  * LCD, the TM1637 and the TFT. So the visible symptom of "USB connected, host
  * not reading" is that the DISPLAY FREEZES, which reads as a crashed board and
- * is nothing of the kind — the frequency and control tasks never touch serial
- * and keep disciplining the oscillator throughout. Reported from the field by
- * Dave (Solder_Junkie) on EEVblog, whose board ran fine until a USB cable went
- * in. The blue LED keeps blinking through it, because PC13 is toggled in the
- * 2 Hz timer ISR and owes nothing to any task.
+ * is nothing of the kind. Reported from the field by Dave (Solder_Junkie) on
+ * EEVblog, whose board ran fine until a USB cable went in.
  *
- * Telemetry is a live stream, not a log: a report nobody is reading is worth
- * dropping, and the next one is a second away. So ask first, and skip the
- * whole line if it will not fit. */
+ * The first cut of this guard asked availableForWrite() once and dropped the
+ * WHOLE report when it returned less than the report size. That silenced the
+ * 1 Hz telemetry on USB CDC entirely: the CDC transmit queue is
+ * USB_FS_MAX_PACKET_SIZE * CDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER = 64 * 2
+ * = 128 bytes (stm32duino 2.12.0 defaults), the human report is 400+ — so room
+ * was always 128 and always less than n, and no report ever went out. On a
+ * UART with the 512-byte TX buffer of build_opt.h it happened to fit, which
+ * is why the failure looked configuration-dependent.
+ *
+ * So write in CHUNKS no larger than what the port says it can take now, and
+ * give up on the remainder after REPORT_WRITE_BUDGET_MS. A draining host
+ * empties the 128-byte queue in well under a millisecond of polling, so the
+ * whole report goes out in a few iterations; a host that is not reading
+ * stalls the first chunk and the tail is dropped — which is the intended
+ * behaviour, because telemetry is a live stream, not a log, and the next
+ * report is a second away. HardwareSerial::write() blocks rather than drops
+ * when its buffer fills, but a room-sized chunk never asks it to. */
+#define REPORT_WRITE_BUDGET_MS 25u
 static bool report_write(const uint8_t *buf, int n)
 {
     if (n <= 0) return true;
-    /* Write in CHUNKS no larger than what the port can take now, with a time
-     * budget. Asking once and dropping the WHOLE report when it did not fit
-     * silenced the 1 Hz telemetry on USB CDC entirely: the CDC transmit queue
-     * is USB_FS_MAX_PACKET_SIZE * CDC_TRANSMIT_QUEUE_BUFFER_PACKET_NUMBER
-     * = 64 * 2 = 128 bytes (stm32duino 2.12.0 defaults) and the report is
-     * 400+, so room was always less than n. A draining host empties the queue
-     * in under a millisecond of polling, so the whole report still goes out;
-     * a host that is not reading stalls the first chunk and the tail is
-     * dropped after the budget — the intended behaviour.
-     *
-     * room == 0 is ambiguous: a FULL CDC queue reports 0, and so would a port
-     * that cannot answer. Never blind-write the rest on 0: on a full CDC
-     * queue USBSerial::write() loops for as long as the host stays connected,
-     * which is the freeze this wrapper exists to prevent. Yield and let the
-     * budget decide. */
-#define REPORT_WRITE_BUDGET_MS 25u
     uint32_t t0 = millis();
     int off = 0;
     while (off < n) {
         int room = REPORT_SERIAL.availableForWrite();
+        /* room == 0 is ambiguous: a FULL CDC queue reports 0, and so would a
+         * port that cannot answer. Every port this firmware ships —
+         * HardwareSerial, USBSerial, TeeSerial — answers properly, so treat
+         * 0 as "full right now", yield, and let the budget decide. Never
+         * blind-write the rest: on a full CDC queue USBSerial::write() loops
+         * for as long as the host stays connected, which is the freeze this
+         * wrapper exists to prevent. */
         if (room > 0) {
             int chunk = (room < (n - off)) ? room : (n - off);
             REPORT_SERIAL.write((uint8_t *)buf + off, (size_t)chunk);
@@ -461,10 +653,10 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
             "primitive", "forced-drift", "random-walk", "FLL-PID-man",
             "PLL-PI-man", "PLL-PID-man", "FLL-PID-gen", "PLL-PID-gen",
             "hybrid-FLL-PLL", "NN-MLP", "LTIC-3stage", "LTIC-Lars",
-            "multi-level" };
+            "multi-level", "kalman" };
         p=sa(buf,p,"\r\nLearn: algo="); p=si(buf,p,c->active_algo);
         p=sa(buf,p," (");
-        p=sa(buf,p,(c->active_algo <= 12) ? algo_name[c->active_algo] : "?");
+        p=sa(buf,p,(c->active_algo <= 13) ? algo_name[c->active_algo] : "?");
         p=sa(buf,p,")");
 
         if (c->active_algo == 11) {
@@ -500,6 +692,26 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
             p=sa(buf,p," sig="); p=si(buf,p,(int)m.sigma_ns); p=sa(buf,p,"ns");
             p=sa(buf,p," zc="); p=si(buf,p,(int)m.zero_cross);
             p=sa(buf,p," secs="); p=si(buf,p,(int)m.seconds);
+        } else if (c->active_algo == 13) {
+            /* Algo 13 (Kalman). What matters is the ESTIMATE, not this second's
+             * reading: the phase and frequency the filter believes, how well it
+             * believes the phase (sigma), and whether it is being fed at all.
+             * static for the same stack reason as the algo-12 block above. */
+            static kf_stats_t k;
+            kf_get_stats(&k);
+            p=sa(buf,p," ph="); p=sd(buf,p,(double)k.phase_ns,1); p=sa(buf,p,"ns");
+            p=sa(buf,p," f="); p=sd(buf,p,(double)k.freq_ns_s * 1000.0,2);
+            p=sa(buf,p,"ps/s sig="); p=sd(buf,p,(double)k.sigma_ns,2);
+            p=sa(buf,p,"ns R="); p=sd(buf,p,(double)k.r_ns,2);
+            p=sa(buf,p," rej="); p=si(buf,p,(int)k.rejects);
+            /* The rate, not just the total: a gate quietly discarding a ninth
+             * of the readings is the kind of thing a cumulative counter hides
+             * for twelve hours. Only shown once it is worth looking at. */
+            if (k.rej_pct >= 0.5f) { p=sa(buf,p,"("); p=sd(buf,p,(double)k.rej_pct,1); p=sa(buf,p,"%)"); }
+            if (k.r_pinned) p=sa(buf,p," Rpin");
+            if (k.arms) { p=sa(buf,p," arm="); p=si(buf,p,(int)k.arms); }
+            if (k.holdover_s) { p=sa(buf,p," HOLD="); p=si(buf,p,(int)k.holdover_s);
+                                p=sa(buf,p,"s"); }
         } else if (c->active_algo == 10) {
             /* Algo 10 (LTIC three-stage) is a state machine, not an LRN loop. */
             static const char *ltic_st[] = { "ACQ", "DPLL", "LOCK" };
@@ -553,12 +765,39 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
          * showed a corrected one, so the same instant read differently on the
          * two — the whole sawtooth apart (~±10 ns on a LEA-6T, more on an M8T).
          * The comment above already claimed this convention; now the code keeps
-         * it. Display paths use the unpaired ubx_timtp_correction_ns(): the
-         * pairing refinement matters to the loop, not to a human-read figure. */
-        ph_ns -= (double)ubx_timtp_correction_ns();
+         * it. Display paths use the value LATCHED at the pulse — see
+         * s_ltic_qerr_ns — not the live global, which by drawing time may
+         * already describe the next pulse. */
+        ph_ns -= (double)s_ltic_qerr_ns;
         p=sa(buf,p," dph:"); p=sd(buf,p,ph_ns,1); p=sa(buf,p,"ns");
     }
 #endif
+    /* CPU load, appended LAST on purpose: every reader of this line — the
+     * tuner, the log scrapers — searches for its field rather than anchoring at
+     * the end, but adding a field in the middle is still the kind of change
+     * that silently breaks somebody's regex. The end is free. */
+    /* cpu_load_tick() used to be called here, which meant TAB (pause telemetry)
+     * also paused the load measurement. It is driven from vUptimeTask now. */
+    {
+        uint8_t ld = cpu_load_pct();
+        if (ld <= 100u) { p=sa(buf,p,"  CPU:"); p=si(buf,p,(int)ld); p=sa(buf,p,"%"); }
+    }
+    /* Per-task breakdown, only when TL 1 asked for it. Appended to the sensor
+     * line rather than given one of its own so a capture keeps one row per
+     * second and the tuner's parser does not have to learn a new line. */
+    if (g_cpu_task_line) {
+        /* static for the same stack reason as the algo-12 and algo-13 blocks
+         * above: the sensor task has 384 words and this is 96 bytes. */
+        static cpu_task_t ct[CPU_TASKS_MAX];
+        uint8_t n = cpu_tasks_get(ct, CPU_TASKS_MAX);
+        if (n) {
+            p=sa(buf,p,"  TL:");
+            for (uint8_t i = 0; i < n; i++) {
+                p=sa(buf,p," "); p=sa(buf,p,ct[i].name); p=sa(buf,p,"=");
+                p=sd(buf,p,(double)ct[i].pct100 / 100.0, 2); p=sa(buf,p,"%");
+            }
+        }
+    }
     buf[p++]='\r'; buf[p++]='\n';
     buf[p++]='\r'; buf[p++]='\n';
 
@@ -884,6 +1123,13 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #else
   #define TFT_YOFF        0
 #endif
+  /* The LMT field's padding erase. TFT_eSPI fills a rectangle THIS WIDE ending
+   * at the right-anchored text, so the header band from
+   * (TFT_W - TFT_S(6) - HDR_LMT_PAD) rightwards belongs to the clock and
+   * anything drawn there is wiped. Named once because the CPU field has to
+   * stay clear of it, and two copies of the same constant in two files' worth
+   * of geometry is how a one-pixel margin becomes a bug report. */
+  #define HDR_LMT_PAD     TFT_S(130)
   #define TFT_ROW_H       TFT_SY(20)     /* GF_DATA row pitch — wider spacing (authored 320x240) */
   #define TFT_GRID_Y      (TFT_SY(64) + TFT_YOFF)   /* first grid row top   */
   #define TFT_COL_L       TFT_S(8)       /* left column x         */
@@ -1438,6 +1684,66 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       vTaskDelay(pdMS_TO_TICKS(1800));       /* final hold before operating screen */
   }
 
+  /* Where the CPU reading goes in the header, and whether it fits at all.
+   *
+   * IT BELONGS ON THE CENTRE LINE OF THE BAR. That is where the eye looks for
+   * it with a name on the left and a clock on the right, and two earlier
+   * versions of this got it wrong in opposite directions.
+   *
+   * The first drew it at TFT_W/2 with no arithmetic and lost the '%' on the 480
+   * panel: the LMT field is right-anchored with a padding of HDR_LMT_PAD, and
+   * TFT_eSPI's padding erase is a rectangle of that width ending at the anchor,
+   * 276..471 there. "CPU 66%" in FreeSans9pt is about 79 px, so centred at 240
+   * its right edge lands near 279 — three pixels inside that band — and the
+   * clock, drawn afterwards, wiped the last glyph.
+   *
+   * The second measured the gap and centred in it. Nothing clipped, and the
+   * whole string sat visibly left of centre, because HDR_LMT_PAD reserves far
+   * more room than the clock's glyphs actually use.
+   *
+   * THE PADDING IS NOT THE OBSTACLE. THE CLOCK'S TEXT IS. Both draw paths put
+   * CPU down last, so nothing can erase it afterwards; the only thing it must
+   * not touch is the clock's glyphs, and their left edge is the anchor less the
+   * measured width of the string being shown. Between the name and that edge
+   * there is room for the centre line on both panels, so that is where it goes,
+   * with the gap centre kept only as the fallback for a header that really is
+   * too crowded — a long clock format, a wider face, a narrower panel.
+   *
+   * The erase band is sized to the FIELD, not to the gap: "CPU 100%" is the
+   * widest this ever gets, and a shorter reading centred on the same x sits
+   * wholly inside it. Sizing it to the gap, as the second version did, is what
+   * forced the text off-centre to keep the erase away from its neighbours.
+   *
+   * Every width is asked of the font rather than assumed — the two panels do
+   * not even use the same face (classic font 2 against GFXFF). If the slot
+   * cannot hold the string, draw nothing: a clipped number is worse than none.
+   *
+   * TFT_eSprite derives from TFT_eSPI, so one helper serves the sprite path and
+   * the direct-draw fallback, and both measure with the font they have set. */
+  static bool hdr_cpu_slot(TFT_eSPI &o, const char *cs, const char *clk,
+                           int *cx, int *pad)
+  {
+      char hdr[24];
+      snprintf(hdr, sizeof(hdr), "%s %s", PROGRAM_NAME, PROGRAM_VERSION);
+      int left  = TFT_S(6) + o.textWidth(hdr);      /* right edge of the name   */
+      int right = TFT_W - TFT_S(6) - o.textWidth(clk);  /* left edge of the CLOCK'S GLYPHS */
+      /* The widest reading this field can ever show, so the erase covers the
+       * previous value whatever it was and never has to grow to the gap. */
+      int w = o.textWidth("CPU 100%");
+      { int wn = o.textWidth(cs); if (wn > w) w = wn; }
+      int p  = w + TFT_S(6);
+      int c  = TFT_W / 2;
+      if (c - p / 2 < left + TFT_S(4) || c + p / 2 > right - TFT_S(4)) {
+          /* The centre line will not hold it on this panel with this clock.
+           * Fall back to the middle of what is actually free. */
+          if (right - left < p + TFT_S(8)) return false;
+          c = (left + right) / 2;
+      }
+      *cx  = c;
+      *pad = p;
+      return true;
+  }
+
   /* Per-second update — called from vDisplayTask main loop */
   static void tft_update(const GpsData_t *g, const FreqSnap_t *f,
                          const CtrlData_t *c, const Uptime_t *u,
@@ -1477,19 +1783,38 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
               s_hdr_sprite.setTextPadding(0);
               s_hdr_sprite.drawString(hdr, TFT_S(6), TFT_SY(3) + TFT_YOFF);
           }
-          /* LMT right-anchored. Drawn BEFORE the notice on purpose: with a
+          /* LMT right-anchored. Drawn BEFORE the CPU field on purpose: with a
            * padding of TFT_S(130) TFT_eSPI erases a band running from
-           * (anchor - padding) rightwards to the start of the text — 276..361
-           * on the 480 panel — and the notice sits immediately to its left.
-           * The two are ~1 px apart by calculation, which is far too thin a
-           * margin to rely on: the glyph widths are estimates, and if they are
-           * off by a few percent the padding eats the notice's last letter.
-           * Drawing the notice last removes the question rather than answering
-           * it. It carries no padding of its own, so it cannot return the
-           * favour and erase the clock. */
+           * (anchor - padding) rightwards to the anchor — 276..471 on the 480
+           * panel — which reaches well past the clock's own glyphs and into the
+           * space the CPU reading sits in. Whether it reaches far enough to eat
+           * a glyph depends on font metrics nobody should have to predict, so
+           * the order answers it instead: CPU goes down last and carries no
+           * padding of its own here (the whole band is rebuilt in RAM each
+           * second), so neither field can erase the other. */
           s_hdr_sprite.setTextDatum(TR_DATUM);
-          s_hdr_sprite.setTextPadding(TFT_S(130));
+          s_hdr_sprite.setTextPadding(HDR_LMT_PAD);
           s_hdr_sprite.drawString(s, TFT_W - TFT_S(6), TFT_SY(3) + TFT_YOFF);
+
+          /* CPU last, on the centre line of the bar — see hdr_cpu_slot(). The
+           * whole band is rebuilt in RAM each second, so this needs no padding
+           * of its own; drawing it after the clock also means the clock's erase
+           * can never reach it, whatever the two widths turn out to be.
+           * 255 = not measured yet (the first second after boot): draw nothing
+           * rather than a lie. */
+          {
+              uint8_t ld = cpu_load_pct();
+              if (ld <= 100u) {
+                  char cs[12];
+                  int cx, pad;
+                  snprintf(cs, sizeof(cs), "CPU %u%%", (unsigned)ld);
+                  if (hdr_cpu_slot(s_hdr_sprite, cs, s, &cx, &pad)) {
+                      s_hdr_sprite.setTextDatum(TC_DATUM);
+                      s_hdr_sprite.setTextPadding(0);
+                      s_hdr_sprite.drawString(cs, cx, TFT_SY(3) + TFT_YOFF);
+                  }
+              }
+          }
 
           s_hdr_sprite.pushSprite(0, 0);
       } else {
@@ -1497,8 +1822,24 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           TFT_FONT_HEAD(s_tft);
           s_tft.setTextColor(TFT_WHITE, TFT_COL_HEADER);
           s_tft.setTextDatum(TR_DATUM);
-          s_tft.setTextPadding(TFT_S(130));
+          s_tft.setTextPadding(HDR_LMT_PAD);
           s_tft.drawString(s, TFT_W - TFT_S(6), TFT_SY(3) + TFT_YOFF);
+          /* CPU on the centre line, with a padding sized to the widest reading
+           * the field can show so it erases its own previous value — 100% is
+           * wider than 66% — and stops well short of the name and the clock. */
+          {
+              uint8_t ld = cpu_load_pct();
+              if (ld <= 100u) {
+                  char cs[12];
+                  int cx, pad;
+                  snprintf(cs, sizeof(cs), "CPU %u%%", (unsigned)ld);
+                  if (hdr_cpu_slot(s_tft, cs, s, &cx, &pad)) {
+                      s_tft.setTextDatum(TC_DATUM);
+                      s_tft.setTextPadding(pad);
+                      s_tft.drawString(cs, cx, TFT_SY(3) + TFT_YOFF);
+                  }
+              }
+          }
       }
       s_tft.setTextDatum(TL_DATUM);
 
@@ -2210,9 +2551,50 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                *
                * Pairing is sound: UBX-TIM-TP describes the NEXT pulse, so it
                * arrives after pulse N-1 carrying qErr(N), and g_ltic_voltage is
-               * sampled on pulse N's own ramp peak. Same pulse, same qErr. */
-              ns -= (double)ubx_timtp_correction_ns();
+               * sampled on pulse N's own ramp peak. Same pulse, same qErr —
+               * PROVIDED the qErr is the one latched at that pulse rather than
+               * the live global, which the burst carrying TIM-TP(N+1) has
+               * usually already overwritten by the time this row is drawn.
+               * See s_ltic_qerr_ns. */
+              ns -= (double)s_ltic_qerr_ns;
           }
+
+          /* The formatted phase, for BOTH panels.
+           *
+           * It used to be declared inside the 480 branch and used in the 320
+           * one, so the small-panel build did not compile at all — 'phs' was
+           * not declared in that scope. Nothing caught it because until the
+           * TFT_eSPI stub went into tools/hostcheck NOTHING compiled a line of
+           * the display code: every panel switch was off there for want of the
+           * vendor library. A build nobody can build is not a configuration,
+           * it is a rumour.
+           *
+           * The decimal appears only below 100 ns: the 320 cuts a 55 px pad for
+           * this field and its own comment warns that a five-digit reading
+           * would overrun the label, and "+1234.5ns" is two characters past
+           * that. Below 100 the widest form "-99.9ns" is exactly the seven
+           * characters the field was measured for, and in the locked regime —
+           * the only place a tenth of a nanosecond is worth reading — the
+           * decimal is always there.
+           *
+           * dtostrf, not "%.1f": this file uses no float conversions in
+           * snprintf anywhere, deliberately, because they need Float printf
+           * enabled in the IDE and print "?" when it is not. dtostrf is
+           * Arduino-native and always safe. It emits no leading "+", so the
+           * sign is prepended to keep the field's width constant either way. */
+          char phs[14], phb[12];
+          if (cal) {
+              if (ns > -100.0 && ns < 100.0) {
+                  dtostrf(ns, -1, 1, phb);
+                  snprintf(phs, sizeof(phs), "%s%sns", (ns >= 0.0) ? "+" : "", phb);
+              } else {
+                  snprintf(phs, sizeof(phs), "%+ldns",
+                           (long)(ns < 0.0 ? ns - 0.5 : ns + 0.5));
+              }
+          } else {
+              phs[0] = '\0';
+          }
+
 #if defined(GPSDO_TFT_ILI9488)
           /* FIRST sensor row, RIGHT column — swapped with enclosure humidity so the
            * environmental sensors share the left column and the electrical
@@ -2241,6 +2623,29 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            * and a shrinking string leaves its tail behind otherwise. The label's
            * pad equals its own widest form, which is exactly what erases "dph:"
            * when the reading falls back to bare volts. */
+          /* ONE DECIMAL WHILE IT FITS, WHOLE NANOSECONDS ABOVE THAT.
+           *
+           * The serial report has always printed dph to one decimal and the
+           * panel printed it whole, which was invisible while the readings were
+           * hundreds of nanoseconds and glaring once the loop settled to single
+           * digits: the log said -5.2 and the panel said -5.
+           *
+           * The decimal cannot simply be added, because both phase fields are
+           * sized to the string "+0000ns" — the 480 measures align_R from it,
+           * the 320 cuts a 55 px pad for it and its own comment warns that a
+           * five-digit reading would overrun the label. "+1234.5ns" is two
+           * characters past that. So the decimal appears only below 100 ns,
+           * where the widest form "-99.9ns" is exactly the seven characters the
+           * field was measured for, and above it the format falls back to the
+           * whole numbers the pad was cut for. In the locked regime — which is
+           * where a tenth of a nanosecond is worth reading at all — the decimal
+           * is always there.
+           *
+           * dtostrf, not "%.1f": this file uses no float conversions in
+           * snprintf anywhere, deliberately, because they need Float printf
+           * enabled in the IDE and print "?" when it is not. dtostrf is
+           * Arduino-native and always safe. It emits no leading "+", so the
+           * sign is prepended to keep the field's width constant either way. */
           static int16_t ph_lab_w = 0;
           if (ph_lab_w == 0) ph_lab_w = tft_text_w("Vph: 0.000 V dph:");
           const int16_t ns_pad = (int16_t)(align_R - TFT_COL_R - ph_lab_w);
@@ -2251,7 +2656,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            * STRING changes, and out of band the value is pinned — so a colour
            * would never get applied in exactly the case it was meant for. The
            * raw Vph sits beside it and says which end it ran out of. */
-          if (cal && in_band) snprintf(s, sizeof(s), "%+ldns", (long)ns);
+          if (cal && in_band) snprintf(s, sizeof(s), "%s", phs);
           else if (cal)       snprintf(s, sizeof(s), "ovf");
           else                s[0] = '\0';
           tft_val_r(21, align_R, TFT_SENS_Y,
@@ -2303,8 +2708,10 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           tft_val(13, TFT_COL_R, TFT_SENS_Y, TFT_S(73), TFT_COL_VALUE, s);
           tft_val(22, TFT_COL_R + TFT_S(73), TFT_SENS_Y,
                   TFT_S(18), TFT_COL_VALUE, cal ? "dp:" : "");
-          if (cal) snprintf(s, sizeof(s), "%+4ldns", (long)ns);
-          else     s[0] = '\0';
+          /* No width specifier any more: the field is right-anchored, so the
+           * digits end in the same place whether or not the string is padded,
+           * and a fixed width would fight the variable-length decimal form. */
+          snprintf(s, sizeof(s), "%s", phs);
           tft_val_r(21, TFT_COL_R + TFT_S(146), TFT_SENS_Y,
                     TFT_S(55), TFT_COL_VALUE, s);
 #endif
@@ -2811,7 +3218,7 @@ void vDisplayTask(void *pvParameters)
          *   line0:  ====================
          *   line1:       GPSDO  vX.XX
          *   line2:  GPS Disciplined OCXO
-         *   line3:  jmnlabs  +  Claude
+         *   line3:  jmnlabs  +  AI x3
          * lcd_set_line uses I2C → guard with the Wire mutex.            */
         if (xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             char l[21];
@@ -2975,13 +3382,11 @@ void vDisplayTask(void *pvParameters)
 
         memset(&snap_f, 0, sizeof(snap_f));
         memset(&snap_g, 0, sizeof(snap_g));
-        strcpy(snap_u.time_str, "00:00:00");
-        strcpy(snap_u.days_str, "000d");
 
         if (xSemaphoreTake(xFreqMutex,   pdMS_TO_TICKS(5)) == pdTRUE) { snap_f = gFreqSnap; xSemaphoreGive(xFreqMutex); }
         if (xSemaphoreTake(xGpsMutex,    pdMS_TO_TICKS(5)) == pdTRUE) { snap_g = gGps;      xSemaphoreGive(xGpsMutex); }
         if (xSemaphoreTake(xCtrlMutex,   pdMS_TO_TICKS(5)) == pdTRUE) { snap_c = gCtrl;     xSemaphoreGive(xCtrlMutex); }
-        if (xSemaphoreTake(xUptimeMutex, pdMS_TO_TICKS(5)) == pdTRUE) { snap_u = gUptime;   xSemaphoreGive(xUptimeMutex); }
+        uptime_snapshot(&snap_u);   /* pure function of the counter; no lock */
 
         /* ---- Yellow LED state machine ----
          *

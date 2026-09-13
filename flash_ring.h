@@ -1,7 +1,7 @@
 /* ======================================================================
  * flash_ring.h  —  wear-levelled ring buffer for live + settings data
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * Purpose
  * -------
@@ -44,6 +44,11 @@
 /* Record type IDs — see flash_ring_core.h for the canonical definition. */
 #define REC_LIVE      0u
 #define REC_SETTINGS  1u
+/* Algorithm 13 (Kalman) parameters. Its own record rather than a field in the
+ * settings block: that block has no padding left, and growing it would force a
+ * SETTINGS_VER bump that throws away everyone's PID, LC and timezone for three
+ * numbers. A new type costs nothing and an older build simply never reads it. */
+#define REC_A13       2u
 
 /* Initialise: validate header, scan slots. Call once at boot before the
  * scheduler starts. Returns true if at least one valid slot exists. */

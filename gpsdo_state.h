@@ -1,7 +1,7 @@
 /**
  * gpsdo_state.h — Shared application state and FreeRTOS handles
  *
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -16,7 +16,6 @@
  *   gFreq / gFreqSnap  -> xFreqMutex
  *   gGps               -> xGpsMutex
  *   gCtrl              -> xCtrlMutex
- *   gUptime            -> xUptimeMutex
  */
 #pragma once
 #include "gpsdo_config.h"
@@ -131,13 +130,63 @@ typedef struct {
     uint8_t  active_algo;
 } CtrlData_t;
 
-/* ---- Uptime ------------------------------------------------------------ */
+/* ---- Uptime ------------------------------------------------------------
+ *
+ * COUNTED FROM THE PPS, not from an MCU timer. This is a GPS-disciplined
+ * clock; counting its own uptime off a free-running oscillator was the one
+ * place the box ignored the reference it exists to follow.
+ *
+ * Measured over thirteen captures on two boards, 1 to 21 hours each: the
+ * printed uptime gained on the printed UTC by +129 to +169 ppm, best estimate
+ * +159 ppm from the three longest records (+12 s in 20.8 h, +13 s in 22.9 h,
+ * +7 s in 11.9 h). Both boards agree, so it is not a crystal tolerance; the
+ * 2 Hz tick that drove the counter simply is not 2 Hz.
+ *
+ * That rate error also produced the ±1 s jitter, which is the part a reader
+ * notices first. The report is printed on the PPS and the counter advanced on
+ * TIM9, so the two edges slid across each other once every ~6530 s (= 1/159
+ * ppm) and each crossing threw a short burst of repeated and skipped seconds
+ * before settling. The bursts in the 19.08 record start at 325, 6854, 13383
+ * and 19907 s — spacing 6529, 6529, 6524.
+ *
+ * So: one monotonic seconds counter, advanced by whoever is qualified.
+ *   - uptime_tick_pps() from the validated PPS, the authority whenever GPS is
+ *     present, and the SAME event that triggers the report - so the value
+ *     printed cannot be a beat between two clocks, by construction.
+ *   - vUptimeTask from the 2 Hz tick, but ONLY after the PPS has been silent
+ *     for over 1.5 s. Holdover still counts; it just counts on the crystal,
+ *     which is the best available then and is now the exceptional case rather
+ *     than the normal one.
+ * The 1.5 s guard band is what keeps the two writers from ever incrementing
+ * concurrently, which is why a plain 32-bit counter needs no mutex here: a
+ * word write is atomic on this core, and the two paths are mutually exclusive
+ * in time rather than by locking.
+ *
+ * Uptime_t is now a FORMATTING result, filled on demand by uptime_snapshot()
+ * from the counter, not a piece of shared state with a lock of its own.
+ */
 typedef struct {
     uint16_t days;
     uint8_t  hours, mins, secs;
     char     time_str[9];   /* "hh:mm:ss\0" */
     char     days_str[5];   /* "000d\0"      */
 } Uptime_t;
+
+/* Monotonic uptime, seconds. Read it through uptime_snapshot(); the raw
+ * counter is exposed only because the CLI reports it. */
+extern volatile uint32_t gUpSecs;
+
+/* millis() at the last PPS-driven tick; 0 until the first one arrives. */
+extern volatile uint32_t gUpPpsMs;
+
+/* MCU clock error against GPS, ppm, measured by uptime_tick_pps over 1024 s
+ * windows. INT32_MIN until the first window closes. This is the number that
+ * explains the paragraph above, measured by the board rather than inferred
+ * from its logs afterwards. */
+extern volatile int32_t  gMcuPpm;
+
+void uptime_tick_pps(void);              /* called from the validated PPS path */
+void uptime_snapshot(Uptime_t *out);     /* format the counter, no locking     */
 
 /* ---- EventGroup bits --------------------------------------------------- */
 #define EVT_NEED_CALIBRATION  (1u << 0)
@@ -152,7 +201,6 @@ typedef struct {
 extern SemaphoreHandle_t xFreqMutex;
 extern SemaphoreHandle_t xGpsMutex;
 extern SemaphoreHandle_t xCtrlMutex;
-extern SemaphoreHandle_t xUptimeMutex;
 /* xSerialMutex: guards REPORT_SERIAL / CLI_SERIAL (same UART).
  * Only used by DisplayTask(pri=1) and CliTask(pri=3).
  * GPS task (pri=4) never writes to REPORT_SERIAL in normal operation
@@ -179,7 +227,6 @@ extern FreqData_t  gFreq;
 extern FreqSnap_t  gFreqSnap;   /* display-safe copy, updated each PPS */
 extern GpsData_t   gGps;
 extern CtrlData_t  gCtrl;
-extern Uptime_t    gUptime;
 
 /* ---- Sensor data (written by SensorTask, read by DisplayTask) ---------- */
 extern uint16_t g_freq_damp_win_dpll; /* FAD: 10/100/1000 (default 100) */

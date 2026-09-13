@@ -1,5 +1,9 @@
 # GPSDO Tuner
 
+[English](README_TUNER_EN.md) | **Polski** | [Español](README_TUNER_ES.md)
+
+📖 [Strona projektu](../README.md) · [README](README_PL.md) · Instrukcja: [MD](MANUAL_PL.md) · [PDF](MANUAL_PL.pdf)
+
 Konsola na PC do strojenia pętli na żywo i obserwowania, co robi: trzy
 przewijające się wykresy, po jednej zakładce na grupę parametrów oraz pole
 komend ręcznych na wszystko, czego zakładki nie obejmują.
@@ -39,7 +43,20 @@ dostępne, gdyby trzeba było odczytać komunikat błędu.
 Tuner ma `TOOL_VERSION` śledzące wydanie firmware, dla którego powstał. Przy
 połączeniu odczytuje wersję z płytki i porównuje:
 
-- **zgodność** — pasek stanu pokazuje `connected — firmware vX.YZ`
+- **zgodność** — pasek stanu pokazuje całą tożsamość płytki, na ile ją podała:
+
+  ```
+  connected — firmware v1.06-rtos  build 27  2026-09-02 09:46  CRC 78B08D26
+  ```
+
+  Te trzy fakty odpowiadają na różne pytania. **Wersja** mówi, jakim protokołem
+  tuner rozmawia. **Build** i czas kompilacji mówią, z którego drzewa źródeł to
+  pochodzi. **CRC** mówi, który binarny obraz naprawdę działa, i jako jedyne nie
+  może być nieaktualne — płytka liczy je z własnego flasha przy starcie, więc
+  pozostaje uczciwe nawet wtedy, gdy builder Arduino użyje ponownie starego
+  pliku obiektowego, a znacznik czasu tego nie odnotuje. Wszystko poza wersją
+  jest opcjonalne: starszy firmware odpowiada na `V` samą nazwą i linia po
+  prostu mówi mniej.
 - **niezgodność** — pasek stanu i monitor surowy mówią o tym wprost
 
 Niezgodność nie jest błędem krytycznym i tuner nadal rozmawia z płytką, ale
@@ -72,11 +89,11 @@ wypełnione, a nie puste.
 Trzy okna, odświeżane raz na sekundę. To, co pokazują dwa górne, zależy od tego,
 jaki algorytm zgłasza płytka:
 
-| | Algorytmy 10 / 11 (LTIC) | Algorytm 12 | Algorytmy 0-9 |
-|---|---|---|---|
-| Górne | Faza `dph` (ns) | Błąd fazy `ph` (ns) | Wyuczony dryf (LSB) |
-| Środkowe | `Vphase` detektora (V), z liniami pasma | Napięcie sterujące `Vctl` (V) | Napięcie sterujące `Vctl` (V) |
-| Dolne | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) |
+| | Algorytmy 10 / 11 (LTIC) | Algorytm 12 | Algorytm 13 | Algorytmy 0-9 |
+|---|---|---|---|---|
+| Górne | Faza `dph` (ns) | Błąd fazy `ph` (ns) | **Estymata** fazy `ph` (ns) | Wyuczony dryf (LSB) |
+| Środkowe | `Vphase` detektora (V), z liniami pasma | Napięcie sterujące `Vctl` (V) | `Vphase` detektora (V), z liniami pasma | Napięcie sterujące `Vctl` (V) |
+| Dolne | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) | Błąd częstotliwości (Hz) |
 
 Tylko pętle LTIC mają detektor fazy, więc przy każdym innym algorytmie te dwa
 okna stałyby puste przez całą sesję. Zamiast tego są przekierowane na inne
@@ -87,6 +104,12 @@ samouczącego się sprzężenia w przód, więc wykres dryfu byłby płaski, a j
 idzie prosto z detektora, a nie przez filtr pętli — to nie jest ta sama wielkość,
 którą rysuje `dph`. Linie pasma detektora znikają zawsze wtedy, gdy środkowe
 okno pokazuje zamiast niego napięcie sterujące.
+
+Algorytm 13 rysuje to, w co filtr Kalmana WIERZY, że jest fazą, a nie odczyt z
+tej sekundy — ta estymata jest właśnie sensem posiadania filtru — a pod nią
+`Vphase`, bo pytanie, które ta pętla stawia najczęściej, brzmi: czy detektor w
+ogóle żyje. Na początku wpadał do pary 0-9, więc górne okno nosiło podpis
+„Wyuczony dryf" nad serią, której algorytm 13 nigdy nie wysyła.
 
 ### Span i Follow
 
@@ -109,18 +132,90 @@ później na wykres.
 
 ## Ograniczenia
 
-**Historia sięga 30 godzin.** Tuner trzyma 108 000 próbek przy telemetrii 1 Hz.
-To pokrywa pełną dobową akwizycję z zapasem, ale wszystko starsze jest
-odrzucane w miarę napływu nowych danych i nie da się tego odzyskać. Nic nie jest
-zapisywane na dysk.
+**Historia sięga tygodnia.** Tuner trzyma 604 800 próbek przy telemetrii 1 Hz.
+Wszystko starsze jest odrzucane w miarę napływu nowych danych i nie da się tego
+odzyskać; nic z wykresów nie trafia na dysk. Bufory to tablice liczb
+podwójnej precyzji, a nie listy pythonowych floatów, więc pełny tydzień
+wszystkich serii kosztuje około 82 MB RAM zamiast 406 — i nic nie jest
+alokowane z góry, więc pięciominutowa sesja nadal kosztuje kilobajty.
 
 **Wykresy nie są rejestratorem.** Dane wykresów żyją wyłącznie w pamięci i
 znikają po zamknięciu okna. Do wszystkiego, co chcesz zachować, użyj **Start
-logging** (zakładka Raw monitor): zapisuje każdą odebraną linię do pliku
-`gpsdo_RRRR-MM-DD_GG-MM-SS.log` obok skryptu, z buforowaniem liniowym, więc
-przebieg zakończony awarią i tak zostawia użyteczne dane. Uwaga: zapisywany jest
-*surowy tekst telemetrii*, nie serie z wykresów — do ADEV i długich porównań ze
-wzorcem podaj ten plik do TimeLab lub podobnego.
+logging** (zakładka Raw monitor) — patrz niżej.
+
+### Co zapisuje logowanie
+
+Lista rozwijana obok **Start logging** wybiera format i jest zamrożona na czas
+życia pliku:
+
+| Ustawienie | Zapisuje | Około tygodnia |
+|---|---|---|
+| **Full log** | każdą odebraną linię, dokładnie tak jak wypisana, do `gpsdo_RRRR-MM-DD_GG-MM-SS.log` | ~217 MB |
+| **CSV only** | jeden wiersz na sekundę telemetrii, tylko kolumny analityczne, do `…​.csv` | ~65 MB |
+| **Both** | ten sam przebieg zapisany do obu plików | ~282 MB |
+
+Oba otwierane są obok skryptu z buforowaniem liniowym, więc przebieg zakończony
+awarią zostawia użyteczne dane, a nie pusty plik niezrzuconych buforów.
+
+**Pełny log** to surowy tekst telemetrii — wszystko, co powiedziała płytka,
+łącznie z odpowiedziami CLI i banerami startowymi. To format dla kogoś, kto ma
+na przebieg *popatrzeć*, a nie na nim liczyć, i jedyny, który zachowuje
+cokolwiek, na co CSV nie ma kolumny.
+
+**CSV** jest do liczenia: `pandas.read_csv` i `numpy.loadtxt` czytają go z
+domyślnymi ustawieniami, bo dwie linie proweniencji zaczynają się od `#`.
+Kolumny to to, czego każda dotychczasowa analiza tych logów faktycznie
+potrzebowała, a nie wszystko, co firmware wypisuje:
+
+```
+utc, up_s, algo, state, dph_ns, qerr_ns, vphase_v, pwm, f10, f100,
+ph_ns, level, corr, sig_ns, zc, bmp_c, sat, hdop
+```
+
+`ph_ns`, `level`, `corr`, `sig_ns` i `zc` to diagnostyka algorytmu 12 i pozostają
+puste przy każdym innym algorytmie; `f100` jest puste, dopóki okno 100 s się nie
+wypełni. Pusta komórka zawsze znaczy *tego pola nie było w telemetrii tej
+sekundy*, nigdy zero.
+
+Trzy kolumny wymagają komentarza:
+
+- **`up_s` jest wiarygodne dopiero od firmware'u v1.06.** Zmierzone na 75 055
+  blokach z v1.05: UTC szło do przodu dokładnie o sekundę za każdym razem,
+  podczas gdy licznik uptime powtórzył lub przeskoczył sekundę 118 razy (0,16 %)
+  i zyskał 12 s w 20,8 h. Liczony był z wolnobieżnego timera MCU, który idzie o
+  jakieś 159 ppm za szybko; v1.06 liczy go z PPS. Tuner zapisuje obie kolumny
+  dokładnie tak, jak przyszły, i żadnej nie naprawia — rejestrator, który po
+  cichu poprawia swoje wejście, nie nadaje się do znajdowania takich rzeczy —
+  więc w zapisie z v1.05 lub starszego używaj `utc`.
+- **`hdop` nie zawsze jest liczbą.** LEA-T po zakończonym survey-in wypisuje
+  `HDOP:TIME`, a ta flaga jest ważniejszym z dwóch faktów — to tryb, w którym
+  1PPS jest wart zaufania. Jeśli chcesz mieć kolumnę liczbową, parsuj ją z
+  `errors="coerce"`.
+- **`vphase_v`** to surowe napięcie rampy detektora i jedyna kolumna, która
+  ujawnia detektor na ograniczniku. `dph_ns` policzone z rampy na ograniczniku
+  wygląda jak zwyczajna liczba.
+
+Świadomie pominięte: `Vctl` (to `pwm` przez RC, a `pwm` jest liczbą dokładną),
+wilgotność, ciśnienie i szyny INA (przez wszystkie dotychczasowe przebiegi nigdy
+nie ruszyły się na tyle, żeby cokolwiek wyjaśnić). **Kolumn z pozycją nie ma w
+ogóle**, więc CSV jest zanonimizowany z konstrukcji, niezależnie od checkboxa.
+
+**Redact position** (obok przycisku logowania, domyślnie włączone) dotyczy
+**pełnego logu** — CSV nie ma kolumn z pozycją, więc nie ma tam czego
+anonimizować. Zastępuje `Lat` / `Lon` / `Alt` odbiornika symbolami zastępczymi
+**tylko w zapisywanym pliku** — Raw monitor i wykresy nadal pokazują prawdziwy fiks. Liczba satelitów,
+HDOP i znacznik TIME zostają: są diagnostyczne i nie mówią nic o tym, gdzie
+jesteś.
+
+Log telemetrii to jest właśnie ten plik, który trafia na forum albo do kogoś,
+kto zaproponował pomiar Twojej płytki, a każda jego sekunda niesie pozycję z
+sześcioma miejscami po przecinku — czyli z dokładnością do kilkunastu
+centymetrów. Czyszczenie po fakcie działa, ale zależy od pamiętania, a ten jeden
+raz, kiedy się zapomni, jest tym razem, kiedy plik już poszedł. Ustawienie jest
+zamrażane w chwili otwarcia pliku, a pole wyszarzone do końca logowania — więc
+log jest albo w całości zanonimizowany, albo w całości nie; plik zanonimizowany
+częściowo wygląda na bezpieczny, a nie jest. Tak czy inaczej log sam mówi, który
+to przypadek, w swojej drugiej linii.
 
 **Generate tz_table.h** przebudowuje tablicę stref czasowych firmware'u z danych
 IANA na tej maszynie i zapisuje `tz_table.h` obok skryptu. Zastępuje dawny

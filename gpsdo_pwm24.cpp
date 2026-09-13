@@ -1,6 +1,6 @@
 /* =======================================================================
  * gpsdo_pwm24.cpp — 24-bit control voltage from a short PWM plus dithering
- * Part of GPSDO FreeRTOS v1.05
+ * Part of GPSDO FreeRTOS v1.06
  *
  * See gpsdo_pwm24.h for what this does and why. This file is the hardware:
  * TIM4 CH4 on PB9, fed from a table by DMA1 Stream 6 Channel 2.
