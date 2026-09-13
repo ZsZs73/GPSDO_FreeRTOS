@@ -3390,21 +3390,21 @@ void vDisplayTask(void *pvParameters)
     bool     holdover_blink_state = false;
     uint32_t holdover_blink_last  = 0;
 
+    /* Keep the display task awake fast enough for the 200 ms
+     * auto-holdover alarm LED blink. */
+    bool     fast_led_active = false;
+
     for (;;)
     {
         /* Wait for PPS notification from FreqRelayTask, or fall through
-         * after a timeout so the display doesn't freeze without GPS. The
-         * timeout is SHORT while a LED spinner animation is running
-         * (warmup / survey-in / calibration), because those animations step
-         * their frame every 200 ms (millis()/200) and the task only redraws
-         * when it wakes — at the normal 1100 ms PPS cadence the spinner would
-         * update just once a second and look like it's "skipping" / running
-         * ~5x too slow. During an animation we wake ~every 150 ms so the
-         * spinner is smooth; otherwise we keep the slow 1100 ms cadence (the
-         * clock only changes once a second, so there's nothing to gain from
-         * waking faster, and it keeps the display task cheap). */
+         * after a timeout so the display doesn't freeze without GPS.
+         * During LED spinner animations we wake every 150 ms for smooth
+         * updates. During auto-holdover we wake every 100 ms so the
+         * 200 ms alarm LED blink can be timed accurately. Otherwise the
+         * display task keeps its normal slow 1100 ms cadence. */
         bool anim_active = g_warmup_active || g_svin_active || g_calib_active;
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(anim_active ? 150 : 1100));
+        uint32_t wake_ms = fast_led_active ? 100 : (anim_active ? 150 : 1100);
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wake_ms));
 
         /* ---- Snapshot shared state ---- */
         FreqSnap_t snap_f;
@@ -3420,19 +3420,20 @@ void vDisplayTask(void *pvParameters)
         if (xSemaphoreTake(xCtrlMutex,   pdMS_TO_TICKS(5)) == pdTRUE) { snap_c = gCtrl;     xSemaphoreGive(xCtrlMutex); }
         uptime_snapshot(&snap_u);   /* pure function of the counter; no lock */
 
-       /* ---- Alarm LED state machine ----
-        *
-        * State | Condition                            | Behaviour
-        * ------+--------------------------------------+----------------------
-        * ON    | No GPS fix                           | Alarm on steady
-        * OFF   | Fix OK, no holdover                  | Normal operation
-        * SLOW  | Fix OK, manual holdover (user MH)    | 1000 ms pulse
-        * FAST  | Fix lost during operation,           | 200 ms pulse
-        *       | auto-holdover engaged                |
-        *
-        * When fix returns after auto-holdover, control task clears
-        * holdover_auto and holdover_mode -> alarm turns OFF.
-        */
+        fast_led_active = snap_c.holdover_auto;
+        /* ---- Alarm LED state machine ----
+         *
+         * State | Condition                            | Behaviour
+         * ------+--------------------------------------+----------------------
+         * ON    | No GPS fix                           | Alarm on steady
+         * OFF   | Fix OK, no holdover                  | Normal operation
+         * SLOW  | Fix OK, manual holdover (user MH)    | 1000 ms pulse
+         * FAST  | Fix lost during operation,           | 200 ms pulse
+         *       | auto-holdover engaged                |
+         *
+         * When fix returns after auto-holdover, control task clears
+         * holdover_auto and holdover_mode -> alarm turns OFF.
+         */
         {
             static uint32_t led_blink_last = 0;
             static bool     led_blink_state = false;
