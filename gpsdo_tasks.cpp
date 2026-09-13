@@ -3443,8 +3443,11 @@ void vDisplayTask(void *pvParameters)
             bool hold    = snap_c.holdover_mode;
             bool hold_auto = snap_c.holdover_auto;
 
-            if (!fix && !hold_auto) {
-                /* No fix, no auto-holdover — alarm */
+            bool startup_pending =
+                g_warmup_active || g_svin_active || g_calib_active;
+
+            if (startup_pending || (!fix && !hold_auto)) {
+                /* Startup not yet qualified, or no fix before auto-holdover — alarm */
                 digitalWrite(PIN_ALARM_LED, HIGH);   /* ON steady */
                 led_blink_state = false;
             } else if (fix && !hold) {
