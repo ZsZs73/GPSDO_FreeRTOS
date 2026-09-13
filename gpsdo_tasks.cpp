@@ -3188,6 +3188,9 @@ void vDisplayTask(void *pvParameters)
     vTaskDelay(pdMS_TO_TICKS(200));
     if (xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         s_oled.begin();               /* also calls Wire.begin()           */
+        #if GPSDO_OLED_FLIP
+            s_oled.setFlipMode(1);
+        #endif
         /* u8x8.begin() does not verify the display is present — probe the
          * bus ourselves so the HW report reflects reality.               */
         s_oled_ok = i2c_probe(0x3C);
