@@ -304,8 +304,8 @@ void setup()
 
     /* ---- GPIO ---- */
     pinMode(PIN_BLUE_LED,   OUTPUT);
-    pinMode(PIN_YELLOW_LED, OUTPUT);
-    digitalWrite(PIN_YELLOW_LED, LOW);    /* OFF at boot — LED on = fix acquired */
+    pinMode(PIN_ALARM_LED, OUTPUT);
+    digitalWrite(PIN_ALARM_LED, HIGH);    /* Alarm ON at boot until GPSDO is synchronized */
 
     /* ---- Frequency counter input select ---- */
     pinMode(PIN_FCSEL, OUTPUT);

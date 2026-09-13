@@ -426,7 +426,7 @@ extern "C" {
 
 /* ── Pin definitions ─────────────────────────────────────────────────── */
 #define PIN_BLUE_LED     PC13
-#define PIN_YELLOW_LED   PB8
+#define PIN_ALARM_LED   PB8
 #define PIN_VCTL_PWM     PB9
 #define PIN_VCTL_ADC     PB1
 #define PIN_VCC_DIV2     PA0
@@ -527,8 +527,8 @@ extern "C" {
 
 /* ── Holdover blink period (ms) ──────────────────────────────────────── */
 #define HOLDOVER_BLINK_MS   500u   /* OLED/LCD [H] blink period (ms) */
-#define LED_SLOW_BLINK_MS  1000u   /* Yellow LED slow pulse — manual holdover */
-#define LED_FAST_BLINK_MS   200u   /* Yellow LED fast pulse — fix lost / auto holdover */
+#define LED_SLOW_BLINK_MS  1000u   /* Alarm LED slow pulse — manual holdover */
+#define LED_FAST_BLINK_MS   200u   /* Alarm LED fast pulse — fix lost / auto holdover */
 
 /* ── Default PWM (pre-calibration start point) ────────────────────────
  *

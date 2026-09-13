@@ -19,7 +19,7 @@
  *       then local time clock (LMT:hh:mm:ss DAY) on row 0.
  * LCD:  frequency on line 0, UTC+uptime on line 1, 6-mode rotating
  *       view on line 2, PWM+trend+holdover on line 3.
- * Yellow LED: 4-state machine (off / on / slow pulse / fast pulse).
+ * Alarm LED: 4-state machine (on / off / slow pulse / fast pulse).
  */
 
 #include "gpsdo_config.h"
@@ -3417,19 +3417,19 @@ void vDisplayTask(void *pvParameters)
         if (xSemaphoreTake(xCtrlMutex,   pdMS_TO_TICKS(5)) == pdTRUE) { snap_c = gCtrl;     xSemaphoreGive(xCtrlMutex); }
         uptime_snapshot(&snap_u);   /* pure function of the counter; no lock */
 
-        /* ---- Yellow LED state machine ----
-         *
-         * State | Condition                            | Behaviour
-         * ------+--------------------------------------+----------------------
-         * OFF   | No GPS fix                           | LED off (LOW)
-         * ON    | Fix OK, no holdover                  | LED on steady (HIGH)
-         * SLOW  | Fix OK, manual holdover (user MH)    | 1000 ms pulse
-         * FAST  | Fix lost during operation,           | 200 ms pulse
-         *       | auto-holdover engaged                |
-         *
-         * When fix returns after auto-holdover, control task clears
-         * holdover_auto and holdover_mode → LED transitions back to ON.
-         */
+       /* ---- Alarm LED state machine ----
+        *
+        * State | Condition                            | Behaviour
+        * ------+--------------------------------------+----------------------
+        * ON    | No GPS fix                           | Alarm on steady
+        * OFF   | Fix OK, no holdover                  | Normal operation
+        * SLOW  | Fix OK, manual holdover (user MH)    | 1000 ms pulse
+        * FAST  | Fix lost during operation,           | 200 ms pulse
+        *       | auto-holdover engaged                |
+        *
+        * When fix returns after auto-holdover, control task clears
+        * holdover_auto and holdover_mode -> alarm turns OFF.
+        */
         {
             static uint32_t led_blink_last = 0;
             static bool     led_blink_state = false;
@@ -3440,26 +3440,26 @@ void vDisplayTask(void *pvParameters)
             bool hold_auto = snap_c.holdover_auto;
 
             if (!fix && !hold_auto) {
-                /* No fix, no auto-holdover (never had fix or manual mode) */
-                digitalWrite(PIN_YELLOW_LED, LOW);   /* OFF */
+                /* No fix, no auto-holdover — alarm */
+                digitalWrite(PIN_ALARM_LED, HIGH);   /* ON steady */
                 led_blink_state = false;
             } else if (fix && !hold) {
-                /* Fix acquired, disciplined mode */
-                digitalWrite(PIN_YELLOW_LED, HIGH);  /* ON steady */
+                /* Fix acquired, disciplined mode — normal operation */
+                digitalWrite(PIN_ALARM_LED, LOW);    /* OFF */
                 led_blink_state = false;
             } else if (hold && !hold_auto) {
                 /* Manual holdover — slow pulse 1000 ms */
                 if ((now_ms - led_blink_last) >= LED_SLOW_BLINK_MS) {
                     led_blink_last  = now_ms;
                     led_blink_state = !led_blink_state;
-                    digitalWrite(PIN_YELLOW_LED, led_blink_state ? HIGH : LOW);
+                    digitalWrite(PIN_ALARM_LED, led_blink_state ? HIGH : LOW);
                 }
             } else {
                 /* Auto-holdover (fix lost during operation) — fast pulse 200 ms */
                 if ((now_ms - led_blink_last) >= LED_FAST_BLINK_MS) {
                     led_blink_last  = now_ms;
                     led_blink_state = !led_blink_state;
-                    digitalWrite(PIN_YELLOW_LED, led_blink_state ? HIGH : LOW);
+                    digitalWrite(PIN_ALARM_LED, led_blink_state ? HIGH : LOW);
                 }
             }
         }
