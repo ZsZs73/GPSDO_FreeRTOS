@@ -524,6 +524,7 @@ extern "C" {
 #define OCXO_CALIB_SECS      60u
 #define TUNNEL_TIMEOUT_SECS 300u
 #define POS_LOST_TIMEOUT_MS 10000u   /* ms without position fix before clearing pos_valid */
+#define PPS_LOST_TIMEOUT_MS  2000u   /* GPS 1PPS considered lost after this interval */
 #define PICDIV_ARM_MS       1001u
 
 /* ── Holdover blink period (ms) ──────────────────────────────────────── */

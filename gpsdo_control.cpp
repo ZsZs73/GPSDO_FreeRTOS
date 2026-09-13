@@ -1098,20 +1098,31 @@ void vControlTask(void *pvParameters)
             }
         }
 
-        /* ---- Auto-holdover: engage on fix loss, disengage on fix recovery ----
+        /* ---- Auto-holdover: engage on GPS timing loss, disengage on recovery ----
+         * A usable GPS reference requires both a valid position state and a recent
+         * physical 1PPS on PB10. This prevents a timing receiver's frozen Time-Mode
+         * position from falsely ending holdover after RF/PPS has disappeared.
+         *
          * Rules (evaluated every 200 ms loop tick):
-         *   Fix lost  → holdover_mode=true,  holdover_auto=true   (engage)
-         *   Fix back  → holdover_mode=false, holdover_auto=false  (disengage)
-         *               (only if holdover was set automatically; manual HO untouched)
-         * prev_pos_valid is a local variable that tracks the last known fix state. */
+         *   Reference lost → holdover_mode=true,  holdover_auto=true
+         *   Reference back → holdover_mode=false, holdover_auto=false
+         *                    (only if holdover was automatic; manual HO untouched)
+         */
         {
-            static bool prev_pos_valid = false;
-            bool cur_fix = false;
+            static bool prev_ref_valid = false;
+            bool pos_valid = false;
             if (xSemaphoreTake(xGpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                cur_fix = gGps.pos_valid;
+                pos_valid = gGps.pos_valid;
                 xSemaphoreGive(xGpsMutex);
             }
-            if (prev_pos_valid && !cur_fix) {
+
+            uint32_t last_pps_ms = gUpPpsMs;
+            bool pps_recent =
+                (last_pps_ms != 0u) &&
+                ((millis() - last_pps_ms) < PPS_LOST_TIMEOUT_MS);
+
+            bool cur_fix = pos_valid && pps_recent;
+            if (prev_ref_valid && !cur_fix) {
                 /* Fix just lost — engage auto-holdover */
                 if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                     gCtrl.holdover_mode = true;
@@ -1119,7 +1130,7 @@ void vControlTask(void *pvParameters)
                     xSemaphoreGive(xCtrlMutex);
                 }
                 OUT_SERIAL.println("GPS fix lost — auto-holdover engaged");
-            } else if (!prev_pos_valid && cur_fix) {
+            } else if (!prev_ref_valid && cur_fix) {
                 /* Fix gained.  Distinguish the very first fix after boot
                  * (nothing to disengage) from a genuine recovery after a
                  * fix loss (auto-holdover active).                        */
@@ -1143,7 +1154,7 @@ void vControlTask(void *pvParameters)
                     ? "GPS fix recovered — auto-holdover disengaged"
                     : "GPS fix acquired");
             }
-            prev_pos_valid = cur_fix;
+            prev_ref_valid = cur_fix;
 
             /* ---- Timezone: recompute the UTC→local offset.
              * Cheap (5 Hz, pure arithmetic) and re-run every pass so a DST
