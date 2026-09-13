@@ -118,6 +118,9 @@ extern "C" {
 #define PIN_TFT_DC    PB12
 #define PIN_TFT_CS    PB13
 
+// Counter input select: HIGH = OCXO 10 MHz, LOW = external FCin
+#define PIN_FCSEL     PB2
+
 /* ── OLED page alternation: seconds per page ─────────────────────────── */
 #define OLED_PAGE_SWITCH_SECS   10u   /* flip between page A and B every N seconds */
 

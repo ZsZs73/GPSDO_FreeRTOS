@@ -307,6 +307,10 @@ void setup()
     pinMode(PIN_YELLOW_LED, OUTPUT);
     digitalWrite(PIN_YELLOW_LED, LOW);    /* OFF at boot — LED on = fix acquired */
 
+    /* ---- Frequency counter input select ---- */
+    pinMode(PIN_FCSEL, OUTPUT);
+    digitalWrite(PIN_FCSEL, HIGH);   /* Select OCXO 10 MHz input */
+
 #ifdef GPSDO_PICDIV
     pinMode(PIN_PICDIV_ARM, OUTPUT);
     digitalWrite(PIN_PICDIV_ARM, HIGH);
