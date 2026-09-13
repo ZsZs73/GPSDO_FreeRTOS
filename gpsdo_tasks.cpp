@@ -516,31 +516,60 @@ static int s2(char *buf, int pos, uint8_t v)
  * report is a second away. HardwareSerial::write() blocks rather than drops
  * when its buffer fills, but a room-sized chunk never asks it to. */
 #define REPORT_WRITE_BUDGET_MS 25u
-static bool report_write(const uint8_t *buf, int n)
+
+/* Write one telemetry report to one physical stream with a bounded wait.
+ *
+ * Never ask the stream to accept more bytes than availableForWrite() says
+ * will fit immediately. If the port stops draining, abandon the remainder
+ * after REPORT_WRITE_BUDGET_MS rather than letting its write() stall the
+ * display task indefinitely.
+ */
+static bool report_write_one(Stream &port, const uint8_t *buf, int n)
 {
     if (n <= 0) return true;
+
     uint32_t t0 = millis();
     int off = 0;
+
     while (off < n) {
-        int room = REPORT_SERIAL.availableForWrite();
-        /* room == 0 is ambiguous: a FULL CDC queue reports 0, and so would a
-         * port that cannot answer. Every port this firmware ships —
-         * HardwareSerial, USBSerial, TeeSerial — answers properly, so treat
-         * 0 as "full right now", yield, and let the budget decide. Never
-         * blind-write the rest: on a full CDC queue USBSerial::write() loops
-         * for as long as the host stays connected, which is the freeze this
-         * wrapper exists to prevent. */
+        int room = port.availableForWrite();
+
         if (room > 0) {
             int chunk = (room < (n - off)) ? room : (n - off);
-            REPORT_SERIAL.write((uint8_t *)buf + off, (size_t)chunk);
+            port.write(buf + off, (size_t)chunk);
             off += chunk;
         } else {
             taskYIELD();
         }
+
         if (off < n && (millis() - t0) >= REPORT_WRITE_BUDGET_MS)
             return false;               /* tail dropped, display must live */
     }
+
     return true;
+}
+
+/* Write the telemetry report.
+ *
+ * In USB+Bluetooth parallel mode the two physical outputs MUST be handled
+ * independently. TeeSerial::availableForWrite() cannot distinguish an absent
+ * USB CDC port from a connected CDC port whose TX queue is full: both may
+ * report zero. Using g_tee here could therefore call Serial.write() while its
+ * queue is full and recreate the indefinite USB block this guard exists to
+ * prevent.
+ *
+ * Send Bluetooth first so a stalled/unopened USB CDC port cannot even delay
+ * the UART copy. Each output then gets its own bounded write attempt.
+ */
+static bool report_write(const uint8_t *buf, int n)
+{
+#ifdef GPSDO_BLUETOOTH_PARALLEL
+    bool bt_ok  = report_write_one(Serial2, buf, n);
+    bool usb_ok = report_write_one(Serial,  buf, n);
+    return bt_ok && usb_ok;
+#else
+    return report_write_one(REPORT_SERIAL, buf, n);
+#endif
 }
 
 /* ---- Tab-delimited report -------------------------------------------- */
