@@ -313,7 +313,11 @@ void setup()
 
 #ifdef GPSDO_PICDIV
     pinMode(PIN_PICDIV_ARM, OUTPUT);
-    digitalWrite(PIN_PICDIV_ARM, HIGH);
+    /* Keep picDIV stopped during startup until GPS is valid and the initial
+     * GPSDO calibration has completed. This prevents an unsynchronized or
+     * not-yet-qualified PPS from being presented to downstream timing
+     * equipment such as an NTP server. */
+    digitalWrite(PIN_PICDIV_ARM, LOW);
 #endif
 
     /* ---- 2 kHz test square wave on PB5 (TIM3 CH2) ---- */

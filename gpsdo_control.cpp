@@ -1132,6 +1132,13 @@ void vControlTask(void *pvParameters)
                     }
                     xSemaphoreGive(xCtrlMutex);
                 }
+            #ifdef GPSDO_PICDIV
+                /* First valid startup cycle or GPS recovery: re-sync picDIV PPS to GPS.
+                * During startup the divider remains stopped through survey-in and the
+                * initial calibration phase. On later GPS loss it is deliberately left
+                * running from the disciplined OCXO so holdover PPS remains available. */
+                xEventGroupSetBits(xSysEvents, EVT_ARM_PICDIV);
+            #endif
                 OUT_SERIAL.println(was_auto_ho
                     ? "GPS fix recovered — auto-holdover disengaged"
                     : "GPS fix acquired");
