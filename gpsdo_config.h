@@ -32,6 +32,7 @@ extern "C" {
 /* ── Version ─────────────────────────────────────────────────────────── */
 #define PROGRAM_NAME     "GPSDO"
 #define PROGRAM_VERSION  "v1.06-rtos"
+#define DEBUG_BUILD_TAG ""
 
 /* ---- Serial output macro ----
  * OUT_SERIAL routes user-facing output to Serial2 (Bluetooth) or Serial
@@ -524,7 +525,8 @@ extern "C" {
 #define OCXO_CALIB_SECS      60u
 #define TUNNEL_TIMEOUT_SECS 300u
 #define POS_LOST_TIMEOUT_MS 10000u   /* ms without position fix before clearing pos_valid */
-#define PPS_LOST_TIMEOUT_MS  2000u   /* GPS 1PPS considered lost after this interval */
+#define PPS_LOST_TIMEOUT_MS 10000u   /* GPS 1PPS considered lost after this interval */
+#define PICDIV_PPS_FRESH_MS  1500u   /* Maximum PPS age allowed before arming picDIV */
 #define PICDIV_ARM_MS       1001u
 
 /* ── Holdover blink period (ms) ──────────────────────────────────────── */

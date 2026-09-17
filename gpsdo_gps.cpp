@@ -661,15 +661,19 @@ static void run_tunnel_mode(void)
         Serial1.begin(g_tunnel_baud);
     }
     CLI_SER.println("Entering tunnel mode...");
-#ifdef GPSDO_BLUETOOTH
+#if defined(GPSDO_BLUETOOTH) || defined(GPSDO_BLUETOOTH_PARALLEL)
     Serial.println("GPS tunnel active on this USB port.");
 #endif
     uint32_t end_ms        = millis() + (TUNNEL_TIMEOUT_SECS * 1000UL);
     uint32_t last_notify   = millis();
 
     while (millis() < end_ms) {
-        if (Serial1.available())  Serial.write(Serial1.read());
-        if (Serial.available())   Serial1.write(Serial.read());
+        /* Drain both directions completely before yielding. */
+        while (Serial1.available())
+            Serial.write(Serial1.read());
+
+        while (Serial.available())
+            Serial1.write(Serial.read());
 
         /* Notify DisplayTask ~1 Hz so displays stay alive */
         uint32_t now = millis();

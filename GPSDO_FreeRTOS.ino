@@ -295,6 +295,10 @@ void setup()
     OUT_SERIAL.println("Algo 13 (Kalman filter) by J. M. Niewinski - original to this project");
 #endif
     OUT_SERIAL.println("Type H = help  SW = stack diagnostics");
+#ifdef DEBUG_BUILD_TAG
+    OUT_SERIAL.print("Debug build: ");
+    OUT_SERIAL.println(DEBUG_BUILD_TAG);
+#endif
     OUT_SERIAL.println("================================================\r\n");
     print_reset_cause();
 

@@ -1031,20 +1031,33 @@ void vControlTask(void *pvParameters)
          * ---------------------------------------------------------------- */
 #ifdef GPSDO_PICDIV
         if (xEventGroupGetBits(xSysEvents) & EVT_ARM_PICDIV) {
-            bool fix_ok = false;
+            bool pos_valid = false;
             if (xSemaphoreTake(xGpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                fix_ok = gGps.pos_valid;
+                pos_valid = gGps.pos_valid;
                 xSemaphoreGive(xGpsMutex);
             }
-            if (fix_ok && !s_arm_active) {
+
+            uint32_t last_pps_ms = gUpPpsMs;
+            bool pps_recent =
+                (last_pps_ms != 0u) &&
+                ((millis() - last_pps_ms) < PICDIV_PPS_FRESH_MS);
+
+            bool ref_ok = pos_valid && pps_recent;
+
+            if (ref_ok && !s_arm_active) {
                 digitalWrite(PIN_PICDIV_ARM, LOW);
-                s_arm_active     = true;
-                s_arm_started_ms = millis();
+                s_arm_active       = true;
+                s_arm_started_ms   = millis();
+                s_arm_wait_warned  = false;
                 xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
                 OUT_SERIAL.println("picDIV: armed (output stopped, waiting for 1PPS sync)");
-            } else if (!fix_ok && !s_arm_wait_warned) {
-                s_arm_wait_warned = true;   /* warn once, keep event bit set */
-                OUT_SERIAL.println("picDIV: no GPS fix - arming deferred until fix");
+            } else if (!ref_ok) {
+                xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
+
+                if (!s_arm_wait_warned) {
+                    s_arm_wait_warned = true;
+                    OUT_SERIAL.println("picDIV: arm request ignored - GPS reference unavailable");
+                }
             }
         }
         if (s_arm_active && (millis() - s_arm_started_ms) > PICDIV_ARM_MS) {
@@ -1100,61 +1113,125 @@ void vControlTask(void *pvParameters)
 
         /* ---- Auto-holdover: engage on GPS timing loss, disengage on recovery ----
          * A usable GPS reference requires both a valid position state and a recent
-         * physical 1PPS on PB10. This prevents a timing receiver's frozen Time-Mode
-         * position from falsely ending holdover after RF/PPS has disappeared.
+         * physical 1PPS on PB10.
          *
-         * Rules (evaluated every 200 ms loop tick):
-         *   Reference lost → holdover_mode=true,  holdover_auto=true
-         *   Reference back → holdover_mode=false, holdover_auto=false
-         *                    (only if holdover was automatic; manual HO untouched)
+         * Loss qualification:
+         *   no PPS for PPS_LOST_TIMEOUT_MS -> enter auto-holdover
+         *
+         * Recovery qualification:
+         *   while in auto-holdover, require continuously arriving PPS edges for
+         *   PPS_LOST_TIMEOUT_MS before leaving holdover. A gap longer than
+         *   PICDIV_PPS_FRESH_MS resets the recovery qualification.
+         *
+         * Initial acquisition after boot remains immediate.
          */
         {
-            static bool prev_ref_valid = false;
+            static bool     prev_ref_valid      = false;
+            static uint32_t recovery_start_ms   = 0;
+            static uint32_t recovery_last_pps_ms = 0;
+
             bool pos_valid = false;
             if (xSemaphoreTake(xGpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                 pos_valid = gGps.pos_valid;
                 xSemaphoreGive(xGpsMutex);
             }
 
+            uint32_t now_ms      = millis();
             uint32_t last_pps_ms = gUpPpsMs;
+
             bool pps_recent =
                 (last_pps_ms != 0u) &&
-                ((millis() - last_pps_ms) < PPS_LOST_TIMEOUT_MS);
+                ((now_ms - last_pps_ms) < PPS_LOST_TIMEOUT_MS);
 
             bool cur_fix = pos_valid && pps_recent;
-            if (prev_ref_valid && !cur_fix) {
-                /* Fix just lost — engage auto-holdover */
-                if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    gCtrl.holdover_mode = true;
-                    gCtrl.holdover_auto = true;
-                    xSemaphoreGive(xCtrlMutex);
+
+            bool auto_ho = false;
+            if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                auto_ho = gCtrl.holdover_auto;
+                xSemaphoreGive(xCtrlMutex);
+            }
+
+            if (!auto_ho) {
+                /* Normal operation / initial acquisition. */
+                recovery_start_ms    = 0;
+                recovery_last_pps_ms = 0;
+
+                if (prev_ref_valid && !cur_fix) {
+                    /* Reference has been absent for PPS_LOST_TIMEOUT_MS. */
+                    if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        gCtrl.holdover_mode = true;
+                        gCtrl.holdover_auto = true;
+                        xSemaphoreGive(xCtrlMutex);
+                    }
+
+                    OUT_SERIAL.println("GPS fix lost — auto-holdover engaged");
+                    prev_ref_valid = false;
+
+                } else if (!prev_ref_valid && cur_fix) {
+                    /* First valid startup acquisition — no recovery delay needed. */
+#ifdef GPSDO_PICDIV
+                    xEventGroupSetBits(xSysEvents, EVT_ARM_PICDIV);
+#endif
+                    OUT_SERIAL.println("GPS fix acquired");
+                    prev_ref_valid = true;
+
+                } else {
+                    prev_ref_valid = cur_fix;
                 }
-                OUT_SERIAL.println("GPS fix lost — auto-holdover engaged");
-            } else if (!prev_ref_valid && cur_fix) {
-                /* Fix gained.  Distinguish the very first fix after boot
-                 * (nothing to disengage) from a genuine recovery after a
-                 * fix loss (auto-holdover active).                        */
-                bool was_auto_ho = false;
-                if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    was_auto_ho = gCtrl.holdover_auto;
-                    if (gCtrl.holdover_auto) {
+
+            } else {
+                /* Auto-holdover is active. Qualify recovery from actual new
+                 * physical PPS edges, not merely from a fresh timestamp. */
+
+                if (pos_valid && last_pps_ms != 0u &&
+                    last_pps_ms != recovery_last_pps_ms) {
+
+                    if (recovery_last_pps_ms == 0u ||
+                        (last_pps_ms - recovery_last_pps_ms) >
+                            PICDIV_PPS_FRESH_MS) {
+                        /* First returning PPS, or sequence was broken. */
+                        recovery_start_ms = last_pps_ms;
+                    }
+
+                    recovery_last_pps_ms = last_pps_ms;
+                }
+
+                /* If the returning PPS stream stops, abandon qualification. */
+                if (recovery_start_ms != 0u &&
+                    (now_ms - recovery_last_pps_ms) >
+                        PICDIV_PPS_FRESH_MS) {
+                    recovery_start_ms = 0;
+                }
+
+                bool recovery_ok =
+                    pos_valid &&
+                    recovery_start_ms != 0u &&
+                    (recovery_last_pps_ms - recovery_start_ms) >=
+                        PPS_LOST_TIMEOUT_MS;
+
+                if (recovery_ok) {
+                    if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         gCtrl.holdover_mode = false;
                         gCtrl.holdover_auto = false;
+                        xSemaphoreGive(xCtrlMutex);
                     }
-                    xSemaphoreGive(xCtrlMutex);
+
+#ifdef GPSDO_PICDIV
+                    xEventGroupSetBits(xSysEvents, EVT_ARM_PICDIV);
+#endif
+
+                    OUT_SERIAL.println(
+                        "GPS fix recovered — auto-holdover disengaged");
+
+                    prev_ref_valid       = true;
+                    recovery_start_ms    = 0;
+                    recovery_last_pps_ms = 0;
+                } else {
+                    /* Do not let individual returning pulses look like a full
+                     * recovery to the transition detector. */
+                    prev_ref_valid = false;
                 }
-            #ifdef GPSDO_PICDIV
-                /* First valid startup cycle or GPS recovery: re-sync picDIV PPS to GPS.
-                * During startup the divider remains stopped through survey-in and the
-                * initial calibration phase. On later GPS loss it is deliberately left
-                * running from the disciplined OCXO so holdover PPS remains available. */
-                xEventGroupSetBits(xSysEvents, EVT_ARM_PICDIV);
-            #endif
-                OUT_SERIAL.println(was_auto_ho
-                    ? "GPS fix recovered — auto-holdover disengaged"
-                    : "GPS fix acquired");
             }
-            prev_ref_valid = cur_fix;
 
             /* ---- Timezone: recompute the UTC→local offset.
              * Cheap (5 Hz, pure arithmetic) and re-run every pass so a DST

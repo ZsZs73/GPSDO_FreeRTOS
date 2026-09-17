@@ -508,23 +508,25 @@ static int s2(char *buf, int pos, uint8_t v)
  * is why the failure looked configuration-dependent.
  *
  * So write in CHUNKS no larger than what the port says it can take now, and
- * give up on the remainder after REPORT_WRITE_BUDGET_MS. A draining host
+ * give up on the remainder after the per-port write budget. A draining host
  * empties the 128-byte queue in well under a millisecond of polling, so the
  * whole report goes out in a few iterations; a host that is not reading
  * stalls the first chunk and the tail is dropped — which is the intended
  * behaviour, because telemetry is a live stream, not a log, and the next
  * report is a second away. HardwareSerial::write() blocks rather than drops
  * when its buffer fills, but a room-sized chunk never asks it to. */
-#define REPORT_WRITE_BUDGET_MS 25u
+#define REPORT_USB_WRITE_BUDGET_MS  25u
+#define REPORT_BT_WRITE_BUDGET_MS  200u
 
 /* Write one telemetry report to one physical stream with a bounded wait.
  *
  * Never ask the stream to accept more bytes than availableForWrite() says
  * will fit immediately. If the port stops draining, abandon the remainder
- * after REPORT_WRITE_BUDGET_MS rather than letting its write() stall the
+ * after the per-port write budget rather than letting its write() stall the
  * display task indefinitely.
  */
-static bool report_write_one(Stream &port, const uint8_t *buf, int n)
+static bool report_write_one(Stream &port, const uint8_t *buf, int n,
+                             uint32_t budget_ms)
 {
     if (n <= 0) return true;
 
@@ -536,14 +538,18 @@ static bool report_write_one(Stream &port, const uint8_t *buf, int n)
 
         if (room > 0) {
             int chunk = (room < (n - off)) ? room : (n - off);
-            port.write(buf + off, (size_t)chunk);
-            off += chunk;
+
+            size_t written = port.write(buf + off, (size_t)chunk);
+            off += (int)written;
+
+            if (written == 0)
+                taskYIELD();
         } else {
             taskYIELD();
         }
 
-        if (off < n && (millis() - t0) >= REPORT_WRITE_BUDGET_MS)
-            return false;               /* tail dropped, display must live */
+        if (off < n && (millis() - t0) >= budget_ms)
+            return false;
     }
 
     return true;
@@ -564,11 +570,15 @@ static bool report_write_one(Stream &port, const uint8_t *buf, int n)
 static bool report_write(const uint8_t *buf, int n)
 {
 #ifdef GPSDO_BLUETOOTH_PARALLEL
-    bool bt_ok  = report_write_one(Serial2, buf, n);
-    bool usb_ok = report_write_one(Serial,  buf, n);
+    bool bt_ok  = report_write_one(Serial2, buf, n, REPORT_BT_WRITE_BUDGET_MS);
+    bool usb_ok = report_write_one(Serial,  buf, n, REPORT_USB_WRITE_BUDGET_MS);
     return bt_ok && usb_ok;
+
+#elif defined(GPSDO_BLUETOOTH)
+    return report_write_one(REPORT_SERIAL, buf, n, REPORT_BT_WRITE_BUDGET_MS);
+
 #else
-    return report_write_one(REPORT_SERIAL, buf, n);
+    return report_write_one(REPORT_SERIAL, buf, n, REPORT_USB_WRITE_BUDGET_MS);
 #endif
 }
 
