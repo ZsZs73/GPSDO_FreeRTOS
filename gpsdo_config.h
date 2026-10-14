@@ -32,6 +32,12 @@ extern "C" {
 /* ── Version ─────────────────────────────────────────────────────────── */
 #define PROGRAM_NAME     "GPSDO"
 #define PROGRAM_VERSION  "v1.06-rtos"
+
+/* ── Development / startup options ─────────────────────────────────────
+ * GPSDO_FASTBOOT shortens warmup, calibration and survey-in timing so
+ * repeated flash/reboot/test cycles do not require the full normal delays.
+ * Disable it for normal long-term operation and final validation. */
+#define GPSDO_FASTBOOT
 #define DEBUG_BUILD_TAG ""
 
 /* ---- Serial output macro ----
@@ -184,7 +190,11 @@ extern "C" {
  *
  * Survey-in ends when EITHER limit is met (whichever comes first):       */
 #define GPSDO_GPS_TIMING     /* u-blox timing rx: LEA-6T / LEA/NEO-M8T / ZED-F9T */
-#define GPSDO_SVIN_MIN_SECS   300u    /* minimum survey-in duration [s]     */
+#ifdef GPSDO_FASTBOOT        /* minimum survey-in duration [s]     */
+  #define GPSDO_SVIN_MIN_SECS   30u
+#else
+  #define GPSDO_SVIN_MIN_SECS  300u
+#endif
 #define GPSDO_SVIN_ACC_LIMIT  5000u   /* position accuracy limit [mm] (5 m) */
 #define GPSDO_PICDIV
 /* GPSDO_LTIC REQUIRES THE PHYSICAL RAMP DETECTOR ON PA1. It is not a software
@@ -458,7 +468,7 @@ extern "C" {
    * (diode-hold cap with no leakage path), where the cap must be actively zeroed
    * after each read. LTIC_RESET_US is the low-pulse width; a few microseconds is
    * plenty to sink the cap through PA1's drive. */
-  #define GPSDO_LTIC_ACTIVE_RESET   /* current-source variant only — see docs */
+  // #define GPSDO_LTIC_ACTIVE_RESET   /* current-source variant only — see docs */
   #define LTIC_RESET_US       5   /* PA1 low-pulse width to zero the hold cap (us)      */
   /* Legacy voltage→time calibration constant for the TIC ramp. The TIC charges
    * a 1 nF cap with a constant current during the GPS-1PPS → OCXO-1PPS interval,
@@ -521,8 +531,13 @@ extern "C" {
 #define CIRCBUF_SIZE     20000u
 
 /* ── Timing ──────────────────────────────────────────────────────────── */
-#define OCXO_WARMUP_SECS    300u
-#define OCXO_CALIB_SECS      60u
+#ifdef GPSDO_FASTBOOT
+  #define OCXO_WARMUP_SECS     90u
+  #define OCXO_CALIB_SECS      15u
+#else
+  #define OCXO_WARMUP_SECS    300u
+  #define OCXO_CALIB_SECS      60u
+#endif
 #define TUNNEL_TIMEOUT_SECS 300u
 #define POS_LOST_TIMEOUT_MS 10000u   /* ms without position fix before clearing pos_valid */
 #define PPS_LOST_TIMEOUT_MS 10000u   /* GPS 1PPS considered lost after this interval */

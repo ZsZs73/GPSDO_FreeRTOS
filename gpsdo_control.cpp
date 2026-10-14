@@ -138,6 +138,85 @@ static uint32_t s_arm_started_ms  = 0;     /* timestamp of arm LOW edge      */
 static bool     s_arm_active      = false; /* true while Arm pin is held LOW */
 static bool     s_arm_wait_warned = false; /* one-shot no-fix warning        */
 
+#ifdef GPSDO_PICDIV
+static void service_picdiv_arm(void)
+{
+    if (xEventGroupGetBits(xSysEvents) & EVT_ARM_PICDIV) {
+        bool pos_valid = false;
+        if (xSemaphoreTake(xGpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            pos_valid = gGps.pos_valid;
+            xSemaphoreGive(xGpsMutex);
+        }
+
+        uint32_t last_pps_ms = gUpPpsMs;
+        bool pps_recent =
+            (last_pps_ms != 0u) &&
+            ((millis() - last_pps_ms) < PICDIV_PPS_FRESH_MS);
+
+        bool ref_ok = pos_valid && pps_recent;
+
+        if (ref_ok && !s_arm_active) {
+            digitalWrite(PIN_PICDIV_ARM, LOW);
+            s_arm_active      = true;
+            s_arm_started_ms  = millis();
+            s_arm_wait_warned = false;
+            xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
+            OUT_SERIAL.println("picDIV: armed (output stopped, waiting for 1PPS sync)");
+        } else if (!ref_ok) {
+            xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
+
+            if (!s_arm_wait_warned) {
+                s_arm_wait_warned = true;
+                OUT_SERIAL.println("picDIV: arm request ignored - GPS reference unavailable");
+            }
+        }
+    }
+
+    if (s_arm_active &&
+        (millis() - s_arm_started_ms) > PICDIV_ARM_MS) {
+        digitalWrite(PIN_PICDIV_ARM, HIGH);
+        s_arm_active      = false;
+        s_arm_wait_warned = false;
+        OUT_SERIAL.println("picDIV: arm released - output syncs on next 1PPS edge");
+    }
+}
+#endif
+
+#ifdef GPSDO_PICDIV
+static bool arm_picdiv_and_wait(void)
+{
+    if (s_arm_active) {
+        OUT_SERIAL.println("picDIV: arm already in progress");
+        return false;
+    }
+
+    bool started = false;
+
+    xEventGroupSetBits(xSysEvents, EVT_ARM_PICDIV);
+
+    uint32_t start_ms = millis();
+
+    while ((millis() - start_ms) < (PICDIV_ARM_MS + 1000u)) {
+        service_picdiv_arm();
+
+        if (s_arm_active)
+            started = true;
+
+        if (started && !s_arm_active)
+            return true;
+
+        if (!started &&
+            !(xEventGroupGetBits(xSysEvents) & EVT_ARM_PICDIV))
+            return false;   /* request was rejected */
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    OUT_SERIAL.println("picDIV: arm timeout");
+    return false;
+}
+#endif
+
 /* Simple integer moving average (N=10) without heap alloc */
 typedef struct {
     int32_t  sum;
@@ -477,10 +556,16 @@ static void do_ltic_calibrate(void)
         }
         if (fix_ok) {
             OUT_SERIAL.println("LC: arming picDIV (sync to 1PPS)...");
-            digitalWrite(PIN_PICDIV_ARM, LOW);          /* stop divider        */
-            wait_secs_pwm(2, saved_pwm);                /* hold >1 s, PWM steady */
-            digitalWrite(PIN_PICDIV_ARM, HIGH);         /* release: syncs on 1PPS */
-            wait_secs_pwm(2, saved_pwm);                /* let output resume   */
+            if (!arm_picdiv_and_wait()) {
+                OUT_SERIAL.println("LC: ERROR picDIV arm failed");
+                gpsdo_dac_write16(saved_pwm);
+                xEventGroupClearBits(xSysEvents, EVT_NEED_LTIC_CAL);
+                g_calib_active = false;
+                g_calib_kind = CALIB_NONE;
+                g_calib_remaining = 0;
+                return;
+            }
+            wait_secs_pwm(2, saved_pwm);
         } else {
             OUT_SERIAL.println("LC: no GPS fix — skipping picDIV arm (phase may be unsynced)");
         }
@@ -661,24 +746,48 @@ static void do_ltic_calibrate(void)
          * MEASURED −6 ns/s, which grows the interval up the ramp. */
         {
             bool on_ramp = false;
-            for (int a = 0; a < 6 && !on_ramp; a++) {
-                OUT_SERIAL.print("LC: arming picDIV (try ");
-                OUT_SERIAL.print(a + 1); OUT_SERIAL.println(")...");
-                digitalWrite(PIN_PICDIV_ARM, LOW);
-                wait_secs_pwm(2, ramp_pwm);
-                digitalWrite(PIN_PICDIV_ARM, HIGH);
-                wait_secs_pwm(6, ramp_pwm);      /* sync + first pulses settle */
-                float v0 = g_ltic_voltage;
-                OUT_SERIAL.print("LC: post-arm V = "); OUT_SERIAL.println(v0, 3);
-                if (v0 > 0.10f && v0 < 2.5f) on_ramp = true;
-            }
-            if (!on_ramp) {
-                OUT_SERIAL.println("LC: ERROR could not land on the ramp after 6 arms — check picARM / pulse path; aborting.");
+
+            OUT_SERIAL.println("LC: arming picDIV once, then waiting for phase to enter ramp...");
+
+            if (!arm_picdiv_and_wait()) {
+                OUT_SERIAL.println("LC: ERROR picDIV arm failed");
                 gpsdo_dac_write16(saved_pwm);
                 xEventGroupClearBits(xSysEvents, EVT_NEED_LTIC_CAL);
-                g_calib_active = false; g_calib_kind = CALIB_NONE; g_calib_remaining = 0;
+                g_calib_active = false;
+                g_calib_kind = CALIB_NONE;
+                g_calib_remaining = 0;
                 return;
             }
+
+            /* After sync the detector starts near zero phase.  Keep the sweep PWM
+            * applied and let the measured frequency offset walk the phase naturally
+            * into the usable detector range. */
+            for (int s = 1; s <= 120 && !on_ramp; s++) {
+                wait_secs_pwm(1, ramp_pwm);
+
+                float v0 = g_ltic_voltage;
+
+                if ((s % 5) == 0 || (v0 > 0.10f && v0 < 2.5f)) {
+                    OUT_SERIAL.print("LC: ramp wait ");
+                    OUT_SERIAL.print(s);
+                    OUT_SERIAL.print("s V=");
+                    OUT_SERIAL.println(v0, 3);
+                }
+
+                if (v0 > 0.10f && v0 < 2.5f)
+                    on_ramp = true;
+            }
+
+            if (!on_ramp) {
+                OUT_SERIAL.println("LC: ERROR phase did not enter detector ramp within 120 s; aborting.");
+                gpsdo_dac_write16(saved_pwm);
+                xEventGroupClearBits(xSysEvents, EVT_NEED_LTIC_CAL);
+                g_calib_active = false;
+                g_calib_kind = CALIB_NONE;
+                g_calib_remaining = 0;
+                return;
+            }
+
             OUT_SERIAL.println("LC: on the ramp — collecting transit.");
         }
 #endif
@@ -1030,48 +1139,11 @@ void vControlTask(void *pvParameters)
          * bound phase, or re-arm (AP) when drift accumulates.
          * ---------------------------------------------------------------- */
 #ifdef GPSDO_PICDIV
-        if (xEventGroupGetBits(xSysEvents) & EVT_ARM_PICDIV) {
-            bool pos_valid = false;
-            if (xSemaphoreTake(xGpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                pos_valid = gGps.pos_valid;
-                xSemaphoreGive(xGpsMutex);
-            }
-
-            uint32_t last_pps_ms = gUpPpsMs;
-            bool pps_recent =
-                (last_pps_ms != 0u) &&
-                ((millis() - last_pps_ms) < PICDIV_PPS_FRESH_MS);
-
-            bool ref_ok = pos_valid && pps_recent;
-
-            if (ref_ok && !s_arm_active) {
-                digitalWrite(PIN_PICDIV_ARM, LOW);
-                s_arm_active       = true;
-                s_arm_started_ms   = millis();
-                s_arm_wait_warned  = false;
-                xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
-                OUT_SERIAL.println("picDIV: armed (output stopped, waiting for 1PPS sync)");
-            } else if (!ref_ok) {
-                xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
-
-                if (!s_arm_wait_warned) {
-                    s_arm_wait_warned = true;
-                    OUT_SERIAL.println("picDIV: arm request ignored - GPS reference unavailable");
-                }
-            }
-        }
-        if (s_arm_active && (millis() - s_arm_started_ms) > PICDIV_ARM_MS) {
-            digitalWrite(PIN_PICDIV_ARM, HIGH);
-            s_arm_active      = false;
-            s_arm_wait_warned = false;
-            OUT_SERIAL.println("picDIV: arm released - output syncs on next 1PPS edge");
-        }
+        service_picdiv_arm();
 #else
-        /* No picDIV support compiled in — just clear the request */
         if (xEventGroupGetBits(xSysEvents) & EVT_ARM_PICDIV)
             xEventGroupClearBits(xSysEvents, EVT_ARM_PICDIV);
 #endif
-
         /* ---- ADC readings ---- */
         {
             /* SCHEDULER SUSPENDED FOR THE CONVERSIONS. These share ADC1 with
