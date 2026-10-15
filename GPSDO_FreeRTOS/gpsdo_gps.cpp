@@ -19,7 +19,7 @@
 
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
-#include "ubx_timtp.h"
+#include "gpsdo_ubx_timtp.h"
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include <string.h>

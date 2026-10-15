@@ -11,7 +11,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include "gpsdo_config.h"
-#include "GPSDO_algorithms.h"
+#include "gpsdo_algorithms.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
 

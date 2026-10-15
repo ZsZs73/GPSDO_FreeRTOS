@@ -1,9 +1,9 @@
 /* ======================================================================
- * settings_store.cpp  —  persistent user settings via the flash ring
+ * gpsdo_settings_store.cpp  —  persistent user settings via the flash ring
  *
  * Part of GPSDO FreeRTOS v1.06
  *
- * See settings_store.h for the design. This module snapshots the runtime
+ * See gpsdo_settings_store.h for the design. This module snapshots the runtime
  * settings globals into a flat SettingsBlock_t and stores it as a REC_SETTINGS
  * slot in the flash ring. On boot, settings_recall() reads the newest such
  * slot, validates its version and per-field ranges, and applies the values.
@@ -13,15 +13,15 @@
  * module is pure serialisation.
  * ====================================================================== */
 
-#include "settings_store.h"
+#include "gpsdo_settings_store.h"
 #include "gpsdo_dac.h"
-#include "flash_ring.h"
+#include "gpsdo_flash_ring.h"
 #include "gpsdo_state.h"
 #include <stddef.h>   /* offsetof, for the v4 migration */
-#include "GPSDO_algorithms.h"
+#include "gpsdo_algorithms.h"
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
-#include "ubx_timtp.h"      /* g_qerr_enable (SAW master switch) */
+#include "gpsdo_ubx_timtp.h"      /* g_qerr_enable (SAW master switch) */
 #include <math.h>
 #include <string.h>
 
@@ -35,7 +35,7 @@ extern float g_altitude_offset;
 /* LT flag, defined in gpsdo_control.cpp; same local-extern pattern. */
 extern bool  g_show_local_time;
 
-/* LRN_DAMP_LO / LRN_DAMP_HI come from GPSDO_algorithms.h. */
+/* LRN_DAMP_LO / LRN_DAMP_HI come from gpsdo_algorithms.h. */
 
 /* ---- snapshot: runtime -> SettingsBlock_t ---- */
 

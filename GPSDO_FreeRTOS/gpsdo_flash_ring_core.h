@@ -1,5 +1,5 @@
 /* ======================================================================
- * flash_ring_core.h  —  hardware-INDEPENDENT ring-buffer logic
+ * gpsdo_flash_ring_core.h  —  hardware-INDEPENDENT ring-buffer logic
  *
  * Part of GPSDO FreeRTOS v1.06
  *
@@ -8,7 +8,7 @@
  * nothing about STM32 flash — it operates through three function pointers
  * (read / program / erase) supplied by the caller. The same code is unit-
  * tested on a PC with a RAM-backed "flash" and driven on-target by a thin
- * HAL layer (flash_ring.cpp), so the risky part (real flash writes) is a
+ * HAL layer (gpsdo_flash_ring.cpp), so the risky part (real flash writes) is a
  * small, isolated shim around logic that is already proven.
  *
  * Sector layout:

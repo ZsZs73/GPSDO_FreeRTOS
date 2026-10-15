@@ -26,11 +26,11 @@
 #include "gpsdo_health.h"
 #include "gpsdo_state.h"
 #include <limits.h>
-#include "GPSDO_algorithms.h"
-#include "flash_ring.h"
-#include "live_store.h"
-#include "settings_store.h"
-#include "ubx_timtp.h"
+#include "gpsdo_algorithms.h"
+#include "gpsdo_flash_ring.h"
+#include "gpsdo_live_store.h"
+#include "gpsdo_settings_store.h"
+#include "gpsdo_ubx_timtp.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1478,7 +1478,7 @@ static void dispatch(char *line)
     /* ---- PO <f> ---- Calibration offset in pascals, added to the BMP280's
      * raw reading before the /100 to hPa. Zero is legal — it means "show the
      * sensor's own pressure". Range matches the recall guard in
-     * settings_store.cpp so nothing accepted here is silently dropped on
+     * gpsdo_settings_store.cpp so nothing accepted here is silently dropped on
      * the next boot. */
     if (cli_ieq(verb, "PO")) {
         if (arg == NULL) {

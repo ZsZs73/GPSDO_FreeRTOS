@@ -1,5 +1,5 @@
 /* ======================================================================
- * live_store.h  —  live-data persistence (LRN + LC + PWM) over the ring
+ * gpsdo_live_store.h  —  live-data persistence (LRN + LC + PWM) over the ring
  *
  * Part of GPSDO FreeRTOS v1.06
  *

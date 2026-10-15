@@ -1,5 +1,5 @@
 /**
- * GPSDO_algorithms.h — Control loop algorithm declarations and tunable parameters
+ * gpsdo_algorithms.h — Control loop algorithm declarations and tunable parameters
  *
  * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
@@ -186,7 +186,7 @@ uint16_t nn_mlp_ctl_loop(uint16_t pwm, uint32_t ppscount);
  * unconditionally too.
  *
  * That mismatch made the firmware impossible to BUILD with GPSDO_LTIC off:
- * GPSDO_algorithms.cpp:1437 onwards and the ML/MLP/MG/MF handlers in
+ * gpsdo_algorithms.cpp:1437 onwards and the ML/MLP/MG/MF handlers in
  * gpsdo_cli.cpp all reference MLACC_LEVELS, mlacc_fit_t and the g_mlacc_*
  * globals, and every one of those declarations used to sit inside this block.
  * Nobody had hit it because every board of this design has the detector — the

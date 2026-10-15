@@ -9,7 +9,7 @@
  * lied: two captures carried the same compile stamp from two different builds.
  * Nobody had done anything wrong. __DATE__ is baked into whichever translation
  * unit mentions it — the sketch — and the Arduino builder does not recompile a
- * translation unit whose sources have not changed. Edit GPSDO_algorithms.cpp,
+ * translation unit whose sources have not changed. Edit gpsdo_algorithms.cpp,
  * upload, and the sketch's object file is reused with last week's timestamp
  * still inside it. The stamp is honest about when the SKETCH was compiled and
  * says nothing about the rest of the firmware.
@@ -55,7 +55,7 @@ uint32_t fw_image_bytes(void);
  *
  * IT HAS TO COME FROM THE SKETCH. __DATE__ and __TIME__ are baked into whichever
  * translation unit mentions them, and the sketch is the only one the builder is
- * forced to recompile (that is what build_id.h is for). Composing it there and
+ * forced to recompile (that is what gpsdo_build_id.h is for). Composing it there and
  * publishing it here gives the banner and the V command ONE string rather than
  * two that can drift apart - and lets the tuner ask for it on connect instead of
  * having to have caught the boot banner as it scrolled past. */

@@ -1,10 +1,10 @@
 /*
- * dac_ext.h — external SPI DAC on the control-voltage output: AD5680.
+ * gpsdo_dac_ext.h — external SPI DAC on the control-voltage output: AD5680.
  *
  * Part of GPSDO FreeRTOS v1.06
  *
  * IMPLEMENTED for the AD5680 (18-bit, external reference), bit-banged GPIO.
- * See dac_ext.cpp for the word format, clocking and the critical section.
+ * See gpsdo_dac_ext.cpp for the word format, clocking and the critical section.
  *
  * WHY THIS EXISTS RATHER THAN THE SIGMA-DELTA PATH
  * ------------------------------------------------

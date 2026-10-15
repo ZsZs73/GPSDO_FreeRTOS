@@ -25,8 +25,8 @@
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
-#include "ubx_timtp.h"
-#include "GPSDO_algorithms.h"   /* g_ltic (calibrated span) for the ADC outlier gate */
+#include "gpsdo_ubx_timtp.h"
+#include "gpsdo_algorithms.h"   /* g_ltic (calibrated span) for the ADC outlier gate */
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
@@ -52,7 +52,7 @@ static bool i2c_probe(uint8_t addr)
  *
  * NOT under GPSDO_LTIC, although only the LTIC loops read them. They are part
  * of the persisted settings block and the CLI prints and sets them
- * unconditionally, so with the detector compiled out settings_store.cpp and
+ * unconditionally, so with the detector compiled out gpsdo_settings_store.cpp and
  * gpsdo_cli.cpp still reference them and the LINK fails:
  *   undefined reference to `g_freq_damp_win_dpll'
  * from snapshot_full(), settings_recall(), settings_save_partial() and
@@ -2561,7 +2561,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
            * recovers it. The 15%..85% band is where the local slope stays
            * within about a third of its anchor value.
            *
-           * The loop's own guard (railed_now, GPSDO_algorithms.cpp) tests a
+           * The loop's own guard (railed_now, gpsdo_algorithms.cpp) tests a
            * hard-coded 3.28 V. On a detector saturating near 2.9 V that never
            * fires, so it is no help here and is worth a look in its own right. */
           double ns = 0.0;

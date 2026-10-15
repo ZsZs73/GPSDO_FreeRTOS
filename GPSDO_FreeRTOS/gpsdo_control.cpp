@@ -22,9 +22,9 @@
 #include "gpsdo_dac.h"
 #include "gpsdo_health.h"
 #include "gpsdo_state.h"
-#include "live_store.h"
-#include "settings_store.h"
-#include "GPSDO_algorithms.h"
+#include "gpsdo_live_store.h"
+#include "gpsdo_settings_store.h"
+#include "gpsdo_algorithms.h"
 #include <Arduino.h>
 #include <string.h>
 

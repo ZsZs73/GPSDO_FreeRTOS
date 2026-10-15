@@ -1,5 +1,5 @@
 /**
- * GPSDO_algorithms.cpp — Control loop algorithm implementations
+ * gpsdo_algorithms.cpp — Control loop algorithm implementations
  *
  * Part of GPSDO FreeRTOS v1.06
  * Author:   J. M. Niewiński
@@ -23,12 +23,12 @@
  * can be modified at runtime via CLI (KP/KI/KD/IL commands).
  */
 
-#include "GPSDO_algorithms.h"
+#include "gpsdo_algorithms.h"
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
 #include "gpsdo_dac.h"
-#include "ubx_timtp.h"
-#include "flash_ring.h"
+#include "gpsdo_ubx_timtp.h"
+#include "gpsdo_flash_ring.h"
 #include <string.h>
 #include <math.h>
 
@@ -152,7 +152,7 @@ float    g_lrn_damp     = 1.0f;          /* damping multiplier, 0.5..1.5      */
 
 #define LRN_TICK        30               /* seconds between learner updates    */
 #define LRN_DRIFT_MAX   400.0f           /* |feed-forward| clamp, LSB          */
-/* LRN_DAMP_LO / LRN_DAMP_HI live in GPSDO_algorithms.h (shared with
+/* LRN_DAMP_LO / LRN_DAMP_HI live in gpsdo_algorithms.h (shared with
  * live_store for clamping restored values). The floor was raised 0.30 → 0.45
  * when a too-hard floor was found to starve the loop of correction authority
  * on a wide HC74 detector (phase ran 11→−425 ns in 51 s at damp 0.30 and

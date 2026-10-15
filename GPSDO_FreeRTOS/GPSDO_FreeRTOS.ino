@@ -42,13 +42,13 @@
 #include "gpsdo_dac.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
-#include "GPSDO_algorithms.h"
+#include "gpsdo_algorithms.h"
 #include "gpsdo_build.h"
 /* Not used for anything except its own existence: including it is what
  * makes the Arduino builder recompile this file, so __DATE__ below is the
  * date of THIS build and not of whenever the sketch last changed. See
- * build_id.h — and the CRC in the banner, which cannot be stale either way. */
-#include "build_id.h"
+ * gpsdo_build_id.h — and the CRC in the banner, which cannot be stale either way. */
+#include "gpsdo_build_id.h"
 #include <Arduino.h>
 #include <Wire.h>
 /* EEPROM library removed in v0.96 — persistence via flash_ring (sector 7). */
@@ -76,9 +76,9 @@ extern void gpsdo_gps_init(void);
 /* declared in gpsdo_state.cpp */
 extern bool persist_check_on_boot(void);
 extern void persist_recall(void);
-#include "flash_ring.h"
-#include "live_store.h"
-#include "settings_store.h"
+#include "gpsdo_flash_ring.h"
+#include "gpsdo_live_store.h"
+#include "gpsdo_settings_store.h"
 
 /* declared in gpsdo_cli.cpp — single byte, safe to read without mutex */
 extern int16_t g_time_offset_min;
@@ -99,7 +99,7 @@ HardwareSerial Serial2(PA3, PA2);
 #endif
 
 #if defined(GPSDO_BLUETOOTH_PARALLEL)
-#include "TeeSerial.h"
+#include "gpsdo_tee_serial.h"
 /* g_tee mirrors USB Serial and the Bluetooth UART. The extern in the config
  * headers points here; both ports are begin()-run in setup() below. */
 TeeSerial g_tee(Serial, Serial2);

@@ -1,9 +1,9 @@
 /* ======================================================================
- * ubx_timtp.h — UBX-TIM-TP sawtooth (quantization-error) correction
+ * gpsdo_ubx_timtp.h — UBX-TIM-TP sawtooth (quantization-error) correction
  *
  * Part of GPSDO FreeRTOS v1.06
  *
- * See ubx_timtp.cpp for the full description. Passive UBX sniffer that
+ * See gpsdo_ubx_timtp.cpp for the full description. Passive UBX sniffer that
  * extracts qErr (quantization error) from UBX-TIM-TP and offers it as a
  * per-pulse correction to the TIC phase measurement. Works on LEA-6T,
  * LEA/NEO-M8T and ZED-F9T (qErr is I4 at payload offset 8, in ps, on all).
@@ -41,7 +41,7 @@
 extern "C" {
 #endif
 
-/* Published state (defined in ubx_timtp.cpp) */
+/* Published state (defined in gpsdo_ubx_timtp.cpp) */
 extern volatile bool     g_qerr_enable;   /* master enable (SAW command)    */
 extern volatile bool     g_qerr_valid;    /* fresh qErr available           */
 extern volatile float    g_qerr_ns;       /* latest qErr [ns]               */

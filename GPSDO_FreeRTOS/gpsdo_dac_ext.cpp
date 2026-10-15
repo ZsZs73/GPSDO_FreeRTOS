@@ -1,5 +1,5 @@
 /*
- * dac_ext.cpp — AD5680 external 18-bit DAC, bit-banged GPIO. No hardware SPI.
+ * gpsdo_dac_ext.cpp — AD5680 external 18-bit DAC, bit-banged GPIO. No hardware SPI.
  *
  * Part of GPSDO FreeRTOS v1.06
  *
@@ -28,7 +28,7 @@
  */
 #include <Arduino.h>
 #include "gpsdo_config.h"
-#include "dac_ext.h"
+#include "gpsdo_dac_ext.h"
 
 #if defined(GPSDO_DAC_EXT)
 

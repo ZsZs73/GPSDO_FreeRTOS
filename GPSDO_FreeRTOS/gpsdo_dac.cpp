@@ -10,7 +10,7 @@
 #include "gpsdo_health.h"
 
 #if defined(GPSDO_DAC_EXT)
-  #include "dac_ext.h"
+  #include "gpsdo_dac_ext.h"
 #endif
 #if defined(GPSDO_PWM_DITHER)
   #include "gpsdo_pwm24.h"

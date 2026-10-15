@@ -10,7 +10,7 @@
  *
  * Instantiates all global state structs and FreeRTOS synchronisation
  * primitives. Persistence (PWM, algorithm, TZ, PID, LTIC params, flags) is
- * handled by settings_store.cpp via the flash ring (sector 7, REC_SETTINGS).
+ * handled by gpsdo_settings_store.cpp via the flash ring (sector 7, REC_SETTINGS).
  * The persist_*() wrappers below are kept for the CLI (ES/ER/EE/CR commands)
  * so callers don't have to change — they delegate to the new flash-ring
  * backed settings_store API.
@@ -19,10 +19,10 @@
 #include "gpsdo_state.h"
 #include <limits.h>
 #include "gpsdo_tz.h"
-#include "ubx_timtp.h"
-#include "GPSDO_algorithms.h"
-#include "settings_store.h"
-#include "flash_ring.h"
+#include "gpsdo_ubx_timtp.h"
+#include "gpsdo_algorithms.h"
+#include "gpsdo_settings_store.h"
+#include "gpsdo_flash_ring.h"
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
@@ -60,7 +60,7 @@ bool        g_persist_valid = false;
 
 /* ---- persistence wrappers (delegating to the flash ring) ----------------
  * The CLI still calls persist_save/recall/erase/check_on_boot by those names
- * (commands ES/ER/EE/CR). Real persistence now lives in settings_store.cpp
+ * (commands ES/ER/EE/CR). Real persistence now lives in gpsdo_settings_store.cpp
  * via the flash ring (sector 7, REC_SETTINGS). These thin wrappers keep the
  * old call sites working without a sweep of every caller.
  *

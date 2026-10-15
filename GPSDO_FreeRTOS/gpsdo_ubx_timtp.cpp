@@ -1,5 +1,5 @@
 /* ======================================================================
- * ubx_timtp.cpp — UBX-TIM-TP sawtooth (quantization-error) correction
+ * gpsdo_ubx_timtp.cpp — UBX-TIM-TP sawtooth (quantization-error) correction
  *
  * Part of GPSDO FreeRTOS v1.06
  *
@@ -33,7 +33,7 @@
  * It never writes to the GPS except the one CFG-MSG that enables TIM-TP.
  * ====================================================================== */
 
-#include "ubx_timtp.h"
+#include "gpsdo_ubx_timtp.h"
 #include "gpsdo_state.h"
 #include <Arduino.h>
 

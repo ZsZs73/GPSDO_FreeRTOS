@@ -1,5 +1,5 @@
 /* ======================================================================
- * settings_store.h  —  persistent user settings via the flash ring
+ * gpsdo_settings_store.h  —  persistent user settings via the flash ring
  *
  * Part of GPSDO FreeRTOS v1.06
  *

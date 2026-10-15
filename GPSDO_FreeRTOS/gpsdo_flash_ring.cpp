@@ -1,12 +1,12 @@
 /* ======================================================================
- * flash_ring.cpp  —  STM32F411 HAL layer for the live-data + settings ring
+ * gpsdo_flash_ring.cpp  —  STM32F411 HAL layer for the live-data + settings ring
  *
  * Part of GPSDO FreeRTOS v1.06
  *
  * This is the ONLY part of the ring buffer that touches real flash. It
  * implements the three primitives the hardware-independent core needs
  * (read / program / erase) against sector 7 of the STM32F411CE, then
- * exposes the small public API declared in flash_ring.h.
+ * exposes the small public API declared in gpsdo_flash_ring.h.
  *
  * SAFETY
  * ------
@@ -22,8 +22,8 @@
  *    (hysteresis in live_store; ES is user-initiated).
  * ====================================================================== */
 
-#include "flash_ring.h"
-#include "flash_ring_core.h"
+#include "gpsdo_flash_ring.h"
+#include "gpsdo_flash_ring_core.h"
 
 #include "stm32f4xx_hal.h"
 #include <string.h>

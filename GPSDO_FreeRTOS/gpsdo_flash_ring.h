@@ -1,5 +1,5 @@
 /* ======================================================================
- * flash_ring.h  —  wear-levelled ring buffer for live + settings data
+ * gpsdo_flash_ring.h  —  wear-levelled ring buffer for live + settings data
  *
  * Part of GPSDO FreeRTOS v1.06
  *
@@ -36,12 +36,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Slot size — also defined in flash_ring_core.h, mirrored here for callers
+/* Slot size — also defined in gpsdo_flash_ring_core.h, mirrored here for callers
  * that want to size their payload buffers without including the core. */
 #define FR_PAYLOAD    504u   /* usable data bytes per slot (6-B slot hdr)*/
 #define FR_SLOT_SIZE  512u   /* total slot size (payload + header)        */
 
-/* Record type IDs — see flash_ring_core.h for the canonical definition. */
+/* Record type IDs — see gpsdo_flash_ring_core.h for the canonical definition. */
 #define REC_LIVE      0u
 #define REC_SETTINGS  1u
 /* Algorithm 13 (Kalman) parameters. Its own record rather than a field in the

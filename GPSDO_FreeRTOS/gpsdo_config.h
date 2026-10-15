@@ -219,7 +219,7 @@ extern "C" {
  * TM1637 and the 2 kHz generator are skipped at compile time when this is on.
  *
  * No hardware SPI is needed: the DAC is written once per second, so bit-banging
- * costs microseconds. See dac_ext.h for the pin proposal and the reasoning. */
+ * costs microseconds. See gpsdo_dac_ext.h for the pin proposal and the reasoning. */
  
 /* GPSDO_PWM_DITHER replaces the plain 16-bit PWM with a shorter PWM whose duty
  * is dithered from period to period, giving 24 bits after the filter. Idea from
@@ -425,10 +425,10 @@ extern "C" {
  * USB Serial (still available for low-level boot diagnostics regardless).
  * CLI_SERIAL and REPORT_SERIAL follow the same pattern in their .cpp files. */
 #if defined(GPSDO_BLUETOOTH_PARALLEL)
-  /* g_tee is a TeeSerial (defined in TeeSerial.h). We must NOT include that
-   * header here — this file is inside an extern "C" block and TeeSerial.h pulls
+  /* g_tee is a TeeSerial (defined in gpsdo_tee_serial.h). We must NOT include that
+   * header here — this file is inside an extern "C" block and gpsdo_tee_serial.h pulls
    * in Arduino.h with C++ templates, which are illegal under C linkage. Each
-   * .cpp that uses OUT_SERIAL includes TeeSerial.h itself, outside extern "C". */
+   * .cpp that uses OUT_SERIAL includes gpsdo_tee_serial.h itself, outside extern "C". */
   #define OUT_SERIAL g_tee
 #elif defined(GPSDO_BLUETOOTH)
   #define OUT_SERIAL Serial2
@@ -615,11 +615,11 @@ extern "C" {
 #endif
 
 /* g_tee declaration for parallel USB+Bluetooth. This sits AFTER the extern "C"
- * block above, because TeeSerial.h pulls in Arduino.h (C++ templates), which is
+ * block above, because gpsdo_tee_serial.h pulls in Arduino.h (C++ templates), which is
  * illegal under C linkage. Every .cpp includes this config header, so declaring
  * g_tee here makes the OUT_SERIAL macro resolve everywhere without touching each
  * file. The single definition lives in the .ino. */
 #if defined(__cplusplus) && defined(GPSDO_BLUETOOTH_PARALLEL)
-  #include "TeeSerial.h"
+  #include "gpsdo_tee_serial.h"
   extern TeeSerial g_tee;
 #endif

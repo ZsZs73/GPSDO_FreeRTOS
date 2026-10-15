@@ -9,7 +9,7 @@
  */
 
 #include "gpsdo_tz.h"
-#include "tz_table.h"
+#include "gpsdo_tz_table.h"
 #include "gpsdo_config.h"
 #include <string.h>
 #include <stdlib.h>

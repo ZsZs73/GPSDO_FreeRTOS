@@ -1,5 +1,5 @@
 /*
- * build_id.h — one number, bumped on every change, whose only job is to make
+ * gpsdo_build_id.h — one number, bumped on every change, whose only job is to make
  * the Arduino builder recompile the sketch.
  *
  * Part of GPSDO FreeRTOS v1.06
@@ -9,7 +9,7 @@
  * __DATE__ and __TIME__ are baked into the translation unit that mentions them,
  * and that is GPSDO_FreeRTOS.ino. The Arduino builder tracks dependencies
  * properly and skips any translation unit whose sources have not changed — so
- * editing GPSDO_algorithms.cpp and uploading leaves the sketch's object file
+ * editing gpsdo_algorithms.cpp and uploading leaves the sketch's object file
  * untouched, with the timestamp from whenever the sketch itself last changed.
  * The banner then reports a compile that is genuinely older than the binary. On
  * 26.08 that cost an hour: two captures from two different builds carried the
