@@ -48,6 +48,12 @@ void health_note_output(uint16_t pwm);
  * that follows is a deliberate jump rather than a correction. */
 void health_reset(void);
 
+/* The running algorithm's own lock verdict: 10 LOCK state, 11 g_lars_locked,
+ * 12 and 13 their published flags; false for 0-9, which have no lock concept.
+ * The statistics gate on it (with a calibration check on top), and the span
+ * module uses it to decide whether a code is a null worth remembering. */
+bool health_loop_locked(void);
+
 typedef struct {
     bool     have_k;        /* false until CT has measured the VCO slope   */
     double   k_hz_per_lsb;  /* 0 if unknown                                */

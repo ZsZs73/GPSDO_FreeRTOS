@@ -43,7 +43,27 @@
  *
  * Algorithms 0-9 have no lock concept, so they are excluded entirely rather than
  * counted with a meaning nobody could interpret; CS says so instead of quietly
- * reporting a number about nothing. */
+ * reporting a number about nothing.
+ *
+ * ALGORITHMS 12 AND 13 WERE EXCLUDED TOO, and that was a plain omission rather
+ * than a decision. They fell through the `default:` below with 0-9, so on the
+ * two newest loops — the two most likely to be running on a board whose owner
+ * cares about this number — the statistics never counted a single correction,
+ * and CS explained the blank by saying the board was "running an algorithm
+ * below 10". Both of them can say whether they are locked; until now neither
+ * was asked. See mlacc_locked() / kf_locked() in gpsdo_algorithms.h. */
+bool health_loop_locked(void)
+{
+    switch (gCtrl.active_algo) {
+        case 10: return (g_ltic.state == LTIC_LOCK);
+        case 11: return g_lars_locked;
+        case 12: return mlacc_locked();
+        case 13: return kf_locked();
+        default: break;             /* algorithms 0-9: no lock state to gate on */
+    }
+    return false;
+}
+
 static bool counting_now(void)
 {
     /* setup() writes the DAC three times — the initial 127, the recalled PWM and
@@ -59,12 +79,7 @@ static bool counting_now(void)
     EventBits_t ev = xEventGroupGetBits(xSysEvents);
     if (ev & (EVT_NEED_CALIBRATION | EVT_NEED_LTIC_CAL)) return false;
 
-    switch (gCtrl.active_algo) {
-        case 10: return (g_ltic.state == LTIC_LOCK);
-        case 11: return g_lars_locked;
-        default: break;             /* algorithms 0-9: no lock state to gate on */
-    }
-    return false;
+    return health_loop_locked();
 }
 
 static uint16_t s_prev;

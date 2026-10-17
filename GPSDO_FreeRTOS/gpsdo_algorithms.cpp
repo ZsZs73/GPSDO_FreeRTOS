@@ -354,6 +354,37 @@ double g_blend_crossover = 0.024;   /* Hz — sigmoid centre */
 double g_blend_scale     = 0.012;   /* Hz — sigmoid width  */
 double g_nn_max_step     = 175.0;   /* LSB — max PWM delta  */
 
+/* The coefficient set CT derives from K, exactly as it always has — moved here
+ * from do_calibrate_tune() so that the span jumper (gpsdo_span.cpp), which has
+ * to produce the same set from a STORED K, calls the same lines rather than a
+ * copy of them. The formulas are the ones documented above.
+ *
+ * Ki and Kd of the PLL algorithms (4, 5, 7) are fixed and do NOT follow K. That
+ * is CT's long-standing choice for those three, not something decided here: a
+ * span move gives exactly what CT in that span would give, no more. */
+void algo_coeffs_from_k(double K)
+{
+    if (!(K > 0.0)) return;
+    double kp_pll = 0.40 / K;
+    double kp_fll = 0.35 / K;
+
+    /* PLL algorithms 4, 5, 7 — Kp on frequency, gentle fixed phase terms */
+    for (int n = 4; n <= 7; n++) {
+        if (n == 6) continue;                 /* 6 is FLL, handled below */
+        g_pid[n].Kp = kp_pll;
+        g_pid[n].Ki = 0.02;
+        g_pid[n].Kd = 2.0;
+    }
+    /* FLL algorithms 3 and 6 — classic frequency-domain PID */
+    for (int n = 3; n <= 6; n += 3) {
+        g_pid[n].Kp = kp_fll;
+        g_pid[n].Ki = kp_fll / 300.0;
+        g_pid[n].Kd = kp_fll * 73.0;
+    }
+    /* NN output step */
+    g_nn_max_step = 0.05 / K;
+}
+
 /* Algorithm 10 (LTIC three-stage PLL) defaults. Calibration fields start at 0
  * (uncalibrated) — the loop must not run until they are set on real hardware.
  * The PID/threshold defaults are plausible starting points to be tuned once
@@ -2180,6 +2211,64 @@ static bool     s_mla_prev_valid;
 static int32_t  s_mla_last_slope;
 static int32_t  s_mla_last_phase;
 
+/* ONE LOCK VERDICT, DECIDED WHERE THE ALGORITHM DECIDES IT.
+ *
+ * Algorithms 10 and 11 have published a live lock state for a long time
+ * (g_ltic.state, g_lars_locked) and everything that needed to know asked them.
+ * 12 and 13 published nothing, so every consumer invented its own test: the
+ * display read the trend string, and the correction statistics in
+ * gpsdo_health.cpp could not read anything at all and simply excluded both
+ * algorithms through a `default:` — while CS told the user the reason was
+ * "running an algorithm below 10", which for 12 and 13 is not true. Two of the
+ * board's own quality numbers were therefore blank on the two newest loops,
+ * with a false explanation printed underneath.
+ *
+ * These two flags are that missing statement. They are set at the one place in
+ * each algorithm where the loop actually knows, and read by anyone who asks. */
+static bool     s_mla_locked;   /* algorithm 12 */
+static bool     s_kf_locked;    /* algorithm 13 */
+
+/* Plain reads of a bool written by the control task. Both consumers are asking
+ * "is the loop settled right now", a question whose answer is already one
+ * second old by the time anything draws it, so a torn read is not a failure
+ * mode that exists here: there is nothing to tear. Carrying the flags through
+ * the CtrlData_t snapshot instead would have meant a second copy that could
+ * disagree with this one, which is the fault being repaired rather than a fix
+ * for it.
+ *
+ * DELIBERATELY OUTSIDE #ifdef GPSDO_LTIC, unlike the algorithms that write
+ * them. Both callers are compiled on every board — gpsdo_health.cpp switches on
+ * a runtime algorithm number and the display asks per second — so guarding
+ * these would mean guarding the call sites too, in two files, to say something
+ * the flags already say: on a board with no phase detector neither algorithm
+ * can run (LA 12 and LA 13 refuse at the CLI, and the dispatcher falls through
+ * to algorithm 0), so neither flag is ever set and both read false. */
+bool mlacc_locked(void) { return s_mla_locked; }
+bool kf_locked(void)    { return s_kf_locked; }
+
+/* Every loop clears its own state on its next call (see s_algo_restart), and
+ * no loop inherits another's lock verdict. The verdicts are read by
+ * health_note_output() on every DAC write, including the writes that happen
+ * between the restart and the incoming algorithm's first run — so a flag left
+ * true by a loop that is no longer running, or that is about to start over in
+ * different units, would put those writes into the statistics under a verdict
+ * nobody has earned.
+ *
+ * Called by the dispatcher on an algorithm change — the one place every change
+ * goes through, the CLI and a settings recall at boot included — by a move of
+ * the span jumper, which changes the units of every integrator at once, and by
+ * CT and C, which put a new code on the pin behind every loop's back. */
+void algo_request_restart(void)
+{
+    s_algo_restart = true;
+    s_mla_locked   = false;
+    s_kf_locked    = false;
+    /* Algorithm 11 also clears its own on its next call; clearing it here as
+     * well closes the gap between this call and that one, which is the gap
+     * the note above is about. */
+    g_lars_locked  = false;
+}
+
 /* Scale from phase error to DAC counts. Zero means derive it from the CT
  * calibration, which is what algorithm 11 does and what most users want. */
 float   g_mlacc_gain = 0.0f;
@@ -2431,7 +2520,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
 
     FreqSnapshot_t s;
     take_freq_snapshot(&s);
-    if (!s.have10) { s_mla_quiet = 0; set_trend("WAIT"); return pwm; }
+    if (!s.have10) { s_mla_quiet = 0; s_mla_locked = false; set_trend("WAIT"); return pwm; }
 
     /* Same refusal as algo 10/11: never steer on a guessed EFC polarity. */
     if (g_ltic.polarity == 0) {
@@ -2441,7 +2530,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
             OUT_SERIAL.println("LTIC: polarity unset - run 'LPOL -1' (or +1) then 'ES'. Holding.");
             s_pol_warned = true;
         }
-        s_mla_quiet = 0; set_trend("NoPL"); return pwm;
+        s_mla_quiet = 0; s_mla_locked = false; set_trend("NoPL"); return pwm;
     }
 
     /* INPUT: phase in nanoseconds, from the LTIC detector.
@@ -2744,6 +2833,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
                 s_mla_slew_lsb  = 0;
                 mlacc_reset();
                 s_mla_quiet = 0;
+                s_mla_locked = false;   /* the loop just said it is stalled */
                 set_trend("STAL");
                 s_mla_prev_valid = false;
                 return pwm;
@@ -2818,6 +2908,13 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
                 s_mla_slew_lsb = 0;
                 s_mla_zc_hits++;
                 mlacc_reset();
+                /* The jump itself is a COMMAND, not a correction: it cancels a
+                 * slew this algorithm applied deliberately. It must not enter
+                 * the correction statistics, so the verdict drops for exactly
+                 * the one second it takes. (The display keeps counting ZC as
+                 * locked — a character blinking white once per crossing is a
+                 * different trade from a number being wrong.) */
+                s_mla_locked = false;
                 set_trend("ZC  ");
                 return clamp_pwm((int32_t)pwm + dz);
             }
@@ -3042,6 +3139,10 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
         bool freq_good = s.have100 ? (f_meas < 0.05 && f_meas > -0.05)
                                    : (f_meas < 0.5  && f_meas > -0.5);
         s_mla_quiet++;
+        /* THE one place algorithm 12 decides. Everything else either inherits
+         * this (a CORR second is a correction made BY a settled loop and is
+         * exactly what the statistics measure) or clears it explicitly. */
+        s_mla_locked = (s_mla_quiet > 16u && freq_good);
         set_trend((s_mla_quiet > 16u && freq_good) ? "LOCK" : "ACQ ");
         return pwm;
     }
@@ -3102,6 +3203,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
     } else {
         double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
         if (lsb_per_hz <= 0.0) {
+            s_mla_locked = false;
             set_trend("NoCT");
             return pwm;
         }
@@ -3810,6 +3912,7 @@ static void kf_reset(const kf_scale_t *k)
     s_kf_last_S     = 0.0;
     s_kf_ph_hist_n  = 0;
     s_kf_ph_hist_i  = 0;
+    s_kf_locked     = false;   /* a filter that has just been reset knows nothing */
     s_kf_holdover   = 0;
     s_kf_rej_run    = 0;
     s_kf_frej_run   = 0;
@@ -3900,17 +4003,19 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
             OUT_SERIAL.println("LTIC: polarity unset - run 'LPOL -1' (or +1) then 'ES'. Holding.");
             s_warned_pol = true;
         }
+        s_kf_locked = false;
         set_trend("NoPL");
         return pwm;
     }
     if (g_ltic.ns_per_volt == 0.0f || g_ltic.range_ns == 0.0f) {
+        s_kf_locked = false;
         set_trend(0);
         return pwm;
     }
     /* Scale, from CT. lsb_per_ns is the counts that null one nanosecond of
      * phase in one second, so its reciprocal is the ns/s one count buys. */
     double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
-    if (lsb_per_hz <= 0.0) { set_trend("NoCT"); return pwm; }
+    if (lsb_per_hz <= 0.0) { s_kf_locked = false; set_trend("NoCT"); return pwm; }
     double lsb_per_ns = lsb_per_hz / 100.0;
 
     /* Everything below that is not a state comes from here — CT and LC, once a
@@ -3957,7 +4062,7 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
      * detector, and this measurement does not come through it. */
     FreqSnapshot_t s;
     take_freq_snapshot(&s);
-    if (!s.have10) { set_trend("WAIT"); return pwm; }
+    if (!s.have10) { s_kf_locked = false; set_trend("WAIT"); return pwm; }
     {
         /* The one-second counter's own scatter, which is what the gated average
          * is built from. Measured here rather than assumed: the quantisation of
@@ -4979,6 +5084,55 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
         }
     }
 
+    /* ---- IS THE LOOP LOCKED? ----------------------------------------------
+     *
+     * Algorithm 13 is the only loop here that can say this properly, and until
+     * now it did not say it at all. It emits no "LOCK" trend — its whole
+     * vocabulary is KAL/REJ/NOPH/ARM/WAIT/NoCT/NoPL — so every consumer that
+     * tested the trend string for "LOCK" got false forever, and the display
+     * fell back to judging a Kalman loop by a ten-thousand-second frequency
+     * average, which is precisely what that fallback exists to avoid.
+     *
+     * Three terms, and each one is doing work:
+     *
+     *   s_kf_holdover == 0   THE DETECTOR SPOKE THIS SECOND. Set to zero on
+     *   every usable reading, including a rejected one — a REJ is the gate
+     *   doing its job, not the loop losing its input. Without this term a
+     *   filter flywheeling perfectly on its own model would read as locked
+     *   indefinitely, which is the difference between steering and coasting.
+     *
+     *   |x0| <= band         THE ESTIMATED PHASE IS INSIDE THE BAND. The
+     *   ESTIMATE, not this second's reading: that is the whole point of having
+     *   a filter. A loop pulling in from 400 ns says KAL every second while it
+     *   does so, so the trend alone would have called it locked from the first
+     *   accepted sample.
+     *
+     *   sqrt(P[0][0]) <= band  AND IT KNOWS THAT. A phase estimate is worth
+     *   what its variance says it is worth. This term is what makes the verdict
+     *   honest at the two moments it matters most and costs nothing at any
+     *   other: at a cold start P[0][0] is seeded at (range/2)^2, and after a
+     *   picDIV arm it is deliberately reset to the same value because the zero
+     *   the estimate referred to no longer exists. In both cases the filter is
+     *   not locked and would otherwise have claimed to be within one second of
+     *   the first reading that landed inside the band by luck.
+     *
+     * The band is g_ltic.acq_threshold_ns, which LC measures — the same
+     * threshold this algorithm already uses for s_kf_ctl_fast, for the tracking
+     * test and for the arm patience gate. Nothing is invented here and nothing
+     * is fixed at build time; on a board whose detector resolves better, LC
+     * returns a smaller number and this verdict tightens with it.
+     *
+     * No dwell, deliberately. The status bar applies its own (five samples up,
+     * two down) and the digits live without one on every other algorithm; a
+     * second copy here would have made the bar's dwell mean something different
+     * on 13 than on 10, 11 and 12. */
+    {
+        double band = (double)g_ltic.acq_threshold_ns;
+        double sig  = sqrt(s_kf_P[0][0] > 0.0 ? s_kf_P[0][0] : 0.0);
+        s_kf_locked = (band > 0.0) && (s_kf_holdover == 0u) &&
+                      (fabs(s_kf_x0) <= band) && (sig <= band);
+    }
+
     /* ---- IS THE DETECTOR ACTUALLY THERE? ----------------------------------
      *
      * Two ways it can fail, and the first version of this handled only the
@@ -5204,6 +5358,11 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
             s_kf_P[0][2] = s_kf_P[2][0] = 0.0;
             s_kf_ph_hist_n = 0; s_kf_ph_hist_i = 0;  /* new zero: differences
                                                       * across an arm are garbage */
+            /* An arm moves the reference, so whatever was decided above this
+             * second described a zero that no longer exists. The widened
+             * P[0][0] would clear the verdict on the NEXT second anyway; saying
+             * it here means the second of the arm itself is never counted. */
+            s_kf_locked = false;
             set_trend("ARM ");
             return pwm;
         }
@@ -5348,8 +5507,12 @@ uint16_t adjustVctlPWM(uint16_t prev_pwm, uint32_t ppscount, uint8_t algo_no)
     {
         static uint8_t s_prev_algo = 0xFF;
         if (algo_no != s_prev_algo) {
-            s_prev_algo    = algo_no;
-            s_algo_restart = true;
+            s_prev_algo = algo_no;
+            /* Restart flag AND the lock verdicts, together — see the note at
+             * algo_request_restart(). Here rather than in each algorithm's
+             * restart path because this is the one place every change goes
+             * through, the CLI and a settings recall at boot included. */
+            algo_request_restart();
         }
     }
 
@@ -5991,6 +6154,9 @@ static inline double nn_tanh(double x) { return tanh(x); }
 /* Learned oscillator tempco [LSB/°C] — from the PWM↔temperature regressor
  * below; 0 until enough variance is seen. Exposed for telemetry. */
 float g_nn_tempco = 0.0f;
+/* |tempco| clamp [LSB/degC]. File scope because algo_rescale_lsb() has to
+ * honour the same bound when a span move rescales the learned value. */
+#define NN_TCO_MAX  60.0
 
 /* ACQ centring drive (algo 10), tunable live with `ACG <gain> [cap]`.
  * gain: LSB of PWM per volt of centring error. cap: max step per update.
@@ -6072,7 +6238,7 @@ uint16_t nn_mlp_ctl_loop(uint16_t pwm, uint32_t ppscount)
     const double MAX_STEP  = g_nn_max_step;  /* LSB — output de-normalisation */
     const double I_LIMIT   = g_pid[9].I_LIMIT; /* anti-windup = normalisation bound */
     const double REG_ALPHA = 10.0 / 14400.0;  /* regressor EMA horizon ~4 h */
-    const double TCO_MAX   = 60.0;            /* |tempco| clamp [LSB/°C]    */
+    const double TCO_MAX   = NN_TCO_MAX;      /* |tempco| clamp [LSB/°C]    */
 
     const uint32_t PERIOD = 10;
 
@@ -6214,4 +6380,34 @@ int16_t nn_thermal_holdover_step(void)
     int16_t out = (int16_t)s_ho_frac;         /* emit whole LSBs only    */
     s_ho_frac  -= (double)out;
     return out;
+}
+
+/* ======================================================================
+ * algo_rescale_lsb — learned LSB-denominated state across a span move
+ *
+ * r = K_old / K_new: the same physical correction is r times as many codes in
+ * the new span. Two things are learned in codes and survive a loop restart, so
+ * a restart alone would carry them across in the wrong units:
+ *
+ *   g_lrn_drift  the LRN feed-forward (clamped to the same LRN_DRIFT_MAX the
+ *                learner itself honours)
+ *   g_nn_tempco  algorithm 9's PWM-against-temperature slope (NN_TCO_MAX)
+ *
+ * Everything else a loop keeps in codes — integrators, filter memories, the
+ * Kalman state — is cleared by the restart and rebuilt from the live code, and
+ * every gain derived from K is read from g_pid[7] at run time or recomputed by
+ * algo_coeffs_from_k() / ltic_autotune(). The I_LIMIT clamps are bounds, not
+ * state, and CT has never scaled them either.
+ * ====================================================================== */
+void algo_rescale_lsb(double r)
+{
+    if (!(r > 0.0) || !isfinite(r)) return;
+    double d = (double)g_lrn_drift * r;
+    if (d >  (double)LRN_DRIFT_MAX) d =  (double)LRN_DRIFT_MAX;
+    if (d < -(double)LRN_DRIFT_MAX) d = -(double)LRN_DRIFT_MAX;
+    g_lrn_drift = (float)d;
+    double t = (double)g_nn_tempco * r;
+    if (t >  NN_TCO_MAX) t =  NN_TCO_MAX;
+    if (t < -NN_TCO_MAX) t = -NN_TCO_MAX;
+    g_nn_tempco = (float)t;
 }

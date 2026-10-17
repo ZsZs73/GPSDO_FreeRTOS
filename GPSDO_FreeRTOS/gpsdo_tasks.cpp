@@ -1784,6 +1784,115 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   }
 
   /* Per-second update — called from vDisplayTask main loop */
+  /* IS THE LOOP ACTUALLY LOCKED?
+   *
+   * One verdict, two consumers: the colour of the frequency digits and the
+   * status bar below them. It used to live inline in the digits and the bar
+   * did not consult it at all, which is how a board thirty seconds into
+   * acquisition came to display "DISCIPLINED FIX OK" on lock green. Extracted
+   * so the two cannot disagree — green here means green there, by
+   * construction rather than by both being written the same way twice.
+   *
+   * Green must mean a TRUSTWORTHY, CURRENT lock — not the echo of a long
+   * averaging window (a 1000 s average keeps showing ~10 MHz for minutes after
+   * discipline is lost, e.g. when LTIC drops to ACQ). */
+  static bool tft_loop_locked(const FreqSnap_t *f, const CtrlData_t *c)
+  {
+      bool locked = false;
+      if (c->active_algo == 10 || c->active_algo == 11 ||
+          c->active_algo == 12) {
+          /* All three loops publish an authoritative live state and use the
+           * same trend vocabulary, so green comes ONLY from the trend — no
+           * long-average fallback.
+           *
+           * ALGORITHM 12 WAS MISSING FROM THIS LIST and fell through to the
+           * frequency-average branch below, which is exactly what the comment
+           * above says green must not be. Measured over the 20.08 16:04 run,
+           * 2.99 h: the loop and the colour disagreed for 15.0% of the
+           * samples, and every one of those was the loop LOCKED with the
+           * digits WHITE. Two causes, both structural rather than marginal:
+           *
+           *   For the first 17 minutes neither the 10 000 s nor the 1000 s
+           *   average exists, so `locked` below is false by construction. The
+           *   loop reached LOCK at 219 s and the digits stayed white until
+           *   1041 s — thirteen and a half minutes of a disciplined oscillator
+           *   looking undisciplined. 48% of the disagreement.
+           *
+           *   The rest is the stale-echo guard, fixed separately below.
+           *
+           * CORR and ZC count as locked. They are one-second states that mean
+           * the loop is DOING ITS JOB — this algorithm corrects on a schedule
+           * as a form of self-test, which is the same reasoning that keeps them
+           * from resetting s_mla_quiet in the loop itself. Without this the
+           * digits would blink white once per correction: 16 times in the three
+           * hours measured. */
+          locked = (strncmp(c->trendstr,"LOCK",4) == 0);
+          if (!locked && c->active_algo == 12)
+              locked = (strncmp(c->trendstr,"CORR",4) == 0) ||
+                       (strncmp(c->trendstr,"ZC",2)   == 0);
+#ifdef GPSDO_LTIC
+      } else if (c->active_algo == 13) {
+          /* ALGORITHM 13 WAS MISSING FROM THE LIST ABOVE — the same omission
+           * as algorithm 12's, one algorithm later, and worse here because the
+           * trend test could never have matched even if 13 had been listed:
+           * the Kalman loop does not emit "LOCK". Its whole vocabulary is
+           * KAL / REJ / NOPH / ARM / WAIT / NoCT / NoPL.
+           *
+           * So 13 fell through to the frequency-average branch below, which is
+           * written for loops that have no lock state and is precisely what the
+           * comment above says green must not come from. Consequences, both
+           * structural rather than marginal: for the first seventeen minutes
+           * neither long average exists, so `locked` is false by construction
+           * and a filter that reached the band in three minutes showed
+           * ACQUIRING and white digits for fourteen more; and after that the
+           * verdict was a statement about the COUNTER while the loop's own
+           * estimate of phase and of its own uncertainty — the two things only
+           * this algorithm has — went unread.
+           *
+           * The verdict now comes from the filter, computed where the filter
+           * knows it. See the derivation at the "IS THE LOOP LOCKED?" block in
+           * gpsdo_algorithms.cpp: detector fed this second, estimated phase
+           * inside the LC-measured band, and a covariance small enough for that
+           * estimate to mean anything. */
+          locked = kf_locked();
+#endif
+      } else {
+          /* algos 0-9: no live lock flag exists ("hit" is rare), so the
+           * long-window criterion stays, but it must be BACKED by the fast
+           * 10 s average still sitting near 10 MHz — losing discipline now
+           * kills the green in ~10 s, not minutes. */
+          if      (f->full10000) { double e = f->avg10000 - 10000000.0;
+                                   locked = (e > -0.001 && e < 0.001); }
+          else if (f->full1000)  { double e = f->avg1000  - 10000000.0;
+                                   locked = (e > -0.010 && e < 0.010); }
+          if (locked && f->full10) {
+              /* ONE FULL COUNT, not half of one.
+               *
+               * The 10 s average is a cycle count over ten seconds, so its
+               * granularity is 0.1 Hz and it can only ever read a multiple of
+               * that. Measured over the 20.08 16:04 run it took exactly three
+               * values — -100, 0 and +100 mHz — and nothing between. A
+               * threshold of 50 mHz is therefore HALF A COUNT: it does not mean
+               * "within 50 mHz", it means "the counter must read exactly
+               * 10 000 000", and a single count either way killed the green.
+               * That happened on 8.3% of settled samples and accounted for 46%
+               * of the colour disagreeing with the loop.
+               *
+               * 0.15 Hz is one count plus half a count of margin: a one-count
+               * wobble passes, and a genuine loss of discipline — which is many
+               * counts, and is what this guard exists to catch — still fails
+               * it. The alternative, testing avg100 against 50 mHz, is
+               * meaningful on ITS grid (10 mHz, and it never left +/-50 mHz in
+               * three hours) but responds in 100 s where the point of this
+               * guard was to kill the green in about ten. */
+              double e10 = f->avg10 - 10000000.0;
+              if (e10 < -0.150 || e10 > 0.150) locked = false;  /* stale echo */
+          }
+          if (strncmp(c->trendstr,"hit",3) == 0) locked = true;
+      }
+      return locked;
+  }
+
   static void tft_update(const GpsData_t *g, const FreqSnap_t *f,
                          const CtrlData_t *c, const Uptime_t *u,
                          bool aht_ok, bool bmp_ok, bool bme_ok,
@@ -1932,78 +2041,11 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
               }
               fcol = TFT_COL_HOLD;
           } else {
-          /* Green must mean a TRUSTWORTHY, CURRENT lock — not the echo of a
-           * long averaging window (a 1000-s average keeps showing ~10 MHz for
-           * minutes after discipline is lost, e.g. when LTIC drops to ACQ).
-           *  - algo 10 (LTIC): the loop has an authoritative live state, so
-           *    green comes ONLY from trend "LOCK"; no average fallback.
-           *  - algos 0-9: no live lock flag exists ("hit" is rare), so the
-           *    long-window criterion stays, but it must be BACKED by the
-           *    fast 10-s average still sitting near 10 MHz (±50 mHz) —
-           *    losing discipline now kills the green in ~10 s, not minutes. */
-          if (c->active_algo == 10 || c->active_algo == 11 ||
-              c->active_algo == 12) {
-              /* All three loops publish an authoritative live state and use the
-               * same trend vocabulary, so green comes ONLY from the trend — no
-               * long-average fallback.
-               *
-               * ALGORITHM 12 WAS MISSING FROM THIS LIST and fell through to the
-               * frequency-average branch below, which is exactly what the
-               * comment above says green must not be. Measured over the 20.08
-               * 16:04 run, 2.99 h: the loop and the colour disagreed for 15.0%
-               * of the samples, and every one of those was the loop LOCKED with
-               * the digits WHITE. Two causes, both structural rather than
-               * marginal:
-               *
-               *   For the first 17 minutes neither the 10 000 s nor the 1000 s
-               *   average exists, so `locked` below is false by construction.
-               *   The loop reached LOCK at 219 s and the digits stayed white
-               *   until 1041 s — thirteen and a half minutes of a disciplined
-               *   oscillator looking undisciplined. 48% of the disagreement.
-               *
-               *   The rest is the stale-echo guard, fixed separately below.
-               *
-               * CORR and ZC count as locked. They are one-second states that
-               * mean the loop is DOING ITS JOB — this algorithm corrects on a
-               * schedule as a form of self-test, which is the same reasoning
-               * that keeps them from resetting s_mla_quiet in the loop itself.
-               * Without this the digits would blink white once per correction:
-               * 16 times in the three hours measured. */
-              locked = (strncmp(c->trendstr,"LOCK",4) == 0);
-              if (!locked && c->active_algo == 12)
-                  locked = (strncmp(c->trendstr,"CORR",4) == 0) ||
-                           (strncmp(c->trendstr,"ZC",2)   == 0);
-          } else {
-              if      (f->full10000) { double e = f->avg10000 - 10000000.0;
-                                       locked = (e > -0.001 && e < 0.001); }
-              else if (f->full1000)  { double e = f->avg1000  - 10000000.0;
-                                       locked = (e > -0.010 && e < 0.010); }
-              if (locked && f->full10) {
-                  /* ONE FULL COUNT, not half of one.
-                   *
-                   * The 10 s average is a cycle count over ten seconds, so its
-                   * granularity is 0.1 Hz and it can only ever read a multiple
-                   * of that. Measured over the 20.08 16:04 run it took exactly
-                   * three values — -100, 0 and +100 mHz — and nothing between.
-                   * A threshold of 50 mHz is therefore HALF A COUNT: it does
-                   * not mean "within 50 mHz", it means "the counter must read
-                   * exactly 10 000 000", and a single count either way killed
-                   * the green. That happened on 8.3% of settled samples and
-                   * accounted for 46% of the colour disagreeing with the loop.
-                   *
-                   * 0.15 Hz is one count plus half a count of margin: a
-                   * one-count wobble passes, and a genuine loss of discipline —
-                   * which is many counts, and is what this guard exists to
-                   * catch — still fails it. The alternative, testing avg100
-                   * against 50 mHz, is meaningful on ITS grid (10 mHz, and it
-                   * never left ±50 mHz in three hours) but responds in 100 s
-                   * where the point of this guard was to kill the green in
-                   * about ten. */
-                  double e10 = f->avg10 - 10000000.0;
-                  if (e10 < -0.150 || e10 > 0.150) locked = false;  /* stale echo */
-              }
-              if (strncmp(c->trendstr,"hit",3) == 0) locked = true;
-          }
+          /* The verdict lives in tft_loop_locked() now, because the status bar
+           * needs exactly the same one and the two used to disagree. This else
+           * branch continues to the `#undef FW` below — it carries the whole
+           * not-busy path, not just this line. */
+          locked = tft_loop_locked(f, c);
 
           if      (c->holdover_mode) fcol = TFT_COL_HOLD;
           else if (locked)           fcol = TFT_COL_LOCK;
@@ -2875,12 +2917,70 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 
       /* ---- status bar (full redraw only on state change) ---- */
       {
-          /* states: 0=no fix, 1=disciplined, 2=manual HO, 3=auto HO */
+          /* WHAT THIS BAR IS ALLOWED TO CLAIM.
+           *
+           * It used to read: a position fix present and not in holdover
+           * therefore "DISCIPLINED  FIX OK", in lock green. That is a
+           * statement about the GPS receiver wearing the colours of a
+           * statement about the loop. A board warming up, a board running CT
+           * with its output being deliberately swept, and a board thirty
+           * seconds into acquisition with microseconds of phase error all
+           * showed the same green bar as one that had been inside a
+           * nanosecond for an hour. The single most prominent thing on the
+           * screen was the one thing that could not be wrong, and was.
+           *
+           * It now asks tft_loop_locked() — the same verdict that colours the
+           * frequency digits directly above it, with thresholds that were
+           * measured rather than guessed. The band and the digits therefore
+           * cannot disagree: green here means green there, by construction.
+           *
+           * BAD NEWS TRAVELS FASTER THAN GOOD, BUT NEITHER TRAVELS INSTANTLY.
+           * That verdict is a one-second thing and it can flicker: the
+           * stale-echo guard sits on a 0.1 Hz grid, so a single count of
+           * wobble drops it for one sample. The digits live with that because
+           * a character changing colour is cheap; repainting the whole
+           * coloured band is not, and a band alternating between green and
+           * amber is worse than either colour alone.
+           *
+           * So both directions wait, asymmetrically. Believing a LOSS takes
+           * two consecutive samples, which is enough to ignore the one-sample
+           * grid wobble the 0.15 Hz threshold was widened for and still shows
+           * a real loss of discipline within two seconds. Believing a GAIN
+           * takes five, because a bar that has just gone green and might go
+           * amber again is worth nothing to anybody. Instant on the bad news
+           * was tried first and is wrong for the same reason the digits needed
+           * the wider threshold: one count of jitter is not a fault. */
+          #define STATUS_LOCK_DWELL   5u
+          #define STATUS_UNLOCK_DWELL 2u
+          static uint8_t s_lock_run   = 0;
+          static uint8_t s_unlock_run = 0;
+          static bool    s_bar_locked = false;
+          if (tft_loop_locked(f, c)) {
+              s_unlock_run = 0;
+              if (s_lock_run < STATUS_LOCK_DWELL) s_lock_run++;
+              if (s_lock_run >= STATUS_LOCK_DWELL) s_bar_locked = true;
+          } else {
+              s_lock_run = 0;
+              if (s_unlock_run < STATUS_UNLOCK_DWELL) s_unlock_run++;
+              if (s_unlock_run >= STATUS_UNLOCK_DWELL) s_bar_locked = false;
+          }
+
+          /* States, in the order they outrank each other:
+           *   3 auto holdover    the fix was lost; nothing else matters
+           *   2 manual holdover  the operator froze it; likewise
+           *   0 no fix           there is nothing to discipline against
+           *   4 warm-up          the oscillator is not ready to be judged
+           *   5 calibrating      C, CT or LC is deliberately moving the output
+           *   6 acquiring        fix good, loop not converged
+           *   1 disciplined      fix good, loop converged                     */
           uint8_t st;
           if      (c->holdover_mode && c->holdover_auto) st = 3;
           else if (c->holdover_mode)                     st = 2;
-          else if (g->pos_valid)                         st = 1;
-          else                                           st = 0;
+          else if (!g->pos_valid)                        st = 0;
+          else if (g_warmup_active)                      st = 4;
+          else if (g_calib_active)                       st = 5;
+          else if (s_bar_locked)                         st = 1;
+          else                                           st = 6;
 
           /* A survey-in that outlived our monitor window is still running inside
            * the receiver, and nothing else on screen would say so. It rides on
@@ -2906,6 +3006,13 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                   case 1:  bg = TFT_COL_LOCK;  base = "DISCIPLINED  FIX OK";   break;
                   case 2:  bg = TFT_COL_HOLD;  base = "HOLDOVER (manual)";     break;
                   case 3:  bg = TFT_COL_ALERT; base = "HOLDOVER (fix lost)";   break;
+                  case 4:  bg = TFT_COL_HOLD;  base = "OCXO WARMUP";           break;
+                  case 5:  bg = TFT_COL_HOLD;  base = "CALIBRATING";           break;
+                  /* Amber, not green: the fix is good and the loop is working,
+                   * but it has not arrived. The countdown or the phase figure
+                   * above says how far along it is; this says which half of
+                   * the story you are in. */
+                  case 6:  bg = TFT_COL_HOLD;  base = "ACQUIRING  FIX OK";     break;
                   default: bg = TFT_COL_ALERT; base = "WAITING FOR GPS FIX";   break;
               }
               /* Full word on the 480, abbreviated on the 320. The longest line

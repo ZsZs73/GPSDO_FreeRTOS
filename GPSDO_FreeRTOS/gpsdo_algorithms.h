@@ -46,6 +46,26 @@ extern double g_blend_scale;       /* Hz — sigmoid width,  default 0.01       
 /* Algo 9 (NN) output scaling */
 extern double g_nn_max_step;       /* LSB — max PWM delta per step, default 200 */
 
+/* ---- everything that follows from K, in one place ------------------------
+ *
+ * K is CT's measured slope, hertz per 16-bit LSB. algo_coeffs_from_k() writes
+ * the coefficient set CT derives from it (PLL Kp = 0.40/K, FLL Kp = 0.35/K and
+ * so on — see RUNTIME-TUNABLE PARAMETERS in gpsdo_algorithms.cpp); it is what
+ * CT runs, and what a move of the span jumper runs with the stored K of the
+ * position it moved to (gpsdo_span.cpp), so the two cannot drift apart.
+ *
+ * algo_rescale_lsb(r) converts the LEARNED state that is denominated in LSB
+ * and survives a loop restart — the LRN feed-forward and algorithm 9's tempco
+ * — by r = K_old/K_new, so the same physical correction is kept in the new
+ * span's units. Manual gains are not touched: they are the operator's.
+ *
+ * algo_request_restart() is what the dispatcher does on an algorithm change:
+ * every loop clears its own state on its next call and no loop keeps a lock
+ * verdict it did not earn. */
+void algo_coeffs_from_k(double k_hz_per_lsb);
+void algo_rescale_lsb(double ratio);
+void algo_request_restart(void);
+
 /* ---- Algorithm 10: LTIC three-stage PLL (ACQ → DPLL → LOCK) ----------
  * Disciplines the OCXO from the hardware TIC phase voltage (PA1) instead of
  * the TIM2 cycle counter. A state machine: ACQ pulls phase into the
@@ -224,6 +244,17 @@ typedef struct {
 } mlacc_stats_t;
 
 void mlacc_get_stats(mlacc_stats_t *out);
+
+/* ---- live lock verdicts, one per algorithm that can form one -------------
+ *
+ * Algorithms 10 and 11 have always published theirs as plain state
+ * (g_ltic.state == LTIC_LOCK, g_lars_locked). These are the same statement for
+ * 12 and 13, which had none — so the display invented a test of its own and
+ * the correction statistics in gpsdo_health.cpp gave up and excluded both.
+ * Decided inside the algorithm, at the one place it knows; read by the TFT
+ * status bar, the frequency digits and health_note_output(). */
+bool mlacc_locked(void);
+bool kf_locked(void);
 extern int16_t g_last_offset;
 extern int32_t g_mlacc_lim[MLACC_LEVELS];   /* per-level phase limits [ns] */
 extern float   g_mlacc_gain;                /* LSB per ns, 0 = auto from CT */
@@ -318,7 +349,7 @@ typedef struct {
     uint32_t holdover_s;    /* seconds running on the model alone             */
     uint32_t arms;          /* picDIV re-arms this session                    */
 } kf_stats_t;
-void kf_get_stats(kf_stats_t *out);
+void kf_get_stats(kf_stats_t *out);   /* kf_locked() is declared above */
 void kf_store_save(void);   /* write KR/KQ/KT to their own ring record */
 bool kf_store_load(void);   /* read them back at boot                  */
 
