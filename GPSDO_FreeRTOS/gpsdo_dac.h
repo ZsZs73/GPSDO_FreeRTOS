@@ -1,7 +1,7 @@
 /*
  * gpsdo_dac.h — single point where the control voltage leaves the firmware.
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO v1.07.57rt
  *
  * Before this existed, analogWrite(PIN_VCTL_PWM, ...) appeared in 23 places
  * across three files. Adding a second output path by editing all of them would
@@ -63,6 +63,44 @@ enum {
 };
 
 extern volatile uint8_t g_dac_path;
+
+/* The two scale factors that make the `DAC` report's commanded-against-measured
+ * comparison true on boards it used to lie on. Both live here because they
+ * describe the same thing g_dac_path does: how the number the loop writes
+ * relates to the world outside.
+ *
+ * g_dac_vref (volts, default 3.3) is what full code means at the output the
+ * firmware is steering — the PWM paths run from the 3.3 V rail, an external
+ * DAC from its own reference (5.0 V for the AD5680 boards). The report's
+ * "commanded" voltage is vref × code/65536; with the default it is exactly
+ * the historical 3.3 V PWM model, so existing boards see no change.
+ *
+ * g_adc_vdiv (ratio, default 1.0) is the divide ratio of whatever sits
+ * between the measured node and the ADC pin (e.g. 2.0 for 10k+10k). Every
+ * place that turns the Vctl ADC reading into volts multiplies by it.
+ *
+ * Both are set from the CLI (DV / AV), auto-saved with the ALGO settings
+ * block, and recalled from it — 0 in the stored record means "unset" and
+ * leaves the default in force. */
+extern double g_dac_vref;
+
+/* WHAT THE PA0 DIVIDER IS LOOKING AT.
+ *
+ * That divider (4k7 + 4k7 on the boards that have it) has always measured the
+ * 5 V rail. From the V3 board a jumper on the top of it selects the voltage
+ * REFERENCE instead — same divider, same pin, same scaling, different subject.
+ *
+ * The firmware cannot see a jumper, so it is told, exactly as with DV, AV and
+ * the DAC path. Being told also buys the range check: on the rail, 4.5..5.5 V
+ * is healthy; on the reference, it should read what DV says to within a few
+ * percent, and a reference that is missing, sagging, or simply not the part
+ * that was fitted stops being invisible. Getting that wrong is expensive —
+ * a 5.000 V device where the firmware believes 4.096 V puts a 20 % error into
+ * every frequency figure the board prints. */
+#define VSENSE_VCC   0u
+#define VSENSE_VREF  1u
+extern uint8_t g_vsense_src;
+extern double g_adc_vdiv;
 
 /* Is this path compiled into THIS build? */
 bool        gpsdo_dac_path_available(uint8_t path);
@@ -143,5 +181,31 @@ uint32_t gpsdo_dac_last24(void);
  * the fraction is harmless but buys nothing — the loop checks this so it can
  * report honestly rather than claim resolution it does not have. */
 bool gpsdo_dac_fine_available(void);
+
+/* HOW MANY DISTINCT LEVELS THE LIVE PATH'S OUTPUT CAN TAKE.
+ *
+ * The control value is 24-bit on every path — that is the number the loop
+ * steers and the fine carry delivers on average. What the OUTPUT can move in
+ * one write is a different number and it depends on which driver the jumper is
+ * feeding:
+ *
+ *   DITH  2^24      the dither table averages the 24-bit value EXACTLY, by
+ *                   construction (2^(24-N) entries, Y of them one higher), so
+ *                   there is nothing below it to lose
+ *   EXT   2^18      the AD5680's own width; dac_emit() scales 24-bit full scale
+ *                   onto DAC_EXT_MAX, so 64 counts of the control value make one
+ *                   step at the pin
+ *   PWM   2^16      on a dither build: the same engine with every table entry
+ *                   equal, low eight bits cleared — whole 16-bit LSBs, which is
+ *                   what gpsdo_dac_fine_available() reports
+ *   PWM   50 000    on a build with no dither engine: the timer's own period,
+ *                   100 MHz / 2 kHz. NOT a power of two, which is the whole
+ *                   reason this returns a count rather than a bit width — the
+ *                   16 it used to claim overstated that path by a third.
+ *
+ * Reporting one figure for all of them is how the DAC report came to promise
+ * 0.094 uHz on an 18-bit part that cannot move less than about 6 uHz in a
+ * single write. Both numbers are worth having; they are not the same number. */
+uint32_t gpsdo_dac_output_steps(void);
 
 #endif /* GPSDO_DAC_H */

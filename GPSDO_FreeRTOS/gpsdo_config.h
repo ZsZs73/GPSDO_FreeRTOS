@@ -238,6 +238,25 @@ extern "C" {
 
 //#define GPSDO_DAC_EXT
 
+/* ---- EFC span jumper on PB14 -------------------------------------------
+ * A board with the EFC level shifter runs its oscillator over the full control
+ * span or a reduced one, and the two have different plants — CT's K moved
+ * 5.0-5.7x between them on Dan Wiering's prototype. With a second pole of the
+ * span jumper wired to PB14, the firmware keeps one CT calibration per
+ * position and switches between them when the jumper moves, remapping the
+ * control code so the EFC pin keeps its voltage. See gpsdo_span.h.
+ *
+ * Jumper fitted = PB14 to ground = REDUCED. Open, or nothing wired = FULL,
+ * which is the position that always works: a board without the wire reads
+ * FULL on the internal pull-up and keeps its one calibration as before. That
+ * is why this is on by default — it costs a pull-up on a pin nothing else
+ * uses.
+ *
+ * Comment out only if PB14 is wired to something else on your board. The
+ * stored calibrations are carried through every save either way. */
+#define GPSDO_SPAN_SENSE
+#define PIN_SPAN_SENSE  PB14
+
 /* Historical bring-up aid; OFF by default per the v1.06 policy. */
 /* #define GPSDO_GEN_2kHz_PB5 */
 
@@ -290,6 +309,24 @@ extern "C" {
 /* ── Convenience alias: any TFT defined ─────────────────────────────── */
 #if defined(GPSDO_TFT_ILI9341) || defined(GPSDO_TFT_ST7789) || defined(GPSDO_TFT_ILI9488)
   #define GPSDO_TFT
+#endif
+
+/* ── TFT backlight dimming on PB5 (TIM3 CH2) ─────────────────────────────
+ *
+ * Enabled automatically with any TFT, because PB5 and TIM3 are otherwise idle
+ * and a board without the MOSFET stage simply has a square wave on a spare
+ * pin — inert. The `BL` command sets 30..100 % and auto-saves. See
+ * gpsdo_backlight.h for the stage, and why 100 % is the quietest setting
+ * rather than the loudest.
+ *
+ * IT YIELDS TO THE 2 kHz GENERATOR, not the other way round. Both want PB5,
+ * and the generator is an explicit opt-in a person had to type; the backlight
+ * is on by default. A default must never take a pin away from a deliberate
+ * choice, so the deliberate one wins and nothing has to #error. (Under
+ * GPSDO_DAC_EXT the generator has already been undefined just above, so on
+ * those boards the question does not arise.) */
+#if defined(GPSDO_TFT) && !defined(GPSDO_GEN_2kHz_PB5)
+  #define GPSDO_TFT_BL_PWM
 #endif
 
 /* ── TFT panel geometry & layout scaling ────────────────────────────────
@@ -445,6 +482,8 @@ extern "C" {
 #define PIN_OCXO_ETR     PA15
 #define PIN_PPS_CAPTURE  PB10
 #define PIN_TEST_2KHZ    PB5
+#define PIN_TFT_BL       PB5   /* backlight PWM — THE SAME PIN as the 2 kHz   */
+                               /* generator; see the yield rule further up    */
 #define PIN_PICDIV_ARM   PB3
 #define PIN_BT_RX        PA3   /* Bluetooth UART (Serial2) RX — module TX  */
 #define PIN_BT_TX        PA2   /* Bluetooth UART (Serial2) TX — module RX  */

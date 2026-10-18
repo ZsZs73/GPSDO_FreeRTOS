@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_settings_store.cpp  —  persistent user settings via the flash ring
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO v1.07.57rt
  *
  * See gpsdo_settings_store.h for the design. This module snapshots the runtime
  * settings globals into a flat SettingsBlock_t and stores it as a REC_SETTINGS
@@ -15,6 +15,7 @@
 
 #include "gpsdo_settings_store.h"
 #include "gpsdo_dac.h"
+#include "gpsdo_backlight.h"
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_state.h"
 #include <stddef.h>   /* offsetof, for the v4 migration */
@@ -22,6 +23,7 @@
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
 #include "gpsdo_ubx_timtp.h"      /* g_qerr_enable (SAW master switch) */
+#include "gpsdo_span.h"           /* the span record (PB14)            */
 #include <math.h>
 #include <string.h>
 
@@ -37,6 +39,55 @@ extern bool  g_show_local_time;
 
 /* LRN_DAMP_LO / LRN_DAMP_HI come from gpsdo_algorithms.h. */
 
+/* ---- field groups shared by more than one save ----
+ *
+ * Each is written from ONE place so that a group saved by two different
+ * partials cannot drift apart: SET_PID and SET_SPAN both carry the PID group,
+ * SET_LTIC and SET_SPAN both carry the LTIC loop gains. */
+
+static void put_pid_group(SettingsBlock_t *s)
+{
+    for (int k = 3; k <= 9; k++) {
+        int i = k - 3;
+        s->pid_kp[i] = (float)g_pid[k].Kp;
+        s->pid_ki[i] = (float)g_pid[k].Ki;
+        s->pid_kd[i] = (float)g_pid[k].Kd;
+        s->pid_il[i] = (float)g_pid[k].I_LIMIT;
+    }
+    s->blend_cross = (float)g_blend_crossover;
+    s->blend_scale = (float)g_blend_scale;
+    s->nn_max_step = (float)g_nn_max_step;
+}
+
+/* The twelve numbers ltic_autotune() derives from K. Not the detector
+ * calibration (LC's), not the thresholds, not the state. */
+static void put_ltic_gains(SettingsBlock_t *s)
+{
+    s->ltic_dpll_kp = (float)g_ltic.dpll.Kp;
+    s->ltic_dpll_ki = (float)g_ltic.dpll.Ki;
+    s->ltic_dpll_kd = (float)g_ltic.dpll.Kd;
+    s->ltic_dpll_il = (float)g_ltic.dpll.I_LIMIT;
+    s->ltic_lock_kp = (float)g_ltic.lock.Kp;
+    s->ltic_lock_ki = (float)g_ltic.lock.Ki;
+    s->ltic_lock_kd = (float)g_ltic.lock.Kd;
+    s->ltic_lock_il = (float)g_ltic.lock.I_LIMIT;
+    s->ltic_acq_kp  = (float)g_ltic.acq.Kp;
+    s->ltic_acq_ki  = (float)g_ltic.acq.Ki;
+    s->ltic_acq_kd  = (float)g_ltic.acq.Kd;
+    s->ltic_acq_il  = (float)g_ltic.acq.I_LIMIT;
+}
+
+static void put_span(SettingsBlock_t *s)
+{
+    span_store_t st;
+    span_store_get(&st);
+    s->span_last    = st.last;
+    s->span_k[0]    = st.k[0];
+    s->span_k[1]    = st.k[1];
+    s->span_pair[0] = st.pair[0];
+    s->span_pair[1] = st.pair[1];
+}
+
 /* ---- snapshot: runtime -> SettingsBlock_t ---- */
 
 static void snapshot_full(SettingsBlock_t *s)
@@ -45,7 +96,15 @@ static void snapshot_full(SettingsBlock_t *s)
     s->ver = SETTINGS_VER;
     s->pwm  = gCtrl.pwm_output;
     s->algo = gCtrl.active_algo;
-    s->dac_path = (uint8_t)(g_dac_path + 1u);   /* 0 stays "unset" */
+    s->dac_path   = (uint8_t)(g_dac_path + 1u);   /* 0 stays "unset" */
+    s->vsense_src = (uint8_t)(g_vsense_src + 1u); /* likewise           */
+    s->bl_pct   = g_tft_bl_pct;                 /* already clamped to 30..100 */
+    /* ×100 encodings, never 0 from runtime — the CLI's range checks keep
+     * vref in 2.50..5.50 V and the divider in 1.00..10.00, both well away
+     * from the "unset" zero. */
+    s->dac_vref_cv = (uint16_t)(g_dac_vref * 100.0 + 0.5);
+    s->dac_vref_mv = (uint16_t)(g_dac_vref * 1000.0 + 0.5);   /* the same DV */
+    s->adc_vdiv_h  = (uint16_t)(g_adc_vdiv * 100.0 + 0.5);
     s->a12_gain      = g_mlacc_gain;
     s->a12_run_level = g_mlacc_run_level;
     s->a12_thr_src   = g_mlacc_thr_src;
@@ -110,6 +169,7 @@ static void snapshot_full(SettingsBlock_t *s)
     s->tz_manual_min = g_tz_manual_min;
     memcpy(s->tz_str, g_tz_str, sizeof(s->tz_str));
     s->tz_str[sizeof(s->tz_str) - 1] = '\0';
+    put_span(s);
 }
 
 /* ---- apply: SettingsBlock_t -> runtime (with range guards) ---- */
@@ -135,6 +195,41 @@ static void apply_full(const SettingsBlock_t *s)
      * actually compiled in before it reaches the pin. */
     if (s->dac_path >= 1u && s->dac_path <= 3u)
         g_dac_path = gpsdo_dac_path_resolve((uint8_t)(s->dac_path - 1u));
+    /* Through the setter rather than straight into the variable: it is the one
+     * place the clamp lives, and on a board whose timer is already running it
+     * also puts the value on the pin. 0 = older record, leave the default. */
+    if (s->bl_pct >= BL_PCT_MIN && s->bl_pct <= BL_PCT_MAX)
+        backlight_set(s->bl_pct);
+    if (s->vsense_src >= 1u && s->vsense_src <= 2u)
+        g_vsense_src = (uint8_t)(s->vsense_src - 1u);
+    {
+        /* Range checks live with the meaning, in span_store_put(). */
+        span_store_t st;
+        st.last    = s->span_last;
+        st.k[0]    = s->span_k[0];
+        st.k[1]    = s->span_k[1];
+        st.pair[0] = s->span_pair[0];
+        st.pair[1] = s->span_pair[1];
+        span_store_put(&st);
+    }
+    /* 0 = unset (v5 record, or never configured): leave the compile-time
+     * defaults in force. The ranges mirror the CLI's, with a little slack on
+     * the upper ends so a hand-edited record is not silently crippled. */
+    if (s->dac_vref_cv >= 250u && s->dac_vref_cv <= 550u) {
+        g_dac_vref = (double)s->dac_vref_cv / 100.0;
+        /* The millivolt field carries the third decimal (4.096, not 4.10) —
+         * when it is there, and when it says the same DV to the centivolt.
+         * Every build that writes it writes dac_vref_cv from the same value,
+         * and the two roundings can differ by at most 5 mV, so a larger gap
+         * means dac_vref_cv was written by something that did not know about
+         * this field, and dac_vref_cv is the one to believe. 0 is an older
+         * record, which the range check turns away. */
+        int32_t d = (int32_t)s->dac_vref_mv - 10 * (int32_t)s->dac_vref_cv;
+        if (s->dac_vref_mv >= 2500u && s->dac_vref_mv <= 5500u && d >= -5 && d <= 5)
+            g_dac_vref = (double)s->dac_vref_mv / 1000.0;
+    }
+    if (s->adc_vdiv_h >= 100u && s->adc_vdiv_h <= 1000u)
+        g_adc_vdiv = (double)s->adc_vdiv_h / 100.0;
     if (s->a12_gain >= 0.0f && s->a12_gain <= 10000.0f) g_mlacc_gain = s->a12_gain;
     if (s->a12_run_level < 11u) g_mlacc_run_level = s->a12_run_level;
     /* 0 is the valid "default limit source" / "use the default target" pair,
@@ -263,9 +358,19 @@ bool settings_recall(void)
      * except that algorithm 12 starts untuned, which it would anyway. */
     if (s.ver == 4u && n == offsetof(SettingsBlock_t, a12_gain)) {
         /* the fields beyond the v4 layout are already at their defaults */
-    } else if (n != sizeof(s) || s.ver != SETTINGS_VER) {
+    } else if (s.ver == 5u && n == offsetof(SettingsBlock_t, dac_vref_cv)) {
+        /* and one version later, the same deal for the DV/AV output scales:
+         * accepted with defaults, so a v1.06 board keeps its PID, LC, algo-12
+         * tuning and DAC path while gaining the new knobs unset. */
+    } else if (s.ver != SETTINGS_VER ||
+               n < SETTINGS_V6_BYTES || n > sizeof(s)) {
         return false;
     }
+    /* Anything between SETTINGS_V6_BYTES and the current size is a record from
+     * a build that had fewer appended fields. The struct was zeroed above, so
+     * those fields read as 0, which every one of them defines as "unset" — the
+     * same deal the two migrations above give, but without needing a new case
+     * each time a byte is added. */
     apply_full(&s);
     return true;
 }
@@ -285,9 +390,12 @@ bool settings_save_partial(settings_partial_t which)
     SettingsBlock_t s;
     memset(&s, 0, sizeof(s));
     uint16_t n = flash_ring_read_newest(REC_SETTINGS, (uint8_t *)&s, sizeof(s));
-    /* Exact size required: seeding a partial save from a short record would
-     * write stack garbage back into every field the caller is not updating. */
-    bool have_stored = (n == sizeof(s) && s.ver == SETTINGS_VER);
+    /* A short record is fine — the struct was zeroed, so the fields a shorter
+     * layout did not carry seed as "unset" and the write below promotes them
+     * to the current layout. What is NOT fine is a record from a different
+     * version, which would be a different meaning for the same bytes. */
+    bool have_stored = (s.ver == SETTINGS_VER &&
+                        n >= SETTINGS_V6_BYTES && n <= sizeof(s));
     if (!have_stored) snapshot_full(&s);
     s.ver = SETTINGS_VER;
 
@@ -304,38 +412,18 @@ bool settings_save_partial(settings_partial_t which)
         s.tz_str[sizeof(s.tz_str) - 1] = '\0';
         break;
     case SET_PID:
-        for (int k = 3; k <= 9; k++) {
-            int i = k - 3;
-            s.pid_kp[i] = (float)g_pid[k].Kp;
-            s.pid_ki[i] = (float)g_pid[k].Ki;
-            s.pid_kd[i] = (float)g_pid[k].Kd;
-            s.pid_il[i] = (float)g_pid[k].I_LIMIT;
-        }
-        s.blend_cross = (float)g_blend_crossover;
-        s.blend_scale = (float)g_blend_scale;
-        s.nn_max_step = (float)g_nn_max_step;
+        put_pid_group(&s);
         break;
     case SET_LTIC:
         s.ltic_nsv  = g_ltic.ns_per_volt;
         s.ltic_zero = g_ltic.zero_offset;
         s.ltic_range = g_ltic.range_ns;
-        s.ltic_dpll_kp = (float)g_ltic.dpll.Kp;
-        s.ltic_dpll_ki = (float)g_ltic.dpll.Ki;
-        s.ltic_dpll_kd = (float)g_ltic.dpll.Kd;
-        s.ltic_dpll_il = (float)g_ltic.dpll.I_LIMIT;
-        s.ltic_lock_kp = (float)g_ltic.lock.Kp;
-        s.ltic_lock_ki = (float)g_ltic.lock.Ki;
-        s.ltic_lock_kd = (float)g_ltic.lock.Kd;
-        s.ltic_lock_il = (float)g_ltic.lock.I_LIMIT;
+        put_ltic_gains(&s);
         s.ltic_acq_th  = g_ltic.acq_threshold_ns;
         s.ltic_dpll_th = g_ltic.dpll_lock_thresh;
         s.ltic_lock_iv = g_ltic.lock_interval_s;
         s.ltic_state   = g_ltic.state;
         s.ltic_submode = g_ltic.submode;
-        s.ltic_acq_kp  = (float)g_ltic.acq.Kp;
-        s.ltic_acq_ki  = (float)g_ltic.acq.Ki;
-        s.ltic_acq_kd  = (float)g_ltic.acq.Kd;
-        s.ltic_acq_il  = (float)g_ltic.acq.I_LIMIT;
         s.ltic_polarity = g_ltic.polarity;
         s.ltic_centre_v = g_ltic.centre_v;
         /* LTIC-Lars (algo 11) rides with the LTIC group: one ES LTIC saves both */
@@ -358,11 +446,25 @@ bool settings_save_partial(settings_partial_t which)
         s.saw_en    = g_qerr_enable  ? 1u : 0u;
         s.lrn_en    = g_lrn_enable   ? 1u : 0u;
         s.svin_en   = g_svin_enabled ? 1u : 0u;
+        /* The backlight rides with the display flags: splash and brightness
+         * are one description of what the panel does, and `BL` should no more
+         * rewrite the PID block than `SP` should. */
+        s.bl_pct    = g_tft_bl_pct;
         break;
     case SET_ALGO:
         s.pwm  = gCtrl.pwm_output;
         s.algo = gCtrl.active_algo;
         s.dac_path = (uint8_t)(g_dac_path + 1u);
+        /* The scales ride with the path for the same reason the path rides
+         * here: they are one physical description of the output stage, and
+         * `DAC EXT` / `DV` / `AV` all land in the same partial save. */
+        s.dac_vref_cv = (uint16_t)(g_dac_vref * 100.0 + 0.5);
+        s.dac_vref_mv = (uint16_t)(g_dac_vref * 1000.0 + 0.5);
+        s.adc_vdiv_h  = (uint16_t)(g_adc_vdiv * 100.0 + 0.5);
+        /* And what the PA0 divider is looking at, for the same reason: it is
+         * one more thing about this board's wiring that the firmware cannot
+         * see and has to be told. */
+        s.vsense_src  = (uint8_t)(g_vsense_src + 1u);
         break;
     case SET_ALGO12:
         /* Saved on its own so tuning algorithm 12 does not rewrite the PID or
@@ -377,6 +479,17 @@ bool settings_save_partial(settings_partial_t which)
     case SET_PO:
         s.press_off = g_pressure_offset;
         s.alt_off   = g_altitude_offset;
+        break;
+
+    case SET_SPAN:
+        /* One write for everything a move of the span jumper changes, so a
+         * power cut cannot leave the span record saying REDUCED next to a PID
+         * block derived for FULL. The code goes with it: it was remapped, and
+         * the live store's copy is only as fresh as its last tick. */
+        put_span(&s);
+        put_pid_group(&s);
+        put_ltic_gains(&s);
+        s.pwm = gCtrl.pwm_output;
         break;
     }
 

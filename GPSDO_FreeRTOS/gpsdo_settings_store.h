@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_settings_store.h  —  persistent user settings via the flash ring
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO v1.07.57rt
  *
  * Replaces the old STM32duino emulated EEPROM (gpsdo_state.cpp eeprom_*).
  * Settings are stored as a REC_SETTINGS slot in the flash ring (sector 7),
@@ -20,17 +20,17 @@
  * keep their stored values — a deliberate `ES TZ` cannot clobber a hand-tuned
  * PID set the way the old full-state EEPROM write could.
  * ====================================================================== */
-#ifndef SETTINGS_STORE_H
-#define SETTINGS_STORE_H
+#ifndef GPSDO_SETTINGS_STORE_H
+#define GPSDO_SETTINGS_STORE_H
 
 #include <stdint.h>
 #include <stdbool.h>
 
 /* Bump when the on-flash layout of SettingsBlock_t changes. A mismatch with
  * the stored value triggers a fall-back to defaults on recall. */
-#define SETTINGS_VER  5u   /* v5: + algo-12 block; v4 LT flag; v3 FA windows; v2 Lars */
+#define SETTINGS_VER  6u   /* v6: + DV/AV output scales; v5 algo-12 block; v4 LT flag; v3 FA windows; v2 Lars */
 
-/* The flat on-flash block. Total size must stay <= FR_PAYLOAD (506 B).
+/* The flat on-flash block. Total size must stay <= FR_PAYLOAD (504 B).
  * Every field is little-endian and tightly packed; the recall path range-
  * checks each one so a corrupt byte can't poison the runtime. */
 typedef struct {
@@ -100,6 +100,19 @@ typedef struct {
      * to zero and never touches these bytes — asks for the default rather than
      * for path 0. That is why the encoding starts at 1. */
     uint8_t  dac_path;       /* 0=unset 1=PWM 2=DITH 3=EXT (g_dac_path+1)  */
+    /* TFT backlight percentage (BL command). The SECOND of the two pad bytes
+     * described above — dac_path took 318, this takes 319, and a12_gain still
+     * starts at 320. Verified with offsetof under arm-none-eabi, not by eye:
+     * sizeof(SettingsBlock_t) is 376 before and after, so every field below
+     * keeps its offset and a v6 record written by an earlier build still
+     * loads. The alternative was SETTINGS_VER 7, and recall requires an exact
+     * version AND size match — a bump throws away everyone's PID, LC and
+     * timezone, for one byte.
+     *
+     * ZERO MEANS UNSET, the same convention as dac_path, so a record from a
+     * build before this field existed asks for BL_PCT_DEF rather than for a
+     * dark screen. The valid range starts at 30. */
+    uint8_t  bl_pct;         /* g_tft_bl_pct, 30..100; 0 = unset            */
     /* Algorithm 12 (multi-level accumulator) — SETTINGS_VER 5+.
      *
      * These are here rather than compiled in because the limits are the one
@@ -120,7 +133,62 @@ typedef struct {
     uint8_t  a12_thr_src;    /* g_mlacc_thr_src   (MF)                     */
     uint16_t a12_thr_tgt_s;  /* g_mlacc_thr_tgt_s (MFT), 0 = default       */
     int32_t  a12_lim[11];    /* g_mlacc_lim[], phase limits in ns          */
+    /* Output-path scales (DV / AV commands) — SETTINGS_VER 6+.
+     *
+     * Appended rather than carved from padding because no padding is left
+     * here, which is why this one IS a version bump: a v5 record is shorter,
+     * and settings_recall() accepts it and leaves these two at the defaults —
+     * the same deal the v4→v5 migration gives algo 12.
+     *
+     * ZERO MEANS UNSET, exactly like dac_path: a record written by a v5 build
+     * never wrote these bytes, and 0 asks for the default (3.30 V, 1.00×)
+     * rather than for a nonsense scale. */
+    uint16_t dac_vref_cv;    /* g_dac_vref in centivolts ×100 (DV), 0 = 3.3 V */
+    uint16_t adc_vdiv_h;     /* g_adc_vdiv ×100 (AV), 0 = 1.00×               */
+    /* What the PA0 divider is measuring (VS command) — SETTINGS_VER 6, appended
+     * after the layout was frozen. The board selects between the 5 V rail and
+     * the voltage reference with a jumper on the top of that divider, and the
+     * firmware cannot see a jumper, so it is told. 0 = unset (an older record,
+     * which means the 5 V rail, the behaviour every build before this had),
+     * 1 = VCC, 2 = VREF — offset by one for the same reason dac_path is.
+     *
+     * APPENDED WITHOUT A VERSION BUMP, and that is now a supported thing to do
+     * rather than a trick: settings_recall() accepts any record from
+     * SETTINGS_V6_BYTES up to the current size, and the struct is zeroed first,
+     * so everything appended reads back as 0 = unset on an older record. The
+     * three alignment bytes after this one are the room for the next two. */
+    uint8_t  vsense_src;     /* g_vsense_src + 1; 0 = unset = the 5 V rail    */
+    /* Span sensing on PB14 (gpsdo_span.h) — appended under the rule above: an
+     * older record reads all of these back as 0, and 0 means "never recorded",
+     * "not calibrated" and "no pair" respectively, i.e. exactly a board that
+     * has not met the jumper yet. span_last takes the first of the three pad
+     * bytes after vsense_src; the floats start on the next word, so the block
+     * grows from 380 to 392 bytes. Checked with offsetof under arm-none-eabi. */
+    uint8_t  span_last;      /* span in force when saved, + 1; 0 = unset      */
+    float    span_k[2];      /* CT's K in each span, Hz/LSB; 0 = none         */
+    uint16_t span_pair[2];   /* one code per span, same EFC volts; 0 = none   */
+    /* DV in millivolts. dac_vref_cv holds centivolts, so a DV of 4.096 — the
+     * ADR4540 on Dan Wiering's V3 — came back from every restart as 4.10, a
+     * 0.1 % bias on the commanded column of the DAC report. Appended under the
+     * rule above rather than by widening dac_vref_cv, which every older build
+     * reads: dac_vref_cv is still written, from the same value, so a downgrade
+     * keeps the two-decimal DV it always had, and an older record reads this
+     * back as 0 = not recorded. On recall it refines dac_vref_cv only when the
+     * two agree to the centivolt (apply_full). Takes the word after
+     * span_pair: the block grows from 392 to 396 bytes. Checked with offsetof
+     * under arm-none-eabi. */
+    uint16_t dac_vref_mv;    /* g_dac_vref ×1000 (DV); 0 = not recorded       */
 } SettingsBlock_t;
+
+/* The size SETTINGS_VER 6 had when it was frozen, and the shortest record
+ * settings_recall() will accept as one. Every byte appended since reads back
+ * as zero on such a record, which each appended field defines as "unset".
+ *
+ * DO NOT CHANGE THIS NUMBER WHEN YOU APPEND A FIELD — it is the whole point of
+ * it. The alternative, and what this file used to do, was a fresh `else if`
+ * per version with a hand-written offsetof, and before that a version bump,
+ * which threw away everyone's PID, LC and timezone to gain one byte. */
+#define SETTINGS_V6_BYTES  376u
 
 /* Which group of fields a partial save should update. Used by `ES <object>`. */
 typedef enum {
@@ -128,10 +196,13 @@ typedef enum {
     SET_TZ     = 1,   /* tz_mode, tz_manual_min, tz_str                   */
     SET_PID    = 2,   /* pid_kp/ki/kd/il[3..9], blend, nn_max_step        */
     SET_LTIC   = 3,   /* all ltic_* fields                                */
-    SET_FLAGS  = 4,   /* warmup_en, splash_en, saw_en, lrn_en, svin_en    */
-    SET_ALGO   = 5,   /* pwm, algo                                        */
+    SET_FLAGS  = 4,   /* warmup_en, splash_en, saw_en, lrn_en, svin_en,   */
+                      /* bl_pct — the display group                        */
+    SET_ALGO   = 5,   /* pwm, algo, dac_path, DV/AV scales, VS source     */
     SET_ALGO12 = 7,   /* algo-12 gain, run level, per-level limits         */
     SET_PO     = 6,    /* press_off, alt_off                              */
+    SET_SPAN   = 8,   /* span record + everything a span move re-derives: */
+                      /* the PID group, the LTIC loop gains, and pwm       */
 } settings_partial_t;
 
 /* Boot-time recall. Reads the newest REC_SETTINGS slot from the ring,
@@ -153,4 +224,4 @@ bool settings_save(void);
  * behaves like a full save). Returns true on success. */
 bool settings_save_partial(settings_partial_t which);
 
-#endif /* SETTINGS_STORE_H */
+#endif /* GPSDO_SETTINGS_STORE_H */

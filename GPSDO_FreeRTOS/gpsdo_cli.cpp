@@ -20,6 +20,7 @@
 #include "gpsdo_config.h"
 #include "gpsdo_build.h"
 #include "gpsdo_dac.h"
+#include "gpsdo_backlight.h"
 #ifdef GPSDO_PWM_DITHER
   #include "gpsdo_pwm24.h"    /* PWM24_N / PWM24_TBL, for the DAC report */
 #endif
@@ -31,6 +32,7 @@
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
 #include "gpsdo_ubx_timtp.h"
+#include "gpsdo_span.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -170,6 +172,41 @@ static bool cli_parse_offset(const char *s, int16_t *out)
     return true;
 }
 
+/* x.xxe-NN, built by hand.
+ *
+ * This file prints no floats through printf — Float printf has to be enabled in
+ * the IDE and emits "?" when it is not — and dtostrf has no exponent form. A
+ * FIXED exponent was fine while the DAC report quoted two hard-coded widths;
+ * with three converters of 16, 18 and 24 bits the same line has to carry
+ * anything from 2.4e-12 to 9.4e-15, and "2394.9e-15" is not a number anybody
+ * reads. So normalise the mantissa and print the exponent that belongs to it. */
+static void cli_frac_exp(char *out, size_t n, double frac)
+{
+    int e = 0;
+    if (frac > 0.0) {
+        while (frac <  1.0) { frac *= 10.0; e++; }
+        while (frac >= 10.0) { frac /= 10.0; e--; }
+    }
+    char m[16];
+    dtostrf(frac, -1, 2, m);
+    snprintf(out, n, "%se-%d", m, e);
+}
+
+/* log2 of a power of two, or 0 when it is not one.
+ *
+ * Exists so the DAC report can keep saying "18-bit" where that is the truth
+ * and fall back to a plain count where it is not. The plain-PWM path on a
+ * build with no dither engine resolves 50 000 duty values; calling that
+ * "16-bit" overstates it by a third, and calling it "15-bit" throws a third of
+ * it away. Neither is worth the tidier-looking line. */
+static uint8_t cli_exact_bits(uint32_t steps)
+{
+    uint8_t b = 0;
+    if (steps == 0u || (steps & (steps - 1u)) != 0u) return 0u;
+    while (steps > 1u) { steps >>= 1; b++; }
+    return b;
+}
+
 static void cli_putfloat(float v, int dec)
 {
     static char tmp[24];
@@ -211,6 +248,13 @@ static void print_help(void)
     cli_putln("  T [baud]    GPS tunnel on USB (300s; opt. GPS UART baud for u-center)");
     cli_putln("  SP <n>      Set PWM DAC directly (1-65535)");
     cli_putln("  DAC [PWM|DITH|EXT]  output path (no arg = report + Vctl check)");
+    cli_putln("  DV [v]      volts at full code for 'commanded' (3.30 = PWM, 5.00 = AD5680)");
+    cli_putln("  AV [x]      ADC divide ratio for 'measured' (1.00 = direct)");
+    cli_putln("  VS [VCC|VREF]  what the PA0 divider is jumpered to (auto-saved)");
+    cli_putln("  SPAN [CLR FULL|REDUCED]  EFC span jumper (PB14): K per position");
+#if defined(GPSDO_TFT_BL_PWM)
+    cli_putln("  BL [%]      TFT backlight 30-100% (auto-saved; 100 = no switching)");
+#endif
     cli_putln("  up1 / up10  increase PWM by 1 / 10");
     cli_putln("  dp1 / dp10  decrease PWM by 1 / 10");
     cli_putln("  RH / RD     Human readable / Tab Delimited reporting");
@@ -234,7 +278,7 @@ static void print_help(void)
     cli_putln("  DPP/I/D/L   DPLL PID Kp/Ki/Kd/I_LIMIT");
     cli_putln("  LKP/I/D/L   LOCK PID Kp/Ki/Kd/I_LIMIT");
     cli_putln("  LAT/LDT/LIV ACQ thr, DPLL->LOCK thr, LOCK interval s");
-    cli_putln("  LPOL [-1/0/1] PWM->phase polarity (0=auto)");
+    cli_putln("  LPOL [-1/0/1] PWM->phase polarity (0=not set, loop holds)");
     cli_putln("  FA/FAD/FAL n  LTIC damping avg window (10/100/1000; both/DPLL/LOCK)");
     cli_putln("  -- LTIC-Lars (algo 11) continuous-PI params --");
     cli_putln("  LG [val]    Gain: 0=auto from CT calibration, else manual");
@@ -521,6 +565,16 @@ static void dispatch(char *line)
         }
 #endif
 
+        /* The scales the two numbers below are computed with, stated up front
+         * because they are the first thing to check when commanded and
+         * measured disagree: DV says what full code means at the output
+         * (3.30 V = the PWM model, the historical default), AV says what
+         * divide ratio sits before the ADC pin (1.00 = none). */
+        dtostrf(g_dac_vref, -1, 3, b1);   /* three: a 4.096 V reference */
+        dtostrf(g_adc_vdiv, -1, 2, b2);
+        snprintf(l, sizeof(l), "  scales: commanded at %s V full-code, ADC x%s", b1, b2);
+        cli_putln(l);
+
         /* Three views of one number. Printing all three is the point: a fraction
          * that never appears anywhere is a fraction nobody can trust. A 24-bit
          * code that is not a multiple of 256 is the proof the fine path is the
@@ -536,7 +590,8 @@ static void dispatch(char *line)
         cli_putln(l);
 
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            double vm = ((double)gCtrl.avg_vctl_adc / 4096.0) * 3.3;
+            /* g_adc_vdiv: the divider before the pin (AV), 1.0 = none. */
+            double vm = ((double)gCtrl.avg_vctl_adc / 4096.0) * 3.3 * g_adc_vdiv;
             xSemaphoreGive(xCtrlMutex);
             dtostrf(vm, -1, 4, b1);
             /* COMMANDED AGAINST MEASURED — the one check that catches a jumper
@@ -549,8 +604,14 @@ static void dispatch(char *line)
              * would cry wolf on every board. What this has to catch is the
              * gross case — commanded 1.8 V, measured 0.0 V because the driver
              * that is selected is not the one wired to the filter — and half a
-             * volt catches that without ever firing on a scale error. */
-            double vc = ((double)v16 / 65536.0) * 3.3;
+             * volt catches that without ever firing on a scale error.
+             *
+             * The commanded side is scaled by g_dac_vref (DV), not the
+             * hardcoded 3.3 V it used to be: on a 5 V external DAC the old
+             * model under-stated commanded by 1.5x and the check cried wolf
+             * on every reading — the false MISMATCH that started the whole
+             * DV/AV business. */
+            double vc = ((double)v16 / 65536.0) * g_dac_vref;
             dtostrf(vc, -1, 4, b2);
             snprintf(l, sizeof(l), "  Vctl: %s V measured, %s V commanded", b1, b2);
             cli_putln(l);
@@ -562,22 +623,97 @@ static void dispatch(char *line)
             }
         }
 
+        /* WHAT THE OTHER DIVIDER IS LOOKING AT, and whether it agrees.
+         *
+         * On the 5 V rail this is the reading the telemetry line has always
+         * carried. On the reference it is the only check the firmware has that
+         * the part fitted is the part DV describes — and the failure it catches
+         * is not subtle: a 5.000 V device where DV says 4.096 makes every
+         * frequency figure the board prints a fifth too small, silently. */
+        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            int16_t raw = gCtrl.avg_vcc_adc;
+            xSemaphoreGive(xCtrlMutex);
+            if (raw > 0) {
+                /* The divider halves it; the ADC's own reference is the
+                 * nominal 3.3 V, so this is an indication, not a measurement.
+                 * Good to a percent or two, which is all the check needs. */
+                double v = ((double)raw / 4096.0) * 3.3 * 2.0;
+                dtostrf(v, -1, 3, b1);
+                if (g_vsense_src == VSENSE_VREF) {
+                    dtostrf(g_dac_vref, -1, 3, b2);
+                    snprintf(l, sizeof(l),
+                             "  Vref: %s V measured, %s V per DV", b1, b2);
+                    cli_putln(l);
+                    /* Five percent: wide enough that the ADC reference and the
+                     * divider's own tolerance never trip it, narrow enough to
+                     * catch the wrong part, which is always out by 20 % or
+                     * more, and a reference that has stopped working. */
+                    if (v < g_dac_vref * 0.95 || v > g_dac_vref * 1.05) {
+                        cli_putln("  ** the reference is not where DV says it is.");
+                        cli_putln("     Check VS against the jumper, DV against the");
+                        cli_putln("     part actually fitted, and the reference's");
+                        cli_putln("     own supply — it needs headroom above its");
+                        cli_putln("     output to regulate at all.");
+                    }
+                } else {
+                    snprintf(l, sizeof(l), "  Vcc:  %s V (5 V rail; VS VREF if the"
+                             " jumper feeds the reference)", b1);
+                    cli_putln(l);
+                }
+            }
+        }
+
         /* The Hz figures need the plant gain, which only CT can supply. Without
          * it the resolution is still real but its meaning in frequency is
          * unknown, and saying so beats printing a number from a default. */
         double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
         if (lsb_per_hz > 0.0) {
-            double hz16 = 1.0 / lsb_per_hz;
-            double hz24 = hz16 / 256.0;
-            dtostrf(hz16 * 1e6, -1, 1, b1);
-            dtostrf(hz16 / 1.0e7 * 1e12, -1, 2, b2);
-            snprintf(l, sizeof(l), "  step: 16-bit 1 LSB = %s uHz = %se-12", b1, b2);
+            /* TWO STEPS, AND THEY ARE NOT THE SAME NUMBER.
+             *
+             * The control value is 24-bit on every path — that is what the loop
+             * commands and what the fine carry delivers on average. What the
+             * OUTPUT moves in a single write is the live driver's own width:
+             * 2^24 on DITH (the dither table averages the 24-bit value
+             * exactly), 2^18 on the AD5680, 2^16 on plain PWM riding the
+             * dither engine — and 50 000, which is not a power of two at all,
+             * on a build with no dither engine, where the timer's period is
+             * the resolution. See gpsdo_dac_output_steps().
+             *
+             * This used to print 16-bit and 24-bit regardless of the path, so
+             * on Dan Wiering's AD5680 board the report offered 0.094 uHz as a
+             * step — 64 counts of the control value make one move at that pin,
+             * so the smallest real one is about 6 uHz — while at the same time
+             * understating the part by quoting a 16-bit figure four times
+             * coarser than it can do. Both lines were wrong on the same board
+             * in opposite directions, which is what a fixed pair of widths gets
+             * you when there are three converters.
+             *
+             * uHz on both lines, so they are comparable at a glance. */
+            uint32_t osteps = gpsdo_dac_output_steps();
+            uint8_t  obits  = cli_exact_bits(osteps);   /* 0 = not a power of 2 */
+            char lbl[16];
+            if (obits) snprintf(lbl, sizeof(lbl), "%u-bit", (unsigned)obits);
+            else       snprintf(lbl, sizeof(lbl), "%lu steps", (unsigned long)osteps);
+            double hz_ctl = (1.0 / lsb_per_hz) / 256.0;              /* 24-bit  */
+            double hz_out = (1.0 / lsb_per_hz) * 65536.0
+                          / (double)osteps;
+            dtostrf(hz_ctl * 1e6, -1, 3, b1);
+            cli_frac_exp(b2, sizeof(b2), hz_ctl / 1.0e7);
+            snprintf(l, sizeof(l), "  step: control 24-bit 1 LSB = %s uHz = %s",
+                     b1, b2);
             cli_putln(l);
-            /* uHz on both lines, so the two are comparable at a glance. */
-            dtostrf(hz24 * 1e6, -1, 3, b1);
-            dtostrf(hz24 / 1.0e7 * 1e15, -1, 1, b2);
-            snprintf(l, sizeof(l), "        24-bit 1 LSB = %s uHz = %se-15", b1, b2);
+            dtostrf(hz_out * 1e6, -1, 3, b1);
+            cli_frac_exp(b2, sizeof(b2), hz_out / 1.0e7);
+            snprintf(l, sizeof(l), "        output %-9s 1 LSB = %s uHz = %s",
+                     lbl, b1, b2);
             cli_putln(l);
+            if (osteps < (1UL << 24)) {
+                snprintf(l, sizeof(l),
+                         "        (%s resolves %s; finer requests reach the pin"
+                         " as a", gpsdo_dac_path_name(g_dac_path), lbl);
+                cli_putln(l);
+                cli_putln("         time average, not as one step)");
+            }
             dtostrf(lsb_per_hz, -1, 0, b1);
             dtostrf((double)g_pid[7].Kp, -1, 0, b2);
             snprintf(l, sizeof(l), "        plant %s LSB/Hz (from CT, Kp[7]=%s)", b1, b2);
@@ -586,6 +722,10 @@ static void dispatch(char *line)
             cli_putln("  step: run CT first - plant gain unknown, so the");
             cli_putln("        resolution cannot be stated in Hz");
         }
+
+        /* Which span the plant above belongs to. Two jumper positions, two
+         * plants, and the figures above are only as right as this line. */
+        span_report(cli_putln);
 
         if (gpsdo_dac_fine_available()) {
             cli_putln("  fine: ACTIVE - sub-LSB corrections are applied, not");
@@ -597,6 +737,161 @@ static void dispatch(char *line)
         }
         return;
     }
+
+    /* ---- DV / AV: the two scales the DAC report computes with ----
+     *
+     * DV states what full code means at the output the firmware is steering:
+     * the PWM paths run from the 3.3 V rail (the default), an external DAC
+     * from its own reference — 5.00 for the AD5680 boards. AV states the
+     * divide ratio between the measured node and the ADC pin, 1.00 = direct.
+     * Together they turn the DAC report's commanded-against-measured check
+     * from a PWM-board assumption into a statement about THIS board. Both
+     * save immediately with the ALGO block — the same partial the DAC path
+     * rides in — so nobody has to remember an ES afterwards. */
+    if (cli_ieq(verb, "DV") || cli_ieq(verb, "AV")) {
+        char l[80], b1[16];
+        bool isDV = cli_ieq(verb, "DV");
+        if (arg == NULL) {
+            if (isDV) {
+                dtostrf(g_dac_vref, -1, 3, b1);
+                snprintf(l, sizeof(l), "DV: %s V at full code (3.30 = PWM model)", b1);
+            } else {
+                dtostrf(g_adc_vdiv, -1, 2, b1);
+                snprintf(l, sizeof(l), "AV: ADC divide ratio x%s (1.00 = direct)", b1);
+            }
+            cli_putln(l);
+            return;
+        }
+        double v = atof(arg);
+        if (isDV) {
+            if (v < 2.50 || v > 5.50) {
+                cli_reject("DV: 2.50..5.50 V (3.30 = the PWM model)");
+                return;
+            }
+            g_dac_vref = v;
+            /* Three decimals, as stored since build 57 (dac_vref_mv): with two,
+             * DV 4.096 echoed back as 4.10 and was saved as 4.10 too. */
+            dtostrf(v, -1, 3, b1);
+            snprintf(l, sizeof(l), "DV: commanded now scaled at %s V full code", b1);
+        } else {
+            if (v < 1.00 || v > 10.00) {
+                cli_reject("AV: 1.00..10.00 (divide ratio at the ADC pin)");
+                return;
+            }
+            g_adc_vdiv = v;
+            dtostrf(v, -1, 2, b1);
+            snprintf(l, sizeof(l), "AV: Vctl readings now scaled x%s", b1);
+        }
+        cli_putln(l);
+        /* AUTO-SAVED, not "run ES ALGO". These two describe the board's output
+         * stage — they are typed once when the hardware is built and never
+         * again — and the v1.07 changelog and the notes sent to the people
+         * building those boards both said so. The code did not, so a DV set
+         * and not followed by an ES came back as 3.30 after a reset and the
+         * MISMATCH warning returned with it, which looks like a hardware fault
+         * rather than a lost setting. The promise was the right one; this is
+         * the code catching up to it. */
+        cli_autosaved(SET_ALGO, isDV ? "DV: DAC full-code volts"
+                                     : "AV: ADC divide ratio");
+        return;
+    }
+
+    /* ---- VS: what the PA0 divider is measuring ----
+     *
+     * A jumper on the top of that divider chooses between the 5 V rail and the
+     * voltage reference. The firmware cannot see it, so it is told — the same
+     * arrangement as DV, AV and the DAC path, and for the same reason: the one
+     * piece of evidence a jumper leaves behind is a voltage that is not where
+     * the firmware expected it, and that only helps if the firmware was told
+     * what to expect. */
+    if (cli_ieq(verb, "VS")) {
+        char l[80];
+        if (arg == NULL) {
+            snprintf(l, sizeof(l), "VS: PA0 divider reads %s (VCC | VREF)",
+                     (g_vsense_src == VSENSE_VREF) ? "VREF" : "VCC");
+            cli_putln(l);
+            return;
+        }
+        if      (cli_ieq(arg, "VCC"))  g_vsense_src = VSENSE_VCC;
+        else if (cli_ieq(arg, "VREF")) g_vsense_src = VSENSE_VREF;
+        else { cli_reject("VS: VCC or VREF (what the jumper feeds the PA0 divider)");
+               return; }
+        snprintf(l, sizeof(l), "VS: PA0 divider now read as %s",
+                 (g_vsense_src == VSENSE_VREF) ? "VREF (checked against DV)"
+                                               : "VCC (the 5 V rail)");
+        cli_putln(l);
+        cli_autosaved(SET_ALGO, "ALGO: path/DV/AV/VS");
+        return;
+    }
+
+    /* ---- SPAN: the EFC span jumper on PB14 ----
+     *
+     * Unlike VS, nothing to TELL the firmware here: the jumper's second pole
+     * is wired to PB14 and the firmware reads it. What this shows is the other
+     * half — the calibration each position carries — and CLR is the one
+     * correction a person may need: forgetting a position that was calibrated
+     * in the wrong place. The usual case is a board calibrated before PB14 was
+     * wired, whose only CT was filed under FULL while the jumper actually sat
+     * on REDUCED. CT in the other position catches that by itself (see
+     * SPAN_SAME_PLANT in gpsdo_span.cpp); CLR is for when you already know. */
+    if (cli_ieq(verb, "SPAN")) {
+        if (arg == NULL) { span_report(cli_putln); return; }
+        char *p2 = arg;
+        while (*p2 && *p2 != ' ') p2++;
+        while (*p2 == ' ') *p2++ = '\0';
+        if (!cli_ieq(arg, "CLR") || *p2 == '\0') {
+            cli_reject("SPAN: no argument = report, or SPAN CLR FULL|REDUCED");
+            return;
+        }
+        uint8_t which;
+        if      (cli_ieq(p2, "FULL")    || cli_ieq(p2, "0")) which = SPAN_FULL;
+        else if (cli_ieq(p2, "REDUCED") || cli_ieq(p2, "1")) which = SPAN_REDUCED;
+        else { cli_reject("SPAN CLR: FULL or REDUCED"); return; }
+        span_clear(which);
+        cli_puts("SPAN: calibration for "); cli_puts(span_name(which));
+        cli_putln(" forgotten (and the code pair). Saved.");
+        if (which == span_active())
+            cli_putln("SPAN: this is the position the jumper is in - the live loop is unchanged; run CT to re-measure it.");
+        return;
+    }
+
+#if defined(GPSDO_TFT_BL_PWM)
+    /* ---- BL: TFT backlight brightness ----
+     *
+     * Percent, not raw duty: the operator is setting how bright the screen is,
+     * not what the timer does, and the inversion the P-channel stage needs
+     * belongs in the driver rather than in the number a person types.
+     *
+     * The floor is 30 for a reason that is not electrical — see
+     * gpsdo_backlight.h. Below about a third the panel stops being readable
+     * instead of becoming usefully dim, so a mistyped 3 would leave someone
+     * looking at what could equally be a dead board. */
+    if (cli_ieq(verb, "BL")) {
+        char l[80];
+        if (arg == NULL) {
+            snprintf(l, sizeof(l), "BL: backlight %u%% (%u..%u, %u = default)",
+                     (unsigned)g_tft_bl_pct, (unsigned)BL_PCT_MIN,
+                     (unsigned)BL_PCT_MAX, (unsigned)BL_PCT_DEF);
+            cli_putln(l);
+            return;
+        }
+        long v = atol(arg);
+        if (v < (long)BL_PCT_MIN || v > (long)BL_PCT_MAX) {
+            snprintf(l, sizeof(l), "BL: %u..%u %% (below %u the panel is not "
+                     "readable, only dark)", (unsigned)BL_PCT_MIN,
+                     (unsigned)BL_PCT_MAX, (unsigned)BL_PCT_MIN);
+            cli_reject(l);
+            return;
+        }
+        backlight_set((uint8_t)v);
+        snprintf(l, sizeof(l), "BL: backlight %u%%%s", (unsigned)g_tft_bl_pct,
+                 (g_tft_bl_pct == BL_PCT_MAX)
+                   ? " - full, and the stage stops switching" : "");
+        cli_putln(l);
+        cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV/BL");
+        return;
+    }
+#endif /* GPSDO_TFT_BL_PWM */
 
     /* ---- help; "H TZ" for the one command that needs more than a line ---- */
     if (cli_ieq(verb, "H") || cli_ieq(verb, "?")) {
@@ -725,7 +1020,18 @@ static void dispatch(char *line)
 #ifdef GPSDO_PICDIV
         xEventGroupSetBits(xSysEvents, EVT_ARM_PICDIV);
         cli_putln("picDIV arm requested (1.0-1.2s output gap, then syncs to 1PPS)");
-        cli_putln("Note: use a PLL algorithm (LA 4/5/7) to keep phase locked long-term");
+        /* THE OLD NOTE NAMED LA 4/5/7, and it predates algorithms 10-13 by a
+         * long way. Those three steer on the COUNTER and have no phase detector
+         * at all, so they cannot hold the divider's phase where it is put -
+         * which is the one thing this note is about. The loops that can are the
+         * LTIC family, and they also re-arm by themselves when the detector
+         * says the divider has lost sync, so on 10-13 this command is a manual
+         * override rather than routine maintenance. Dan Wiering picked 7 for an
+         * overnight run and wondered why he was seeing arm events; algorithms
+         * 0-9 never arm at all, and this line is the likeliest reason he was
+         * there in the first place. */
+        cli_putln("Note: LA 10-13 hold the divider's phase and re-arm by");
+        cli_putln("themselves; on LA 0-9 nothing keeps it aligned afterwards.");
 #else
         cli_putln("picDIV support not compiled in (GPSDO_PICDIV)");
 #endif
@@ -1072,7 +1378,7 @@ static void dispatch(char *line)
         if (arg != NULL) cli_manual_save("ES LTIC");
         return;
     }
-    /* ---- LPOL [-1/0/1] — PWM→phase polarity (0=auto-detect) ---- */
+    /* ---- LPOL [-1/0/1] — PWM→phase polarity (0=not set, loop holds) ---- */
     if (cli_ieq(verb, "LRN")) {
         if (arg == NULL) {
             cli_puts("learn="); cli_puts(g_lrn_enable ? "1 (on)" : "0 (off)");
@@ -1109,7 +1415,7 @@ static void dispatch(char *line)
         } else {
             int v = atoi(arg);
             if (v == 0 || v == 1) { g_warmup_enable = (v != 0); cli_puts("warmup="); cli_putint(v); cli_putln("");
-                                    cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV"); }
+                                    cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV/BL"); }
             else cli_putln("WU: 0 (skip warmup) or 1 (warm up on boot)");
         }
         return;
@@ -1122,7 +1428,7 @@ static void dispatch(char *line)
         } else {
             int v = atoi(arg);
             if (v == 0 || v == 1) { g_splash_enable = (v != 0); cli_puts("splash="); cli_putint(v); cli_putln("");
-                                    cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV"); }
+                                    cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV/BL"); }
             else cli_putln("SPL: 0 (static title only) or 1 (boot animation)");
         }
         return;
@@ -1130,11 +1436,16 @@ static void dispatch(char *line)
     if (cli_ieq(verb, "LPOL")) {
         if (arg == NULL) {
             cli_puts("polarity="); cli_putint(g_ltic.polarity);
-            cli_putln(g_ltic.polarity == 0 ? " (auto)" : "");
+            /* NOT "(auto)". All three LTIC loops treat 0 as REFUSE TO RUN and
+             * print a line asking for it to be set; calling that auto told the
+             * operator the firmware would work it out, which is the one thing
+             * it will not do. LC measures the polarity — that is the "auto"
+             * that exists, and it has to be run. */
+            cli_putln(g_ltic.polarity == 0 ? " (not set - loop holds)" : "");
         } else {
             int v = atoi(arg);
             if (v == -1 || v == 0 || v == 1) { g_ltic.polarity = (int8_t)v; cli_puts("polarity="); cli_putint(v); }
-            else cli_reject("LPOL: -1, 0 (auto), or 1");
+            else cli_reject("LPOL: -1, 0 (not set), or 1");
         }
         if (arg != NULL) cli_manual_save("ES LTIC");
         return;
@@ -1295,12 +1606,30 @@ static void dispatch(char *line)
         cli_puts(" LIV=");       cli_putint(g_ltic.lock_interval_s);
         cli_putln("");
         cli_puts("  LPOL=");     cli_putint(g_ltic.polarity);
-        cli_puts(g_ltic.polarity == 0 ? " (auto)" : "");
+        cli_puts(g_ltic.polarity == 0 ? " (not set - loop holds)" : "");
         cli_puts("  LCV=");      cli_putfloat(g_ltic.centre_v, 3);
         cli_putln(g_ltic.centre_v == 0.0f ? " (auto=range mid)" : "");
-        const char *sn = (g_ltic.state==LTIC_ACQ)?"ACQ":(g_ltic.state==LTIC_DPLL)?"DPLL":"LOCK";
-        cli_puts("  state="); cli_puts(sn);
-        cli_putln("  (3-stage phase loop: ACQ->DPLL->LOCK)");
+        /* THIS STATE BELONGS TO ALGORITHM 10 AND TO NOTHING ELSE. It is
+         * persisted, so under any other algorithm LL was reporting where the
+         * three-stage loop stopped the last time it ran — possibly in a
+         * previous session, since the value is recalled from flash. Printed
+         * without that qualification beside the live LTIC parameters, it read
+         * as the current state of whatever loop is running now.
+         *
+         * The ternary was the second half of the fault: every value that was
+         * neither ACQ nor DPLL printed as LOCK, so a byte that had never been
+         * written, or had been recalled from an older settings layout, claimed
+         * the most reassuring of the three states rather than the least. */
+        if (gCtrl.active_algo == 10) {
+            const char *sn = (g_ltic.state == LTIC_ACQ)  ? "ACQ"  :
+                             (g_ltic.state == LTIC_DPLL) ? "DPLL" :
+                             (g_ltic.state == LTIC_LOCK) ? "LOCK" : "?";
+            cli_puts("  state="); cli_puts(sn);
+            cli_putln("  (3-stage phase loop: ACQ->DPLL->LOCK)");
+        } else {
+            cli_puts("  state=- (algo ");  cli_putint(gCtrl.active_algo);
+            cli_putln(" running; the 3-stage state is algo 10's)");
+        }
         return;
     }
 
@@ -1463,7 +1792,7 @@ static void dispatch(char *line)
                 g_svin_enabled = (v == 1);
                 cli_puts("Survey-in: ");
                 cli_putln(g_svin_enabled ? "ENABLED (next boot)" : "DISABLED (next boot)");
-                cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV");
+                cli_autosaved(SET_FLAGS, "FLAGS: WU/SPL/SAW/LRN/SV/BL");
                 cli_putln("(ES to save; reboot to apply)");
             } else {
                 cli_putln("SV: use 0 (off) or 1 (on)");

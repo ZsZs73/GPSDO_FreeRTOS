@@ -1,7 +1,7 @@
 /**
  * gpsdo_control.cpp — vControlTask — OCXO control loop
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO v1.07.57rt
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -25,6 +25,7 @@
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
 #include "gpsdo_algorithms.h"
+#include "gpsdo_span.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -324,6 +325,10 @@ static void do_calibration(void)
         gFreq.flush_requested = true;
         xSemaphoreGive(xFreqMutex);
     }
+    /* Restart the loop, for the reason CT does (see do_calibrate_tune): the
+     * loop's own copy of the code is still the one from before the
+     * calibration, and its first steps would put that code back. */
+    algo_request_restart();
 
     xEventGroupClearBits(xSysEvents, EVT_NEED_CALIBRATION);
     g_calib_active = false;
@@ -336,44 +341,29 @@ static void do_calibration(void)
      * GPS.  Arm manually (AP command) once the loop reports lock.        */
     OUT_SERIAL.println("Calibration done");
 #ifdef GPSDO_PICDIV
-    OUT_SERIAL.println("Tip: arm picDIV (AP) after the loop locks (trend 'hit')");
+    /* The trend was named here and the name was wrong for everyone this tip is
+     * aimed at: 'hit' is emitted only by algorithms 0 and 3-8, never by 10-13,
+     * and a builder who has just run CT is running one of the latter. Whoever
+     * followed the instruction literally waited for a word that could not
+     * appear. The lock indication belongs to the display and to CS, which know
+     * per-algorithm what it means; this line only has to say WHEN. */
+    OUT_SERIAL.println("Tip: arm picDIV (AP) once the loop reports lock");
 #endif
 }
 
 /* ======================================================================
- * do_calibrate_tune (CT command)
+ * CT helpers — one three-point measurement, and the shared failure exit.
  *
- * Extended calibration that BOTH centres the PWM and derives the PID
- * coefficients for all algorithms from the measured plant gain.
- *
- * Procedure (deterministic, ~3 × OCXO_CALIB_SECS):
- *   1. Drive PWM to three points (1.5 / 2.0 / 2.5 V), settle, measure f.
- *   2. Least-squares slope → K [Hz/LSB] (the plant gain), plus the PWM
- *      that yields exactly 10 MHz.
- *   3. Compute coefficients from K:
- *        PLL (4,5,7): Kp = 0.40/K on frequency; Kd=2.0, Ki=0.02 on phase
- *        FLL (3,6):   Kp = 0.35/K; Ki = Kp/300; Kd = Kp·73
- *        NN  (9):     nn_max_step = 0.05/K
- *   4. Write g_pid[], show before/after.  Caller (CT) decides on ES save.
- *
- * No iterative tuning, no forced oscillation — safe to run any time.
+ * Factored out of do_calibrate_tune when the second pass appeared: the
+ * measurement itself is identical for both passes, only the code spread
+ * differs, and a second copy of the settle/average/fit block would be the
+ * kind of duplicate that gets fixed in one place and not the other.
  * ====================================================================== */
-static void do_calibrate_tune(void)
+static bool ct_measure3(uint16_t pa, uint16_t pb, uint16_t pc,
+                        double *K, double *b)
 {
-    const uint16_t PWM_A = 30720;   /* 1.5 V */
-    const uint16_t PWM_B = 39322;   /* 2.0 V */
-    const uint16_t PWM_C = 51200;   /* 2.5 V */
-
-    OUT_SERIAL.println("CT: calibrate + auto-tune started (3 points)");
-    g_calib_active = true;
-    g_calib_kind   = CALIB_CT;
-    /* CT was the one procedure that never seeded this, so the status bar sat
-     * at "Tune 0s" for the whole run while C and LC counted down properly.
-     * Three PWM points, each settling for OCXO_CALIB_SECS, plus a few seconds
-     * for the averaging and the arithmetic at the end. */
-    g_calib_remaining = 3u * OCXO_CALIB_SECS + 5u;
-
-    double f[3]; const uint16_t pwm[3] = { PWM_A, PWM_B, PWM_C };
+    const uint16_t pwm[3] = { pa, pb, pc };
+    double f[3];
     for (int i = 0; i < 3; i++) {
         gpsdo_dac_write16(pwm[i]);
         OUT_SERIAL.print("CT: PWM="); OUT_SERIAL.print(pwm[i]);
@@ -390,7 +380,7 @@ static void do_calibrate_tune(void)
         OUT_SERIAL.print("="); OUT_SERIAL.println(f[i], 3);
     }
 
-    /* Least-squares slope of f vs pwm over the three points → K [Hz/LSB] */
+    /* Least-squares slope of f vs pwm over the three points */
     double sx = 0, sy = 0, sxx = 0, sxy = 0;
     for (int i = 0; i < 3; i++) {
         sx += pwm[i]; sy += f[i];
@@ -398,35 +388,140 @@ static void do_calibrate_tune(void)
         sxy += (double)pwm[i] * f[i];
     }
     double denom = 3.0 * sxx - sx * sx;
-    if (denom == 0.0) {
+    if (denom == 0.0) return false;
+    *K = (3.0 * sxy - sx * sy) / denom;        /* Hz/LSB */
+    *b = (sy - (*K) * sx) / 3.0;               /* intercept */
+    return true;
+}
+
+/* Every CT failure exits the same way: put the loop's code back, drop the
+ * event bit, leave the coefficients untouched. The message is the caller's
+ * to print — it knows what went wrong, this only knows how to leave. */
+static void ct_fail(void)
+{
+    gpsdo_dac_write16(gCtrl.pwm_output);
+    xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
+    g_calib_active = false;
+    g_calib_kind   = CALIB_NONE;
+    g_calib_remaining = 0;
+}
+
+/* ======================================================================
+ * do_calibrate_tune (CT command)
+ *
+ * Extended calibration that BOTH centres the PWM and derives the PID
+ * coefficients for all algorithms from the measured plant gain.
+ *
+ * Procedure (deterministic, ~3 × OCXO_CALIB_SECS, doubled on gentle boards):
+ *   1. Drive PWM to three points (1.5 / 2.0 / 2.5 V), settle, measure f.
+ *   2. Least-squares slope → K [Hz/LSB] (the plant gain), plus the PWM
+ *      that yields exactly 10 MHz.
+ *   2b. If K is gentle (span-reduced EFC, external DAC with a divider),
+ *      RE-MEASURE over a wider code spread centred on the fitted 10 MHz
+ *      code: the fixed pass-1 spread is 20 480 LSB, which at e.g.
+ *      20 µHz/LSB swings the oscillator only 0.4 Hz — a small signal for
+ *      the GPS-referenced averages to slope-fit, and the fit scattered
+ *      10-50% high on exactly such a board (Dan Wiering's V2, measured
+ *      against a 6.5-digit DMM and a counter). The second pass targets
+ *      ~0.8 Hz of swing, never narrower than pass 1, and never closer
+ *      than CT_RAIL_GUARD to either rail. Its K replaces pass 1's.
+ *   3. Compute coefficients from K:
+ *        PLL (4,5,7): Kp = 0.40/K on frequency; Kd=2.0, Ki=0.02 on phase
+ *        FLL (3,6):   Kp = 0.35/K; Ki = Kp/300; Kd = Kp·73
+ *        NN  (9):     nn_max_step = 0.05/K
+ *   4. Write g_pid[], show before/after.  Caller (CT) decides on ES save.
+ *
+ * No iterative tuning, no forced oscillation — safe to run any time.
+ * ====================================================================== */
+static void do_calibrate_tune(void)
+{
+    const uint16_t PWM_A = 30720;   /* 1.5 V */
+    const uint16_t PWM_B = 39322;   /* 2.0 V */
+    const uint16_t PWM_C = 51200;   /* 2.5 V */
+    /* Below this K the fixed pass-1 spread stops being enough signal (see
+     * the header). 0.12 mHz/LSB = a 2.5 Hz swing over pass 1's 20 480 LSB —
+     * where a coarser plant (the original board, 0.32 mHz/LSB) swings 6.6 Hz
+     * and never needs the second pass at all. */
+    const double CT_SMALL_K       = 1.2e-4;
+    const double CT_TARGET_SWING  = 0.80;   /* Hz over the pass-2 spread */
+    /* HOW FAR THE PASS-2 SWEEP MUST STAY OFF EITHER RAIL.
+     *
+     * The bottom of this sweep always had a 1000 LSB guard; the top had none,
+     * because the high clamp stopped the centre from going PAST 65535 - half
+     * rather than from reaching it. On Dan Wiering's board (2026-09-10) the
+     * fitted null landed at 45 577 with half = 20 654, the centre was pulled
+     * down to exactly 65535 - half, and the top measurement point sat on full
+     * code. It measured cleanly there — the three points were linear to the
+     * digit — but a converter's output buffer is at its least linear against
+     * its own rail, and a calibration that defines the plant gain is the last
+     * place to spend the last LSB of range. Same guard at both ends now.
+     *
+     * Costs nothing in swing: the span is CT_TARGET_SWING / K either way, and
+     * only the CENTRING moves. It can cost some centring — on that board the
+     * sweep would have run 23 227 / 43 881 / 64 535 with the null 1699 LSB
+     * above centre — which a three-point least-squares slope does not care
+     * about as long as the plant is linear across the range, and if it is not
+     * linear across the range then the slope was never the whole story anyway.
+     *
+     * The span cap above (60 000) is what guarantees the two clamps can both
+     * be satisfied: they collide only past 65535 - 2*CT_RAIL_GUARD = 63 535. */
+    const int32_t CT_RAIL_GUARD   = 1000;   /* LSB kept clear at BOTH ends */
+
+    /* The span jumper has just moved and the move is still being debounced:
+     * the active span is about to change under this measurement. Let the
+     * control loop finish the switch first — the event bit stays set, so CT
+     * runs on the next pass, in the right span, rather than running for
+     * minutes and then being thrown away by the check below. */
+    {
+        static bool s_said = false;          /* once per wait, not per pass */
+        if (span_pin_moved_since(span_active())) {
+            if (!s_said) {
+                OUT_SERIAL.println("CT: the span jumper has just moved - waiting for the switch");
+                s_said = true;
+            }
+            return;
+        }
+        s_said = false;
+    }
+
+    OUT_SERIAL.println("CT: calibrate + auto-tune started (3 points)");
+    g_calib_active = true;
+    g_calib_kind   = CALIB_CT;
+    /* The span the measurement belongs to. The control task does not poll the
+     * jumper while CT runs, so a move during it is only noticed afterwards —
+     * which is fine for the switch and fatal for the fit: three points taken
+     * across two plants is a slope of neither. Checked after each pass. */
+    const uint8_t ct_span = span_active();
+    /* CT was the one procedure that never seeded this, so the status bar sat
+     * at "Tune 0s" for the whole run while C and LC counted down properly.
+     * Three PWM points, each settling for OCXO_CALIB_SECS, plus a few seconds
+     * for the averaging and the arithmetic at the end. Topped up below if
+     * the gentle-plant second pass runs. */
+    g_calib_remaining = 3u * OCXO_CALIB_SECS + 5u;
+
+    /* ---- pass 1: the fixed historical spread, a coarse K ---- */
+    double K, b;
+    if (!ct_measure3(PWM_A, PWM_B, PWM_C, &K, &b)) {
         OUT_SERIAL.println("CT: ERROR singular fit — aborting, params unchanged");
-        gpsdo_dac_write16(gCtrl.pwm_output);
-        xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
-        g_calib_active = false;
-        g_calib_kind   = CALIB_NONE;
-        g_calib_remaining = 0;
+        ct_fail();
         return;
     }
-    double K = (3.0 * sxy - sx * sy) / denom;        /* Hz/LSB */
-    double b = (sy - K * sx) / 3.0;                  /* intercept */
 
-    /* Sanity: K must be positive and physically plausible. The lower bound
-     * must accommodate NARROW-span EFC oscillators, which are DESIRABLE — a
-     * smaller Hz/LSB means finer tuning resolution and is one route to E-12
-     * stability. Dan Wiering's build measured 0.048 mHz/LSB (K = 4.8e-5) with
-     * a ~1.05 V EFC span, well below the old 0.1 mHz/LSB floor, and was
-     * wrongly rejected. Floor lowered to 2e-5 (0.02 mHz/LSB ≈ 1.3 Hz full
-     * span); upper 2e-3 kept for wide/non-linear parts. Only genuine noise /
-     * no-GPS runs (K≈0 or absurdly large) are now rejected. */
-    if (K < 2e-5 || K > 2e-3) {
+    /* Coarse plausibility only — wide, because this K just has to be good
+     * enough to size and centre the second pass. Genuine no-GPS / no-signal
+     * runs (K near zero, or absurdly large) die here; everything else gets
+     * measured properly before it is believed. */
+    if (K < 5e-6 || K > 5e-3) {
         OUT_SERIAL.print("CT: ERROR K out of range (");
         OUT_SERIAL.print(K * 1000.0, 4);
         OUT_SERIAL.println(" mHz/LSB) — check GPS fix. Params unchanged.");
-        gpsdo_dac_write16(gCtrl.pwm_output);
-        xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
-        g_calib_active = false;
-        g_calib_kind   = CALIB_NONE;
-        g_calib_remaining = 0;
+        ct_fail();
+        return;
+    }
+
+    if (span_pin_moved_since(ct_span)) {
+        OUT_SERIAL.println("CT: the span jumper moved during the measurement - discarded, params unchanged");
+        ct_fail();
         return;
     }
 
@@ -434,30 +529,81 @@ static void do_calibrate_tune(void)
     int32_t v = (int32_t)((10000000.0 - b) / K);
     if (v < 1)     v = 1;
     if (v > 65535) v = 65535;
+
+    /* ---- pass 2: gentle plant — same three points, wider and centred ---- */
+    if (K < CT_SMALL_K) {
+        double span = CT_TARGET_SWING / K;
+        if (span < 20480.0) span = 20480.0;   /* never narrower than pass 1 */
+        if (span > 60000.0) span = 60000.0;   /* stay off both rails */
+        int32_t half = (int32_t)(span * 0.5);
+        int32_t ctr  = v;
+        int32_t lo_c = CT_RAIL_GUARD + half;
+        int32_t hi_c = 65535 - CT_RAIL_GUARD - half;
+        if (ctr < lo_c) ctr = lo_c;
+        if (ctr > hi_c) ctr = hi_c;
+        g_calib_remaining += 3u * OCXO_CALIB_SECS;
+        OUT_SERIAL.print("CT: K small — second pass, wider span (");
+        OUT_SERIAL.print((int32_t)(ctr + half) - (int32_t)(ctr - half));
+        /* Say which of the two it is. The old line claimed the sweep was
+         * centred on the fitted code even when the rail clamp had just moved
+         * it, which is the one case where knowing matters. */
+        if (ctr != v) {
+            OUT_SERIAL.print(" LSB, centre ");
+            OUT_SERIAL.print(ctr);
+            OUT_SERIAL.print(" held clear of the rail; fitted null ");
+            OUT_SERIAL.print(v);
+            OUT_SERIAL.println(")");
+        } else {
+            OUT_SERIAL.println(" LSB, centred on the fitted 10 MHz code)");
+        }
+        if (!ct_measure3((uint16_t)(ctr - half), (uint16_t)ctr,
+                         (uint16_t)(ctr + half), &K, &b)) {
+            OUT_SERIAL.println("CT: ERROR singular fit — aborting, params unchanged");
+            ct_fail();
+            return;
+        }
+        /* the null is refit from the pass-2 line, which is the accurate one */
+        v = (int32_t)((10000000.0 - b) / K);
+        if (v < 1)     v = 1;
+        if (v > 65535) v = 65535;
+    }
     uint16_t new_pwm = (uint16_t)v;
+
+    if (span_pin_moved_since(ct_span)) {
+        OUT_SERIAL.println("CT: the span jumper moved during the measurement - discarded, params unchanged");
+        ct_fail();
+        return;
+    }
+
+    /* FINAL sanity gate, on the K that will actually tune the loop. The
+     * lower bound must accommodate NARROW-span EFC oscillators, which are
+     * DESIRABLE — a smaller Hz/LSB means finer tuning resolution and is one
+     * route to E-12 stability. Dan Wiering's build measured 0.048 mHz/LSB
+     * (K = 4.8e-5) with a ~1.05 V EFC span, well below the old 0.1 mHz/LSB
+     * floor, and was wrongly rejected. Floor at 1e-5 (0.01 mHz/LSB ≈ 0.65 Hz
+     * full span): defensible NOW because the coarse gate above catches the
+     * no-signal garbage before any K is believed, and the second pass
+     * measures gentle plants with a real signal instead of a scatter — the
+     * two things this floor used to have to do alone. Upper 2e-3 kept for
+     * wide/non-linear parts. */
+    if (K < 1e-5 || K > 2e-3) {
+        OUT_SERIAL.print("CT: ERROR K out of range (");
+        OUT_SERIAL.print(K * 1000.0, 4);
+        OUT_SERIAL.println(" mHz/LSB) — check GPS fix / EFC span. Params unchanged.");
+        ct_fail();
+        return;
+    }
 
     OUT_SERIAL.print("CT: K=");       OUT_SERIAL.print(K * 1000.0, 4);
     OUT_SERIAL.print(" mHz/LSB  PWM(10MHz)="); OUT_SERIAL.println(new_pwm);
 
-    /* ---- derive coefficients from K ---- */
+    /* ---- derive coefficients from K ----
+     * In algo_coeffs_from_k() now, because a move of the span jumper has to
+     * derive the same set from a stored K. The two locals are for the report
+     * below, which is unchanged. */
+    algo_coeffs_from_k(K);
     double kp_pll = 0.40 / K;
     double kp_fll = 0.35 / K;
-
-    /* PLL algorithms 4, 5, 7 — Kp on frequency, gentle fixed phase terms */
-    for (int n = 4; n <= 7; n++) {
-        if (n == 6) continue;                 /* 6 is FLL, handled below */
-        g_pid[n].Kp = kp_pll;
-        g_pid[n].Ki = 0.02;
-        g_pid[n].Kd = 2.0;
-    }
-    /* FLL algorithms 3 and 6 — classic frequency-domain PID */
-    for (int n = 3; n <= 6; n += 3) {
-        g_pid[n].Kp = kp_fll;
-        g_pid[n].Ki = kp_fll / 300.0;
-        g_pid[n].Kd = kp_fll * 73.0;
-    }
-    /* NN output step */
-    g_nn_max_step = 0.05 / K;
 
     /* Note: algo 8 (hybrid) is tuned implicitly — it reads g_pid[6] and
      * g_pid[7], both updated above.  algo 9 (NN) uses fixed weights, so
@@ -482,6 +628,25 @@ static void do_calibrate_tune(void)
         gFreq.flush_requested = true;
         xSemaphoreGive(xFreqMutex);
     }
+    /* RESTART THE LOOP, EVERY TIME. CT has just put a new code on the pin,
+     * and every loop keeps its own copy of where the pin should be —
+     * algorithm 11's integrator, algorithm 10's absolute target — which
+     * still holds the code from before the sweep. Left alone, the loop's
+     * first steps after CT's 100 s flush steer back toward that old code and
+     * undo the centring. spansim measured it with a CT that succeeds while
+     * the loop has been running (the mislabel scenario, third attempt):
+     * without this, twenty minutes on the code sat 42 LSB off CT's null at
+     * 1.0e-10, and the span pair learned from there put the next jumper move
+     * 1.1e-10 off; with it, 1.2e-11 and 3.7e-12. In a build without span
+     * sensing, a CT right after the jumper moved went back toward the old
+     * code, 3.1e-8 off at worst; with the restart, 5.0e-9. The restart is the
+     * one an algorithm change does, and it re-seeds every loop from the live
+     * code, which is CT's null.
+     *
+     * Here, not in span_ct_done() where build 55 first put it: nothing about
+     * this depends on the span jumper, and there a build without
+     * GPSDO_SPAN_SENSE compiled it away and kept the defect. */
+    algo_request_restart();
 
     xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
     g_calib_active = false;
@@ -498,6 +663,9 @@ static void do_calibrate_tune(void)
     } else {
         OUT_SERIAL.println("CT: done, but the auto-save FAILED — run 'ES PID' manually.");
     }
+    /* And the span record: this K belongs to the position the jumper is in.
+     * No-op on a build without span sensing, so CT there is exactly as it was. */
+    span_ct_done(K, new_pwm);
 }
 
 #ifdef GPSDO_LTIC
@@ -983,6 +1151,51 @@ static void do_ltic_calibrate(void)
             OUT_SERIAL.println("V (0.632xVsat)");
         }
     }
+    /* THE ANCHOR SLOPE CANNOT EXCEED THE WHOLE-TRANSIT AVERAGE.
+     *
+     * The two ns/V numbers this routine can produce are not interchangeable and
+     * one of them bounds the other. range_ns/span is the AVERAGE dφ/dV over the
+     * swept band; nsv above is the LOCAL dφ/dV at the anchor. On the ramp this
+     * detector actually is — V = Vsat(1 − e^(−φ/τ)) — dφ/dV = (τ/Vsat)·e^(φ/τ)
+     * rises with φ, so the average over a transit that reaches past the anchor
+     * is taken at a point ABOVE it and is therefore LARGER. For the geometry
+     * here (Vsat 3.29 V, transit 0.80..3.22 V) the anchor value should be about
+     * 0.55 of the average. A local slope ABOVE the average is not a slope this
+     * ramp can have: it means the ±LTIC_ANCHOR_WIN_V window caught a disturbed
+     * stretch and the fit did not converge.
+     *
+     * WHAT IT COST, and why this is not hypothetical. Two calibrations of the
+     * same detector, LZO 2.0809 → 2.0797 and LRN 3000.00 → 2958.75 (so the ramp
+     * itself did not move), and:
+     *
+     *   builds 16-41   LNV 1252.0   = 1.01 x the whole-transit average
+     *   build 42       LNV 1837.7   = 1.50 x the whole-transit average
+     *
+     * The second was measured while the phase was unstable. Nothing downstream
+     * noticed a bad slope directly — what it broke was the SATURATION GUARD in
+     * ltic_phase_error_ns(), which sizes the usable band as range_ns/ns_per_volt
+     * and so shrank from ±1.318 V to ±0.886 V about the zero. The picDIV lands
+     * this board's phase 1.06..1.28 V below the zero, a fixed physical offset
+     * that did not move — but it was now OUTSIDE the band, so every landing read
+     * as railed. Algorithm 11's phase-capture bridge then re-armed the divider
+     * every 20 s, eight times, until one landing happened to fall 0.67 V out and
+     * be accepted; the loop locked thirty seconds later. Eight arms for a
+     * calibration artefact.
+     *
+     * So: keep the anchor (the Vsat fit runs over the whole transit and is
+     * robust — LZO agreed to 1.2 mV across the two runs) and replace only the
+     * slope, which is the one number fitted from a handful of points. */
+    if (nsv > 0.0 && span > 0.05 && range_ns > 0.0) {
+        double avg_nsv = range_ns / (double)span;
+        if (avg_nsv > 0.0 && nsv > avg_nsv) {
+            OUT_SERIAL.print("LC: anchor slope ");   OUT_SERIAL.print(nsv, 1);
+            OUT_SERIAL.print(" ns/V is above the whole-transit average ");
+            OUT_SERIAL.print(avg_nsv, 1);
+            OUT_SERIAL.println(" — impossible on an exponential ramp; the local fit did not converge.");
+            nsv = avg_nsv;
+            anchor_n = 0;              /* report it as the average, not the anchor */
+        }
+    }
     if (nsv <= 0.0 && span > 0.05) {              /* fallback: whole-ramp avg */
         nsv = range_ns / span;
         OUT_SERIAL.println("LC: (anchor band not crossed — using range/span average)");
@@ -1327,6 +1540,13 @@ void vControlTask(void *pvParameters)
                     g_time_offset_min = tz_resolve(lat, lon, gd, gmo, gy, gh, gmi);
             }
         }
+
+        /* ---- span jumper (PB14) ----
+         * Before the loop step, on this task, so a move is remapped between two
+         * corrections and never under one. Polled whether or not the loop is
+         * running this second: a move in holdover still has to keep the voltage
+         * on the EFC pin where it was. */
+        span_poll();
 
         /* ---- Frequency averaging ---- */
         {

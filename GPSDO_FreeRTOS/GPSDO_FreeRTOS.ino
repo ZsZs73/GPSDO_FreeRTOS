@@ -40,6 +40,7 @@
 
 #include "gpsdo_config.h"
 #include "gpsdo_dac.h"
+#include "gpsdo_backlight.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
 #include "gpsdo_algorithms.h"
@@ -79,6 +80,7 @@ extern void persist_recall(void);
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
+#include "gpsdo_span.h"
 
 /* declared in gpsdo_cli.cpp — single byte, safe to read without mutex */
 extern int16_t g_time_offset_min;
@@ -324,6 +326,13 @@ void setup()
     digitalWrite(PIN_PICDIV_ARM, LOW);
 #endif
 
+    /* ---- TFT backlight PWM on PB5 (TIM3 CH2) ----
+     * Early, and before the splash: the panel should be lit by the time
+     * anything is drawn on it. Applies the compile-time default here; the
+     * stored percentage arrives with settings_recall() below, which calls
+     * backlight_set() itself. */
+    backlight_begin();
+
     /* ---- 2 kHz test square wave on PB5 (TIM3 CH2) ---- */
 #ifdef GPSDO_GEN_2kHz_PB5
     analogWrite(PIN_TEST_2KHZ, 127);
@@ -395,6 +404,12 @@ void setup()
 #endif
     if (live_store_begin())
         OUT_SERIAL.println("Live store: LRN + LC applied from flash ring");
+
+    /* Span jumper on PB14: which calibration this board is running on, and —
+     * if the jumper was moved while it was off — the recalled code remapped
+     * into the span it is now in. Here, after both recalls and before the
+     * write below, so the oscillator never sees a code from the wrong span. */
+    span_begin();
 
     /* Re-apply PWM: live_store may have overridden the settings value with a
      * fresher one. The OCXO should not sit at the stale PWM until the loop's
