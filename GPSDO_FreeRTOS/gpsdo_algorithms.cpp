@@ -1762,7 +1762,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
          * them and stays fast, which is what it needs. */
         if (near) { if (s_near_run < 0xFFFFFFFFu) s_near_run++; }
         else        s_near_run = 0;
-        if (!s_locked && s_near_run < filt) filt = 1u;
+        if (s_near_run < filt) filt = 1u;
     }
 
     /* If timeConst changed under us, rescale the integrator so the output does
