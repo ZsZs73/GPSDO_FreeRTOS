@@ -4605,7 +4605,13 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
          * predicting. The state still carries frequency and aging, so the
          * control below goes on steering from the model. */
         if (s_kf_holdover < 0xFFFFFFFFu) s_kf_holdover++;
-        set_trend("HOLD");
+        /* NOPH, not HOLD. Three unrelated states used the same word on one
+         * screen: this one (the detector said nothing THIS SECOND), the
+         * operator's or the automatic holdover mode printed as [HOLDOVER]
+         * beside it, and SW's "holdover - MCU crystal" for a system clock
+         * running without PPS. Algorithm 12 already calls this NOPH; there was
+         * no reason for 13 to name it differently, and every reason not to. */
+        set_trend("NOPH");
     } else {
         s_kf_holdover = 0;
         double S = s_kf_P[0][0] + R;
