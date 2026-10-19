@@ -1614,6 +1614,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
     static float    s_integ         = 0.0f;   /* dacValue: integral accumulator */
     static float    s_i_remain      = 0.0f;   /* Lars' I_term_remain            */
     static float    s_phase_filt    = 0.0f;   /* filtered phase [ns]            */
+    static uint32_t s_near_run      = 0u;     /* s with the phase inside the window */
     static uint32_t s_lock_cnt      = 0;      /* Lars' lockPPScounter           */
     static bool     s_locked        = false;
     static bool     s_init          = false;
@@ -1629,7 +1630,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
      * cleared even on a switch into a loop that cannot yet run. */
     if (algo_take_restart()) {
         s_pol_warned = false;
-        s_integ = 0.0f; s_i_remain = 0.0f; s_phase_filt = 0.0f;
+        s_integ = 0.0f; s_i_remain = 0.0f; s_phase_filt = 0.0f; s_near_run = 0u;
         s_lock_cnt = 0; s_locked = false;
         s_init = false;                     /* re-seed from the live PWM */
         s_tc_old = 0;
@@ -1649,7 +1650,14 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
     }
     /* Refuse to run without TIC calibration — phase has no scale otherwise. */
     if (g_ltic.ns_per_volt == 0.0f || g_ltic.range_ns == 0.0f) {
-        set_trend(0);
+        /* NOT set_trend(0). That passed a null pointer to strncpy(), which is
+         * undefined behaviour rather than a blank indicator, and it was
+         * reachable on every board that had not yet been through LC — which is
+         * every new board, on its first run, before anything else can go
+         * wrong. The state deserves a name in any case: the operator needs to
+         * know WHY the loop is holding, and algorithm 13 already answers
+         * exactly this question with NoCT for the other missing coefficient. */
+        set_trend("NoCT");
         return pwm;
     }
 
@@ -1699,13 +1707,63 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
     }
 
     /* ---- adaptive filter/time constants (Lars 261-263) ----
-     * filterConst = timeConst / filterDiv, forced to 1 while unlocked so the
-     * loop reacts fast during acquisition and smooths only once settled. */
+     * filterConst = timeConst / filterDiv, with the smoothing dropped to 1 while
+     * the phase is genuinely out of range so the loop reacts fast during a real
+     * acquisition and smooths as soon as it is home.
+     *
+     * IT USED TO READ `if (!s_locked) filt = 1u;` AND THAT IS A DIFFERENT
+     * CONDITION. s_locked is not "the phase is out of range": it is a stopwatch.
+     * The lock test below requires phase AND frequency to sit inside their
+     * windows CONTINUOUSLY for lock_factor * time_const seconds - five minutes
+     * on the defaults - so a loop that is already home stays formally unlocked
+     * for five more minutes, and this line kept it in fast, unsmoothed mode for
+     * every one of those seconds. Unsmoothed means the loop answers each sample
+     * of detector noise at full gain.
+     *
+     * Measured, 11.09 capture, switching from algorithm 13 to 11 with the phase
+     * sitting at 2.4 ns: 299 s of PLL during which the filtered phase never
+     * left +/-6.7 ns of a 100 ns window - and the PWM moved by an average of
+     * 4.5 LSB per second, as much as 17 in one second, on 145 of those 298
+     * seconds by more than 4. Seventeen LSB is 5.4e-10 on this board. The same
+     * loop, locked, over 14.6 hours: 0 or 1 LSB every second, 2 LSB forty times,
+     * never more. An order of magnitude of output noise, from a flag that was
+     * only ever meant to describe how long the loop had been good for.
+     *
+     * The replacement asks what the fast mode is actually for. RAW phase as well
+     * as filtered, because s_phase_filt starts at zero on a restart and would
+     * otherwise report "in the window" while the true phase is hundreds of
+     * nanoseconds out, smoothing the loop through exactly the acquisition the
+     * fast mode exists to hurry. Railed counts as out of range for the same
+     * reason. The lock stopwatch still gates the LOCK indication, CS and the
+     * display - it just no longer decides how hard the loop hits the EFC. */
     uint16_t time_const = g_lars.time_const_s;
     if (time_const < 1u) time_const = 1u;
     uint32_t filt = (uint32_t)time_const / (g_lars.filter_div ? g_lars.filter_div : 1u);
     if (filt < 1u) filt = 1u;
-    if (!s_locked) filt = 1u;
+    {
+        double win = (double)g_lars.lock_ns_lim;
+        bool near = !railed && ph_valid &&
+                    fabs(phase_ns)             <= win &&
+                    fabs((double)s_phase_filt) <= win;
+        /* AND IT HAS TO HAVE STAYED THERE. A phase on its way OUT passes
+         * through the window too, and smoothing it there is how the loop learns
+         * about a disturbance late: the switch harness measured algorithm 11
+         * ending a 600 s excursion at 340 ns instead of 241 when the window
+         * test alone was used. The pre-filter's job is to reject noise, not
+         * motion.
+         *
+         * So the phase must have been inside the window for as long as the
+         * filter is about to average over. That is not a new constant - it is
+         * `filt` itself, and it is the only self-consistent choice: smoothing
+         * over N seconds is meaningful exactly when the last N seconds were
+         * describing the same thing. A settled loop waiting out the lock
+         * stopwatch has hundreds of such seconds and smooths from the first;
+         * a loop whose phase is walking through the window never accumulates
+         * them and stays fast, which is what it needs. */
+        if (near) { if (s_near_run < 0xFFFFFFFFu) s_near_run++; }
+        else        s_near_run = 0;
+        if (s_near_run < filt) filt = 1u;
+    }
 
     /* If timeConst changed under us, rescale the integrator so the output does
      * not jump (Lars 266-268: dacValue scales with timeConst). Our integrator
@@ -4009,7 +4067,7 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
     }
     if (g_ltic.ns_per_volt == 0.0f || g_ltic.range_ns == 0.0f) {
         s_kf_locked = false;
-        set_trend(0);
+        set_trend("NoCT");   /* not set_trend(0) — see algorithm 11's copy */
         return pwm;
     }
     /* Scale, from CT. lsb_per_ns is the counts that null one nanosecond of
