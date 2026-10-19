@@ -197,6 +197,42 @@ void ltic_read_fast(void)
 #endif
 }
 
+/* THE PHASE AS A DISPLAY MAY REPORT IT - ONE COPY, BECAUSE TWO DISAGREED.
+ *
+ * The panel and the serial report each derived dph from g_ltic_voltage down
+ * their own path, and they drifted apart twice. First over the sawtooth: the
+ * panel subtracted it and the report did not, so the same instant read a whole
+ * qErr differently on the two. Then over the BAND, which is what this function
+ * is really for.
+ *
+ * ns_per_volt is a LOCAL slope. LC reads it in a narrow window around the
+ * anchor it places at 0.632*Vsat, because the ramp is V = Vsat*(1 - e^(-t/tau))
+ * and an exponential has no single slope. Far from that anchor the curve
+ * flattens and a linear reading UNDERSTATES the phase; past Vsat the stop pulse
+ * has missed the window entirely and the cap charges on to the supply rail, at
+ * which point the number means nothing whatever. The 15%..85% band is where the
+ * local slope stays within about a third of its anchor value.
+ *
+ * Returns true when the reading is inside the band the calibration covers.
+ * *ns_out is written whenever LC has run, so a caller that wants the number
+ * anyway still has it - but it has been told. */
+static bool ltic_display_phase(double *ns_out)
+{
+    if (g_ltic.ns_per_volt <= 1.0f) return false;
+
+    double centre = (g_ltic.zero_offset > 0.001f)
+                    ? (double)g_ltic.zero_offset : 0.22;
+    double vsat_est = centre / 0.63212;
+    double v = (double)g_ltic_voltage;
+
+    if (ns_out) {
+        *ns_out = (v - centre) * (double)g_ltic.ns_per_volt
+                  - (double)s_ltic_qerr_ns;
+    }
+
+    return (v > 0.15 * vsat_est) && (v < 0.85 * vsat_est);
+}
+
 #endif /* GPSDO_LTIC */
 
 /* Set true by vSensorTask once all sensor detection has completed, so the
@@ -792,25 +828,23 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                         p=sd(buf,p,g_ocxo_volt,2); p=sa(buf,p,"V ");
                         p=sd(buf,p,g_ocxo_curr,0); p=sa(buf,p,"mA");
 #ifdef GPSDO_LTIC
-    p=sa(buf,p,"  Vphase:"); p=sd(buf,p,(double)g_ltic_voltage,3); p=sa(buf,p,"V");
-    /* Derived phase in ns, once LC has calibrated the detector. Measured
-     * relative to zero_offset (mid-band), using the measured ns_per_volt —
-     * same convention as the loop's ltic_phase_error_ns() and the TFT row. */
-    if (g_ltic.ns_per_volt > 1.0f) {
-        double centre = (g_ltic.zero_offset > 0.001f)
-                        ? (double)g_ltic.zero_offset : 0.22;
-        double ph_ns = ((double)g_ltic_voltage - centre)
-                       * (double)g_ltic.ns_per_volt;
-        /* Subtract the receiver sawtooth, exactly as the TFT row and the loop
-         * do. Without this the serial report showed a RAW phase while the panel
-         * showed a corrected one, so the same instant read differently on the
-         * two — the whole sawtooth apart (~±10 ns on a LEA-6T, more on an M8T).
-         * The comment above already claimed this convention; now the code keeps
-         * it. Display paths use the value LATCHED at the pulse — see
-         * s_ltic_qerr_ns — not the live global, which by drawing time may
-         * already describe the next pulse. */
-        ph_ns -= (double)s_ltic_qerr_ns;
-        p=sa(buf,p," dph:"); p=sd(buf,p,ph_ns,1); p=sa(buf,p,"ns");
+    p=sa(buf,p,"  Vphase:");
+    p=sd(buf,p,(double)g_ltic_voltage,3);
+    p=sa(buf,p,"V");
+
+    {
+        double ph_ns = 0.0;
+        bool ok = ltic_display_phase(&ph_ns);
+
+        if (g_ltic.ns_per_volt > 1.0f) {
+            p=sa(buf,p," dph:");
+            if (ok) {
+                p=sd(buf,p,ph_ns,1);
+                p=sa(buf,p,"ns");
+            } else {
+                p=sa(buf,p,"ovf");
+            }
+        }
     }
 #endif
     /* CPU load, appended LAST on purpose: every reader of this line — the
@@ -2586,61 +2620,9 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
       {
           static char fv[8]; dtostrf((double)g_ltic_voltage, 5, 3, fv);
           const bool cal = (g_ltic.ns_per_volt > 1.0f);
-          /* ns_per_volt is a LOCAL slope: LC reads it in a narrow window around
-           * the anchor it places at 0.632*Vsat, because the ramp is
-           * V = Vsat*(1 - e^(-phase/tau)) and an exponential has no single
-           * slope. Far from that anchor the curve flattens and the linear
-           * reading understates the phase; past Vsat the stop pulse has simply
-           * missed the window and the cap charges on to the supply rail, at
-           * which point the number means nothing whatever.
-           *
-           * That last state is not hypothetical and not rare: it has twice been
-           * reported here as a rock-steady "+1561 ns" while the phase was in
-           * fact somewhere unknown, and both times it cost a measurement before
-           * anyone noticed. A reading that is wrong is recoverable; a reading
-           * that is wrong and looks calm is not.
-           *
-           * Vsat is not stored — LC fits it, places the anchor and discards it —
-           * but the anchor IS 0.632*Vsat by construction, so zero_offset
-           * recovers it. The 15%..85% band is where the local slope stays
-           * within about a third of its anchor value.
-           *
-           * The loop's own guard (railed_now, gpsdo_algorithms.cpp) tests a
-           * hard-coded 3.28 V. On a detector saturating near 2.9 V that never
-           * fires, so it is no help here and is worth a look in its own right. */
+
           double ns = 0.0;
-          bool in_band = false;
-          if (cal) {
-              double centre = (g_ltic.zero_offset > 0.001f)
-                              ? (double)g_ltic.zero_offset : 0.22;
-              double vsat_est = centre / 0.63212;
-              double v = (double)g_ltic_voltage;
-              in_band = (v > 0.15 * vsat_est) && (v < 0.85 * vsat_est);
-              ns = (v - centre) * (double)g_ltic.ns_per_volt;
-              /* Subtract the receiver's sawtooth, exactly as ltic_phase_error_ns()
-               * does for the loop. Without this the display was computing phase
-               * down a second, parallel path that skipped the correction — so
-               * algo 10 steered on a corrected phase while showing an
-               * uncorrected one, and the two differed by the whole sawtooth
-               * (~±10 ns on a LEA-6T, more on an M8T). Measured on air as ~14 ns
-               * of 1-sigma scatter on an otherwise flat reading.
-               *
-               * Not gated on the algorithm: ubx_timtp_correction_ns() already
-               * returns 0 unless SAW is on and a fresh qErr exists, and the
-               * sawtooth is the receiver's, not the loop's — it is there to be
-               * removed whatever is steering. This is what makes dph a usable
-               * instrument under algorithms 3-9, which never call the loop's
-               * phase path at all.
-               *
-               * Pairing is sound: UBX-TIM-TP describes the NEXT pulse, so it
-               * arrives after pulse N-1 carrying qErr(N), and g_ltic_voltage is
-               * sampled on pulse N's own ramp peak. Same pulse, same qErr —
-               * PROVIDED the qErr is the one latched at that pulse rather than
-               * the live global, which the burst carrying TIM-TP(N+1) has
-               * usually already overwritten by the time this row is drawn.
-               * See s_ltic_qerr_ns. */
-              ns -= (double)s_ltic_qerr_ns;
-          }
+          const bool in_band = ltic_display_phase(&ns);
 
           /* The formatted phase, for BOTH panels.
            *
