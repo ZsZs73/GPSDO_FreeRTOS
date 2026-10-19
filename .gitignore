@@ -5,3 +5,5 @@
 .vscode/ipch
 .vscode/extensions.json
 compile_commands.json
+__pycache__/
+*.pyc
