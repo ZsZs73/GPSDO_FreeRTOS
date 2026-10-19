@@ -8,7 +8,7 @@
  * AI:       Claude Opus 5 (Anthropic), GLM-5.3 Max (Z.ai), Qwen3.8-Max
  *
  *
- * Highest-priority task.  Woken by TIM3 capture ISR via xPpsQueue.
+ * Highest-priority task.  Woken by the TIM2 CH3 capture ISR via xPpsQueue.
  * Processes PPS events: updates a 20000-sample ring buffer, maintains
  * cumulative sums for 10/100/1000/10000 s averages, and publishes the
  * compact FreqSnap_t display snapshot under xFreqMutex.

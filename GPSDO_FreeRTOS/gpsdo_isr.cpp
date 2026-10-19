@@ -12,7 +12,7 @@
  * notify task, return immediately.  No math, no I2C, no Serial, no ADC.
  *
  * TIM2 overflow ISR  — flags 32-bit counter wrap
- * TIM3 capture ISR   — reads TIM2 value on GPS 1PPS rising edge,
+ * TIM2 CH3 capture ISR — reads TIM2 value on GPS 1PPS rising edge,
  *                       posts PpsEvent_t to xPpsQueue
  * Timer4 2Hz ISR     — gives xHalfSecondSem for uptime and LED blink
  */

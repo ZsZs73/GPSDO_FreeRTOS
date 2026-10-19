@@ -46,7 +46,8 @@
  * PB9 = TIM4_CH4, the same pin the plain PWM uses, so the existing filter and
  * wiring are unchanged. TIM4_UP drives DMA1 Stream 6 Channel 2. TIM4 is otherwise
  * used only by analogWrite, which this replaces; the 2 Hz tick is on TIM9 and the
- * 1PPS chain on TIM2/TIM3, so nothing is disturbed.
+ * 1PPS chain, which is TIM2 alone — the counter on ETR and the capture on
+ * channel 3 (PB10) — so nothing is disturbed.
  *
  * Two buffers, alternated by the DMA controller in double-buffer mode, so a
  * hardware buffer switch never interrupts a replay, and a value change refills
