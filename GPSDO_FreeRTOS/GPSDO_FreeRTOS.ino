@@ -352,13 +352,12 @@ void setup()
     }
     gpsdo_dac_write16(127);
 
-    /* Only for the plain PWM path. With dithering, TIM4 belongs to the DMA
-     * stream and these calls would reconfigure it underneath — analogWrite
-     * rewrites ARR and the compare mode, which would stop the replay dead. */
-#ifndef GPSDO_PWM_DITHER
-    analogWriteFrequency(2000);
-    analogWriteResolution(16);
-#endif
+    /* Nothing to set here any more. Both output paths now own TIM4 through
+     * registers — pwm24_begin() with the DMA replay, pwm16_begin() without —
+     * so the control voltage no longer passes through analogWrite() and no
+     * longer depends on analogWriteFrequency(), which is a GLOBAL in the core
+     * and would be fought over the moment a second PWM exists. The backlight
+     * on PB5 is that second PWM. */
 
     /* ---- Default control state (overwritten by EEPROM recall below) ---- */
     gCtrl.pwm_output  = DEFAULT_PWM_OUTPUT;
