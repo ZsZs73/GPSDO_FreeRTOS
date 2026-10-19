@@ -27,6 +27,7 @@
 #include "gpsdo_health.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_algorithms.h"   /* g_ltic (calibrated span) for the ADC outlier gate */
+#include "gpsdo_dac.h"          /* g_adc_vdiv: scale Vctl ADC readings */
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
@@ -601,17 +602,18 @@ static void print_tab_report(const GpsData_t *g, const FreqSnap_t *f,
     p = sa  (buf, p, u->time_str);                  buf[p++] = '\t';
     p = su64(buf, p, f->fcount64);                  buf[p++] = '\t';
     p = su64(buf, p, f->calcfreq64);                buf[p++] = '\t';
-    p = sd  (buf, p, f->avg10,    1);               buf[p++] = '\t';
-    p = sd  (buf, p, f->avg100,   2);               buf[p++] = '\t';
-    p = sd  (buf, p, f->avg1000,  3);               buf[p++] = '\t';
-    p = sd  (buf, p, f->avg10000, 4);               buf[p++] = '\t';
-    p = sd  (buf, p, f->avg20000, 5);               buf[p++] = '\t';
+    /* An average that has not filled its window yet is missing data, not 0 Hz. */
+    if (f->full10)    { p = sd(buf, p, f->avg10,    1); }  buf[p++] = '\t';
+    if (f->full100)   { p = sd(buf, p, f->avg100,   2); }  buf[p++] = '\t';
+    if (f->full1000)  { p = sd(buf, p, f->avg1000,  3); }  buf[p++] = '\t';
+    if (f->full10000) { p = sd(buf, p, f->avg10000, 4); }  buf[p++] = '\t';
+    if (f->full20000) { p = sd(buf, p, f->avg20000, 5); }  buf[p++] = '\t';
     p = si  (buf, p, g->sats);                      buf[p++] = '\t';
     /* Tab format keeps numeric HDOP (99.99 in Time Mode) for machine
      * parsing/plotting; the human-readable report shows HDOP:TIME. */
     p = sd  (buf, p, (double)g->hdop/100.0, 2);     buf[p++] = '\t';
     p = si  (buf, p, c->pwm_output);                buf[p++] = '\t';
-    p = sd  (buf, p, (c->avg_vctl_adc/4096.0)*3.3, 3);        buf[p++] = '\t';
+    p = sd  (buf, p, (c->avg_vctl_adc/4096.0)*3.3*g_adc_vdiv, 3);        buf[p++] = '\t';
     p = sd  (buf, p, (c->avg_vcc_adc /4096.0)*3.3*2.0, 2);    buf[p++] = '\t';
     p = sd  (buf, p, (1.21*4096.0)/(double)c->avg_vdd_adc, 3); buf[p++] = '\t';
     p = sd  (buf, p, g_encl_temp, 1);               buf[p++] = '\t';
@@ -680,7 +682,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 
     /* PWM / Vctl */
     p=sa(buf,p,"PWM:"); p=si(buf,p,c->pwm_output);
-    p=sa(buf,p,"  Vctl:"); p=sd(buf,p,((double)c->avg_vctl_adc/4096.0)*3.3,3);
+    p=sa(buf,p,"  Vctl:"); p=sd(buf,p,((double)c->avg_vctl_adc/4096.0)*3.3*g_adc_vdiv,3);
     p=sa(buf,p,"V");
     if (c->holdover_mode) p=sa(buf,p," [HOLDOVER]");
     else { p=sa(buf,p," "); p=sa(buf,p,c->trendstr); }
@@ -2198,7 +2200,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #endif
 
       { static char fv[8];
-        double vctl = ((double)c->avg_vctl_adc / 4096.0) * 3.3;
+        double vctl = ((double)c->avg_vctl_adc / 4096.0) * 3.3 * g_adc_vdiv;
         dtostrf(vctl, 5, 3, fv);
 #if defined(GPSDO_TFT_ILI9488)
         /* Split, so "Vct: 1.970 V" can sit on the alignment line while "PWM:"
@@ -3529,12 +3531,31 @@ void vDisplayTask(void *pvParameters)
         CtrlData_t snap_c;
         Uptime_t   snap_u;
 
+        /* Keep the last valid control snapshot. A temporary xCtrlMutex
+         * timeout must not leave snap_c uninitialised. */
+        static CtrlData_t s_last_c;
+        static bool       s_last_c_ok = false;
+
         memset(&snap_f, 0, sizeof(snap_f));
         memset(&snap_g, 0, sizeof(snap_g));
+        memset(&snap_c, 0, sizeof(snap_c));
 
-        if (xSemaphoreTake(xFreqMutex,   pdMS_TO_TICKS(5)) == pdTRUE) { snap_f = gFreqSnap; xSemaphoreGive(xFreqMutex); }
-        if (xSemaphoreTake(xGpsMutex,    pdMS_TO_TICKS(5)) == pdTRUE) { snap_g = gGps;      xSemaphoreGive(xGpsMutex); }
-        if (xSemaphoreTake(xCtrlMutex,   pdMS_TO_TICKS(5)) == pdTRUE) { snap_c = gCtrl;     xSemaphoreGive(xCtrlMutex); }
+        if (xSemaphoreTake(xFreqMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            snap_f = gFreqSnap;
+            xSemaphoreGive(xFreqMutex);
+        }
+        if (xSemaphoreTake(xGpsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            snap_g = gGps;
+            xSemaphoreGive(xGpsMutex);
+        }
+        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            snap_c = gCtrl;
+            xSemaphoreGive(xCtrlMutex);
+            s_last_c = snap_c;
+            s_last_c_ok = true;
+        } else if (s_last_c_ok) {
+            snap_c = s_last_c;
+        }
         uptime_snapshot(&snap_u);   /* pure function of the counter; no lock */
 
         fast_led_active = snap_c.holdover_auto;
@@ -3968,8 +3989,8 @@ void vDisplayTask(void *pvParameters)
              *   Auto-holdover:   "[A]" blinks with "   " at HOLDOVER_BLINK_MS rate. */
             {
                 static char fv_str[7];
-                double vctl = ((double)snap_c.avg_vctl_adc / 4096.0) * 3.3;
-                dtostrf(vctl, 4, 2, fv_str);   /* always 4 chars for 0.00..3.30 V */
+                double vctl = ((double)snap_c.avg_vctl_adc / 4096.0) * 3.3 * g_adc_vdiv;
+                dtostrf(vctl, 4, 2, fv_str);   /* 4 chars at AV=1.0; wider values expand as needed */
 
                 /* Build indicator string (exactly 3 chars + NUL) */
                 char ind[4];
