@@ -158,29 +158,72 @@ static uint8_t rule_day(const TzRule *r, uint16_t y)
     return (uint8_t)(day > len ? day - 7 : day);   /* "5th Sunday" that isn't */
 }
 
+/* Days elapsed in the year before this date, 0-based: 1 January = 0. Gives
+ * every instant of the year one ordinal, which is what lets a transition be
+ * shifted across midnight below. */
+static uint16_t tz_yday(uint8_t d, uint8_t m, uint16_t y)
+{
+    static const uint16_t cum[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+    uint16_t n = (uint16_t)(cum[m - 1] + (uint16_t)(d - 1));
+    if (m > 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) n++;
+    return n;
+}
+
 int16_t tz_offset_now(const TzSpec *tz, uint8_t day, uint8_t mon,
                       uint16_t year, uint16_t min_utc)
 {
     if (!tz->has_dst || !tz->start.mon || !tz->end.mon) return tz->std_min;
 
-    uint8_t sd = rule_day(&tz->start, year);
-    uint8_t ed = rule_day(&tz->end,   year);
-
-    /* Pack date+time into one comparable number. The transition times are
-     * nominally local, but comparing them against UTC only shifts each
-     * boundary by an hour or so — for a clock display that is immaterial,
-     * and it avoids a chicken-and-egg (you'd need the offset to know the
-     * local time to decide the offset).
+    /* THE RULE TIMES ARE LOCAL AND THIS FUNCTION IS GIVEN UTC.
      *
-     * DISPLAY-ONLY ASSUMPTION (audit v0.95): the ~1 h skew this introduces
-     * at the exact DST transition moment is acceptable for a wall-clock
-     * readout, which is the sole consumer today. Do NOT repurpose this
-     * function for time-critical logic (e.g. timestamping flash-ring
-     * entries) without first resolving the local-time boundary properly —
-     * iterate: guess offset → convert → re-check → settle. */
-    long now = (long)mon           * 1000000L + (long)day * 10000L + min_utc;
-    long st  = (long)tz->start.mon * 1000000L + (long)sd  * 10000L + tz->start.at_min;
-    long en  = (long)tz->end.mon   * 1000000L + (long)ed  * 10000L + tz->end.at_min;
+     * The previous version compared them directly and called the difference
+     * immaterial for a wall-clock readout. It is not, and the error is not the
+     * "hour or so" the old comment claimed: it is exactly the offset in force
+     * at the boundary, which is the whole point of the boundary. Measured
+     * against the real 2026 instants, before this change:
+     *
+     *   Europe/London   spring exact, autumn  +1 h late
+     *   Europe/Berlin   spring +1 h late,     autumn +2 h late
+     *   Europe/Athens   spring +2 h late,     autumn +3 h late
+     *   America/New_York  spring FIVE HOURS EARLY — 02:00 UTC instead of
+     *                     07:00, so the clock jumps at 21:00 on the Saturday
+     *                     EVENING, which nobody could mistake for a rounding
+     *                     error
+     *
+     * London's spring change came out exact only because GMT is UTC; that
+     * coincidence is what let the fault sit here unnoticed. Found by Dave
+     * (Solder_Junkie) on EEVblog asking whether London would switch by itself
+     * at the end of October — it did, an hour late, and the question was
+     * enough to make somebody finally measure it.
+     *
+     * There is no chicken-and-egg to avoid, which is what the old comment
+     * feared. A POSIX start rule is written in local STANDARD time and an end
+     * rule in local DST time — the offset each is measured against is fixed
+     * and known before the comparison, so each boundary converts to UTC by
+     * subtracting its own offset. No iteration, no guess.
+     *
+     * The subtraction can cross midnight and the year end (Australia/Sydney
+     * starts at 02:00 AEST, which is 16:00 UTC on the PREVIOUS day), so the
+     * comparison runs on a day-of-year ordinal rather than a packed date, and
+     * the boundaries wrap into the year. Residual, stated rather than hidden:
+     * a boundary that wraps past 1 January keeps the weekday computed for THIS
+     * year, which could be a day out. No zone in the IANA table transitions
+     * within fourteen hours of New Year, so the branch is a guard and not a
+     * behaviour. */
+    bool leap = ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0);
+    long ylen = (leap ? 366L : 365L) * 1440L;
+
+    long now = (long)tz_yday(day, mon, year) * 1440L + (long)min_utc;
+
+    long st = (long)tz_yday(rule_day(&tz->start, year), tz->start.mon, year) * 1440L
+              + (long)tz->start.at_min - (long)tz->std_min;
+    long en = (long)tz_yday(rule_day(&tz->end,   year), tz->end.mon,   year) * 1440L
+              + (long)tz->end.at_min   - (long)tz->dst_min;
+
+    while (st <  0)    st += ylen;
+    while (st >= ylen) st -= ylen;
+    while (en <  0)    en += ylen;
+    while (en >= ylen) en -= ylen;
 
     /* st < en: northern hemisphere, DST is a window inside the year.
      * st > en: southern, DST wraps through New Year — invert the test.
