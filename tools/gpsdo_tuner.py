@@ -174,6 +174,10 @@ PLOT_SERIES = {
     # actually accumulating.
     "mlacc": [("ph",     "Phase error (ns, LTIC detector)",        "#22aa44"),
               ("Vctl",   "Control voltage Vctl (V)",               "#2277cc")],
+    # Algorithm 11 keeps its own filtered phase (phase=). Same panes as
+    # algorithm 10; the separate family selects the overlay below.
+    "lars": [("dph",    "Phase  dph (ns) - measured, filtered phase over it", "#22aa44"),
+             ("Vphase", "Detector Vphase (V) - ramp position",                "#2277cc")],
     # Algorithm 13 fell through to "pid" and so showed the LRN feed-forward
     # drift, a series it never emits: an empty pane labelled as if it meant
     # something. What it has instead is an ESTIMATE of the phase, which is the
@@ -218,7 +222,12 @@ PLOT_SERIES = {
 # is exactly what a one-sample offset produces and what makes it certain rather
 # than probable. Plotting them index-aligned draws the estimate a second late
 # and makes a filter that is tracking perfectly look like one that lags.
+
+# The one-sample lag for algorithm 11 follows from the control/report task
+# ordering, but unlike algorithm 13 it has not yet been confirmed from a
+# capture. If measurement shows zero lag, change the "lars" value below to 0.
 PLOT_OVERLAY = {
+    "lars":   ("phase", "Filtered phase (algo 11)", "#b96ccc", 1),
     "kalman": ("ph", "Kalman estimate", "#b96ccc", 1),
 }
 
@@ -1396,6 +1405,14 @@ class GpsdoTuner(QMainWindow):
                 ("",            "  here', not 'this task used this'."),
                 ("RB",          "Reboot (warm — settings kept)"),
                 ("CR YES",      "Cold restart: wipe the flash ring, factory defaults"),
+                ("BL [%]",      "TFT backlight brightness, 30..100 percent — auto-saved."),
+                ("",            "  100 (the default) is also the electrically quietest"),
+                ("",            "  setting: the dimmer stage stops switching entirely"),
+                ("",            "  and the 3V3 rail that feeds VDDA — the ADC"),
+                ("",            "  reference, the phase reading, the Vctl monitor — is"),
+                ("",            "  left alone. Dimming trades a little rail noise for"),
+                ("",            "  load and heat in an enclosure coupled to the OCXO."),
+                ("",            "  Compiled in with any TFT; bare BL reports it."),
             ]),
             ("Reporting", [
                 ("RH / RD",     "Report format: human readable / tab delimited"),
@@ -1460,6 +1477,22 @@ class GpsdoTuner(QMainWindow):
                 ("",            "  The Hz figures need CT — without it the resolution"),
                 ("",            "  is real but its meaning in frequency is unknown,"),
                 ("",            "  and the command says that instead of guessing."),
+                ("DV <v>",      "Volts at full code, for the report's 'commanded'"),
+                ("",            "  (2.50..5.50). 3.30 — the default — is the PWM model;"),
+                ("",            "  set 5.00 on an AD5680 board or the report flags"),
+                ("",            "  MISMATCH on every reading. Three decimals are kept:"),
+                ("",            "  4.096 for a 4.096 V reference. Auto-saved (ES ALGO)."),
+                ("AV <x>",      "Divide ratio of the divider before the ADC pin"),
+                ("",            "  (1.00..10.00, default direct). Scales 'measured' and"),
+                ("",            "  every Vctl display. With a 10k+10k sense divider at"),
+                ("",            "  the DAC output: DV 5.00 + AV 2.00 make the check"),
+                ("",            "  exact. Auto-saved (ES ALGO)."),
+                ("VS [VCC|VREF]","What the PA0 divider is jumpered to — auto-saved"),
+                ("",            "  (ES ALGO). VCC (the default) is the 5 V rail;"),
+                ("",            "  VREF selects the voltage-reference check instead."),
+                ("SPAN",        "EFC span jumper on PB14: show position and calibration."),
+                ("",            "  Open or unwired = FULL; grounded = REDUCED."),
+                ("SPAN CLR <p>","Forget one position's calibration, FULL or REDUCED."),
                 ("AP",          "Arm picDIV (resync the divider to 1PPS)"),
             ]),
             ("Calibration", [
@@ -1469,7 +1502,8 @@ class GpsdoTuner(QMainWindow):
                 ("LC",          "LTIC self-calibrate: ns/V, zero offset, range"),
                 ("LL",          "List all LTIC parameters and state"),
                 ("LNV / LZO / LRN", "Calibration: ns per volt, zero-offset V, range ns"),
-                ("LPOL [-1/0/1]", "PWM->phase polarity (0 = auto-detect)"),
+                ("LPOL [-1/0/1]", "PWM->phase polarity (0 = not set — the loop holds"),
+                ("",            "  until it is; LC measures it, so run LC)"),
                 ("SAW 0|1",     "Sawtooth (qErr) correction on/off. With no argument"),
                 ("",            "  it also reports the receiver's own mode bit and how"),
                 ("",            "  often the paired lookup found its pulse. A paired"),
@@ -1800,7 +1834,7 @@ class GpsdoTuner(QMainWindow):
             "it. Fixed when logging starts.")
         row.addWidget(self.log_mode)
 
-        tzb = QPushButton("Generate tz_table.h")
+        tzb = QPushButton("Generate gpsdo_tz_table.h")
         tzb.setToolTip("Rebuild the timezone table from this machine's IANA tzdata")
         tzb.clicked.connect(self.generate_tz_table)
         row.addWidget(tzb)
@@ -1893,7 +1927,8 @@ class GpsdoTuner(QMainWindow):
         self._apply_plot_series()
 
     def _plot_family(self):
-        if self._active_algo in (10, 11): return "ltic"
+        if self._active_algo == 10:        return "ltic"
+        if self._active_algo == 11:        return "lars"
         if self._active_algo == 12:        return "mlacc"
         if self._active_algo == 13:        return "kalman"
         return "pid"
@@ -2315,7 +2350,7 @@ class GpsdoTuner(QMainWindow):
                 if k in self.pid_boxes and k in vals:
                     self.pid_boxes[k].setValue(vals[k])
 
-    # ---- tz_table.h generation ------------------------------------------
+    # ---- gpsdo_tz_table.h generation ------------------------------------
     # Absorbed from the former tools/gen_tz_table.py so the tuner is the only
     # script anyone has to keep. The logic is unchanged; what is new is that the
     # zone data is looked for in several places rather than assuming
@@ -2396,8 +2431,74 @@ class GpsdoTuner(QMainWindow):
                     zones.append((name, parts[-2].decode("ascii", "ignore")))
         return zones
 
+    @staticmethod
+    def _tz_verify(zones):
+        """Check generated POSIX rules against zoneinfo two years ahead.
+
+        The table stores the TZif footer's rule for the era in which the
+        firmware will run. Compare the rule's UTC offsets and DST presence with
+        Python's zoneinfo over a full future year; return complaints only."""
+        try:
+            import datetime
+            from zoneinfo import ZoneInfo, available_timezones
+        except Exception:
+            return ["(zoneinfo unavailable - rules not verified)"]
+
+        avail = available_timezones()
+        utc = datetime.timezone.utc
+
+        def _off(value):
+            # POSIX offsets are west-positive; convert to minutes east of UTC.
+            sign = -1 if value.startswith("-") else 1
+            value = value.lstrip("+-")
+            hh, _, mm = value.partition(":")
+            return -(sign * (int(hh) * 60 + int(mm or 0)))
+
+        name = r"(?:<[^>]+>|[A-Za-z]+)"
+        off = r"[+-]?\d{1,3}(?::\d{1,2})?"
+        rx = re.compile(
+            rf"^({name})({off})(?:({name})({off})?)?(?:,.*)?$")
+
+        def rule_offsets(rule):
+            m = rx.match(rule)
+            if not m:
+                return None
+            std = _off(m.group(2))
+            if not m.group(3):
+                return {std}
+            return {std, _off(m.group(4)) if m.group(4) else std + 60}
+
+        out = []
+        base = datetime.datetime.now(utc) + datetime.timedelta(days=730)
+        for zone_name, rule in zones:
+            if zone_name not in avail:
+                continue
+            try:
+                tz = ZoneInfo(zone_name)
+            except Exception:
+                continue
+            offsets, has_dst = set(), False
+            for day in range(0, 366, 7):
+                t = (base + datetime.timedelta(days=day)).astimezone(tz)
+                offsets.add(int(t.utcoffset().total_seconds() // 60))
+                if (t.dst() or datetime.timedelta()).total_seconds():
+                    has_dst = True
+            expected = rule_offsets(rule)
+            rule_has_dst = "," in rule
+            if expected is None:
+                out.append(f"{zone_name}: rule {rule!r} not understood")
+            elif rule_has_dst != has_dst:
+                out.append(
+                    f"{zone_name}: rule {rule!r} says DST={rule_has_dst}, "
+                    f"tzdata says {has_dst}")
+            elif expected != offsets:
+                out.append(
+                    f"{zone_name}: rule {rule!r} -> {sorted(expected)} min, "
+                    f"tzdata {sorted(offsets)}")
+        return out
+
     def generate_tz_table(self):
-        """Write tz_table.h next to this script from the machine's own tzdata."""
+        """Write GPSDO_FreeRTOS/gpsdo_tz_table.h from this machine's tzdata."""
         sources = self._tz_sources()
         zones = []
         used = ""
@@ -2476,7 +2577,7 @@ class GpsdoTuner(QMainWindow):
           " * Zone data comes from this machine. To refresh it:\n"
           " *   pip install -U tzdata      (any OS; zic-compiled IANA data)\n"
           " * then press the button again. */\n")
-        w("#ifndef TZ_TABLE_H\n#define TZ_TABLE_H\n\n#include <stdint.h>\n\n")
+        w("#ifndef GPSDO_TZ_TABLE_H\n#define GPSDO_TZ_TABLE_H\n\n#include <stdint.h>\n\n")
         w(f"#define TZ_NZONES   {len(zones)}\n")
         w(f"#define TZ_NRULES   {len(rules)}\n")
         w(f"#define TZ_NREGIONS {len(regions)}\n\n")
@@ -2514,9 +2615,11 @@ class GpsdoTuner(QMainWindow):
         for i in range(0, len(ids), 20):
             w("    " + ",".join(f"{x:3d}" for x in ids[i:i + 20]) + ",\n")
         w("};\n\n")
-        w("#endif /* TZ_TABLE_H */\n")
+        w("#endif /* GPSDO_TZ_TABLE_H */\n")
 
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tz_table.h")
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "GPSDO_FreeRTOS", "gpsdo_tz_table.h")
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("".join(out))
@@ -2528,8 +2631,20 @@ class GpsdoTuner(QMainWindow):
                   + sum(len(s) + 1 for s in rules)
                   + sum(len(r) + 1 for r in regions))
         self.monitor.append(
-            f"*** tz_table.h written: {len(zones)} zones, {len(rules)} rules, "
+            f"*** gpsdo_tz_table.h written: {len(zones)} zones, {len(rules)} rules, "
             f"{len(regions)} regions, ~{approx / 1024:.1f} KB flash")
+        problems = self._tz_verify(zones)
+        if not problems:
+            self.monitor.append(
+                "*** rules verified against this machine's tzdata, two years out: "
+                "all agree")
+        else:
+            self.monitor.append(
+                f"*** rules verified: {len(problems)} zone(s) disagree with tzdata")
+            for problem in problems[:12]:
+                self.monitor.append(f"***   {problem}")
+            if len(problems) > 12:
+                self.monitor.append(f"***   ... and {len(problems) - 12} more")
         self.monitor.append(
             f"*** source: {used}"
             + (f"  (IANA {iana})" if iana
