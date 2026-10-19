@@ -14,8 +14,8 @@
  * ports; reads poll port A first, then port B, so commands can come from
  * either terminal. Both ports must already be begin()-run by the caller.
  * ======================================================================= */
-#ifndef TEE_SERIAL_H
-#define TEE_SERIAL_H
+#ifndef GPSDO_TEE_SERIAL_H
+#define GPSDO_TEE_SERIAL_H
 
 #include <Arduino.h>
 
@@ -94,4 +94,4 @@ private:
     Stream &_b;
 };
 
-#endif /* TEE_SERIAL_H */
+#endif /* GPSDO_TEE_SERIAL_H */

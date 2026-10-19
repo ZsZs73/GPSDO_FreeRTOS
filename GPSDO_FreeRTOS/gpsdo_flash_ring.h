@@ -30,8 +30,8 @@
  * (~0x0803A918); sectors 0-5 are code, sector 6 is a growth buffer, sector 7
  * is the ring. ~256 slots of 512 B; ~96 years endurance at ~73 saves/day.
  * ====================================================================== */
-#ifndef FLASH_RING_H
-#define FLASH_RING_H
+#ifndef GPSDO_FLASH_RING_H
+#define GPSDO_FLASH_RING_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -81,4 +81,4 @@ uint8_t  flash_ring_sector_no(void);
  * reads empty and the next recall falls back to defaults. Returns true on OK. */
 bool     flash_ring_wipe(void);
 
-#endif /* FLASH_RING_H */
+#endif /* GPSDO_FLASH_RING_H */

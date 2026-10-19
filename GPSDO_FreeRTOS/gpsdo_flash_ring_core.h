@@ -42,8 +42,8 @@
  * v1 (32-byte slots, no type byte) is detected via FR_FMT_VER mismatch at
  * fr_begin() and reformatted — old live data do not survive the upgrade.
  * ====================================================================== */
-#ifndef FLASH_RING_CORE_H
-#define FLASH_RING_CORE_H
+#ifndef GPSDO_FLASH_RING_CORE_H
+#define GPSDO_FLASH_RING_CORE_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -121,4 +121,4 @@ uint32_t fr_erase_count(const fr_state_t *st);
 #ifdef __cplusplus
 }
 #endif
-#endif /* FLASH_RING_CORE_H */
+#endif /* GPSDO_FLASH_RING_CORE_H */

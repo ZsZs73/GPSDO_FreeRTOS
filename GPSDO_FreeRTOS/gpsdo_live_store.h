@@ -23,8 +23,8 @@
  *   [22..25] centre_v     float
  *   [26]     algo         uint8
  * ====================================================================== */
-#ifndef LIVE_STORE_H
-#define LIVE_STORE_H
+#ifndef GPSDO_LIVE_STORE_H
+#define GPSDO_LIVE_STORE_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -43,4 +43,4 @@ void live_store_tick(uint32_t now_ms);
  * calibration). */
 void live_store_request_save(void);
 
-#endif /* LIVE_STORE_H */
+#endif /* GPSDO_LIVE_STORE_H */

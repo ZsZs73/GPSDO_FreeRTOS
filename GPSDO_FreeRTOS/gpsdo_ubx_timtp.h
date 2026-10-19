@@ -32,8 +32,8 @@
  * The mode bit is still captured and published (g_qerr_mode_next) so a
  * diagnostic can tell the user their receiver is in the lagging mode.
  * ====================================================================== */
-#ifndef UBX_TIMTP_H
-#define UBX_TIMTP_H
+#ifndef GPSDO_UBX_TIMTP_H
+#define GPSDO_UBX_TIMTP_H
 
 #include <stdint.h>
 
@@ -110,4 +110,4 @@ float ubx_timtp_correction_for_pps(uint32_t ppscount);
 }
 #endif
 
-#endif /* UBX_TIMTP_H */
+#endif /* GPSDO_UBX_TIMTP_H */

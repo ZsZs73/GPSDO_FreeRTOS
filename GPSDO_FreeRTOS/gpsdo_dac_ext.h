@@ -45,8 +45,8 @@
  * 17 uV per step, near 9e-12 fractional on a 5.3 Hz/V oscillator, against
  * 2.7e-11 for the PWM in use today.
  */
-#ifndef DAC_EXT_H
-#define DAC_EXT_H
+#ifndef GPSDO_DAC_EXT_H
+#define GPSDO_DAC_EXT_H
 
 #include <stdint.h>
 
@@ -84,4 +84,4 @@ bool dac_ext_begin(void);
 /* Write a code, 0..DAC_EXT_MAX. Expected to be called about once per second. */
 void dac_ext_write(uint32_t code);
 
-#endif /* DAC_EXT_H */
+#endif /* GPSDO_DAC_EXT_H */
