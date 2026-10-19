@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_span.h  —  two EFC spans, two calibrations, one jumper on PB14
  *
- * Part of GPSDO v1.07.57rt
+ * Part of GPSDO FreeRTOS v1.07
  *
  * WHAT THIS IS FOR
  * ----------------

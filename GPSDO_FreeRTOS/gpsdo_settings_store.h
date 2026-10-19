@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_settings_store.h  —  persistent user settings via the flash ring
  *
- * Part of GPSDO v1.07.57rt
+ * Part of GPSDO FreeRTOS v1.07
  *
  * Replaces the old STM32duino emulated EEPROM (gpsdo_state.cpp eeprom_*).
  * Settings are stored as a REC_SETTINGS slot in the flash ring (sector 7),

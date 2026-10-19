@@ -1,7 +1,7 @@
 /**
  * gpsdo_cli.cpp — vCliTask — Serial / Bluetooth command line interface
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa
@@ -769,7 +769,7 @@ static void dispatch(char *line)
                 return;
             }
             g_dac_vref = v;
-            /* Three decimals, as stored since build 57 (dac_vref_mv): with two,
+            /* Three decimals, as stored since the v1.07 DAC settings format (dac_vref_mv): with two,
              * DV 4.096 echoed back as 4.10 and was saved as 4.10 too. */
             dtostrf(v, -1, 3, b1);
             snprintf(l, sizeof(l), "DV: commanded now scaled at %s V full code", b1);

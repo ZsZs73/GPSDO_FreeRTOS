@@ -1,8 +1,9 @@
 /*
- * gpsdo_build_id.h — one number, bumped on every change, whose only job is to make
- * the Arduino builder recompile the sketch.
+ * gpsdo_build_id.h — identifies distinct firmware builds that are worth
+ * flashing, testing, comparing or distributing, and forces the Arduino
+ * builder to recompile the sketch when the number changes.
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  *
  * WHY THIS EXISTS
  * ---------------
@@ -19,10 +20,17 @@
  * recompile the sketch and nothing else — a fraction of a second, against a
  * full rebuild if the same thing were done with a flag in build_opt.h.
  *
- * TWO WAYS TO BUMP IT, and both are fine:
- *   - tools/bumpbuild.py, run before a compile (it edits the line below)
- *   - by hand, or by any edit at all: the builder keys on the file, not on
- *     what is in it
+ * WHEN TO BUMP IT:
+ *   Increment BUILD_SERIAL before producing a distinct firmware binary that is
+ *   worth flashing, testing, comparing or distributing. Several source changes
+ *   may therefore share one bump; documentation/tool-only changes need none.
+ *
+ * HOW TO BUMP IT:
+ *   - tools/bumpbuild.py, run before the compile
+ *   - edit BUILD_SERIAL below by hand
+ *
+ * Merely touching this file also forces the sketch to recompile, but does not
+ * create a new build number.
  *
  * AND IF IT IS NOT BUMPED, nothing breaks and nothing lies. The banner also
  * prints a CRC-32 of the flash image, computed at boot from the flash itself
@@ -33,5 +41,5 @@
 #ifndef GPSDO_BUILD_ID_H
 #define GPSDO_BUILD_ID_H
 
-#define BUILD_SERIAL 42
+#define BUILD_SERIAL 43
 #endif /* GPSDO_BUILD_ID_H */

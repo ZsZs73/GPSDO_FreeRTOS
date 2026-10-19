@@ -1,7 +1,7 @@
 /**
  * GPSDO_FreeRTOS.ino — Main entry point — hardware init and FreeRTOS scheduler start
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  * Author:   J. M. Niewiński
  * GitHub:   https://github.com/jmnlabs/GPSDO_FreeRTOS
  * Based on: GPSDO v0.06c by André Balsa

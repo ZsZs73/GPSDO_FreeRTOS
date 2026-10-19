@@ -2,7 +2,7 @@
  * gpsdo_build.cpp — CRC-32 of the running flash image. See the header for why
  * the compile timestamp alone was not enough.
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  */
 #include "gpsdo_build.h"
 

@@ -1,7 +1,7 @@
 /*
  * gpsdo_build.h — which binary is actually running?
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  *
  * WHY THIS EXISTS
  * ---------------

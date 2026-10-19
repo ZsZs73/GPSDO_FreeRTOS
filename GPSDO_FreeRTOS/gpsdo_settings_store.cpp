@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_settings_store.cpp  —  persistent user settings via the flash ring
  *
- * Part of GPSDO v1.07.57rt
+ * Part of GPSDO FreeRTOS v1.07
  *
  * See gpsdo_settings_store.h for the design. This module snapshots the runtime
  * settings globals into a flat SettingsBlock_t and stores it as a REC_SETTINGS

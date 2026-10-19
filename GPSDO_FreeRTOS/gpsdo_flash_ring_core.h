@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_flash_ring_core.h  —  hardware-INDEPENDENT ring-buffer logic
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  *
  * This is the pure algorithm: signature/version validation, slot packing,
  * CRC, newest-slot selection, wrap handling and garbage detection. It knows

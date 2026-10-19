@@ -1,7 +1,7 @@
 /* ======================================================================
  * gpsdo_ubx_timtp.h — UBX-TIM-TP sawtooth (quantization-error) correction
  *
- * Part of GPSDO FreeRTOS v1.06
+ * Part of GPSDO FreeRTOS v1.07
  *
  * See gpsdo_ubx_timtp.cpp for the full description. Passive UBX sniffer that
  * extracts qErr (quantization error) from UBX-TIM-TP and offers it as a

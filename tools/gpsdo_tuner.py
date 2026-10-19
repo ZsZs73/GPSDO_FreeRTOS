@@ -55,7 +55,7 @@ import math
 # against newer firmware silently mis-parses telemetry and writes commands the
 # board no longer understands, which is a confusing way to lose an evening.
 # Bump this whenever the firmware version changes, even if nothing here moved.
-TOOL_VERSION = "1.06"
+TOOL_VERSION = "1.07"
 from collections import deque, defaultdict
 from array import array
 from bisect import bisect_left

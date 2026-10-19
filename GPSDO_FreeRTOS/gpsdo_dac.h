@@ -1,7 +1,7 @@
 /*
  * gpsdo_dac.h — single point where the control voltage leaves the firmware.
  *
- * Part of GPSDO v1.07.57rt
+ * Part of GPSDO FreeRTOS v1.07
  *
  * Before this existed, analogWrite(PIN_VCTL_PWM, ...) appeared in 23 places
  * across three files. Adding a second output path by editing all of them would

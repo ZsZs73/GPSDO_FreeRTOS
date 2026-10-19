@@ -1,7 +1,7 @@
 /*
  * gpsdo_dac.cpp — control-voltage output: PWM or sigma-delta.
  *
- * Part of GPSDO v1.07.57rt
+ * Part of GPSDO FreeRTOS v1.07
  * See gpsdo_dac.h for why this layer exists and what the two write widths mean.
  */
 #include <Arduino.h>
