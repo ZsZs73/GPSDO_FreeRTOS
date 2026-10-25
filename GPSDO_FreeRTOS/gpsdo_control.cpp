@@ -1033,6 +1033,23 @@ static void do_ltic_calibrate(void)
     int consec_rail = 0;
     bool saturated = false;
 
+    /* Measure the actual OCXO frequency across the SAME interval used for
+     * the LTIC ramp.  avg100 is adequate for steering toward the desired
+     * sweep rate, but its 0.01 Hz grid is 1 ns/s at 10 MHz — too coarse for
+     * the final ns/V calibration.  fcount64 is the cumulative TIM2 count at
+     * GPS PPS; differencing it over the whole transit gives one-count
+     * resolution over the complete measurement interval. */
+    uint64_t ramp_count0 = 0;
+    uint32_t ramp_pps0   = 0;
+    bool ramp_count_ok   = false;
+
+    if (xSemaphoreTake(xFreqMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        ramp_count0 = gFreq.fcount64;
+        ramp_pps0   = gFreq.ppscount;
+        ramp_count_ok = (ramp_count0 != 0);
+        xSemaphoreGive(xFreqMutex);
+    }
+
     for (uint16_t t = 1; t <= LTIC_CAL_SECS; t++) {
         wait_secs_pwm(1, ramp_pwm);
         float v = g_ltic_voltage;
@@ -1057,6 +1074,46 @@ static void do_ltic_calibrate(void)
         OUT_SERIAL.print("s V="); OUT_SERIAL.print(v, 3);
         OUT_SERIAL.print("V n="); OUT_SERIAL.println((int)cnt);
     }
+
+    /* Refine the sweep rate from the raw cumulative counter over the complete
+     * ramp.  The two snapshots refer to GPS-PPS capture points, so dividing
+     * their count difference by the PPS difference gives the true average
+     * OCXO frequency over exactly that interval. */
+    if (ramp_count_ok) {
+        uint64_t ramp_count1 = 0;
+        uint32_t ramp_pps1   = 0;
+
+        if (xSemaphoreTake(xFreqMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            ramp_count1 = gFreq.fcount64;
+            ramp_pps1   = gFreq.ppscount;
+            xSemaphoreGive(xFreqMutex);
+        }
+
+        if (ramp_pps1 > ramp_pps0 &&
+            ramp_count1 > ramp_count0 &&
+            (ramp_pps1 - ramp_pps0) >= 60u) {
+
+            uint32_t dt = ramp_pps1 - ramp_pps0;
+            uint64_t dc = ramp_count1 - ramp_count0;
+
+            double ramp_freq = (double)dc / (double)dt;
+            double ramp_rate =
+                (ramp_freq - (double)BASE_FREQ) /
+                (double)BASE_FREQ * 1.0e9;
+
+            if (fabs(ramp_rate) > 0.1 && fabs(ramp_rate) < 100.0) {
+                OUT_SERIAL.print("LC: refined phase rate ");
+                OUT_SERIAL.print(ramp_rate, 3);
+                OUT_SERIAL.print(" ns/s over ");
+                OUT_SERIAL.print(dt);
+                OUT_SERIAL.println(" PPS");
+
+                phase_rate    = ramp_rate;
+                rate_measured = true;
+            }
+        }
+    }
+
     if (railed > 0) {
         OUT_SERIAL.print("LC: note "); OUT_SERIAL.print((int)railed);
         OUT_SERIAL.println(" railed samples skipped");
@@ -1124,6 +1181,8 @@ static void do_ltic_calibrate(void)
      * self-adapting per board with no configuration. Physics/derivation
      * credit: GML-5.2. Falls back to the ramp midpoint if the fit fails. */
     int anchor_n = 0;
+    double fitted_vsat = 0.0;
+    bool anchor_from_vsat = false;
     {
         /* 1-D Vsat fit: minimise the residual of the linearised charge curve */
         double best_res = 1e300, best_vsat = 0.0;
@@ -1154,7 +1213,11 @@ static void do_ltic_calibrate(void)
         double anchor_v = (double)vlow + 0.5 * span;   /* fallback */
         if (best_vsat > 0.0) {
             double a = 0.63212 * best_vsat;
-            if (a >= (double)vlow + 0.05 && a <= (double)vhigh - 0.05) anchor_v = a;
+            if (a >= (double)vlow + 0.05 && a <= (double)vhigh - 0.05) {
+                anchor_v = a;
+                fitted_vsat = best_vsat;
+                anchor_from_vsat = true;
+            }
         }
         double sx = 0, sy = 0, sxx = 0, sxy = 0;
         for (uint16_t i = 0; i < cnt; i++) {
@@ -1177,49 +1240,50 @@ static void do_ltic_calibrate(void)
             OUT_SERIAL.println("V (0.632xVsat)");
         }
     }
-    /* THE ANCHOR SLOPE CANNOT EXCEED THE WHOLE-TRANSIT AVERAGE.
-     *
-     * The two ns/V numbers this routine can produce are not interchangeable and
-     * one of them bounds the other. range_ns/span is the AVERAGE dφ/dV over the
-     * swept band; nsv above is the LOCAL dφ/dV at the anchor. On the ramp this
-     * detector actually is — V = Vsat(1 − e^(−φ/τ)) — dφ/dV = (τ/Vsat)·e^(φ/τ)
-     * rises with φ, so the average over a transit that reaches past the anchor
-     * is taken at a point ABOVE it and is therefore LARGER. For the geometry
-     * here (Vsat 3.29 V, transit 0.80..3.22 V) the anchor value should be about
-     * 0.55 of the average. A local slope ABOVE the average is not a slope this
-     * ramp can have: it means the ±LTIC_ANCHOR_WIN_V window caught a disturbed
-     * stretch and the fit did not converge.
-     *
-     * WHAT IT COST, and why this is not hypothetical. Two calibrations of the
-     * same detector, LZO 2.0809 → 2.0797 and LRN 3000.00 → 2958.75 (so the ramp
-     * itself did not move), and:
-     *
-     *   builds 16-41   LNV 1252.0   = 1.01 x the whole-transit average
-     *   build 42       LNV 1837.7   = 1.50 x the whole-transit average
-     *
-     * The second was measured while the phase was unstable. Nothing downstream
-     * noticed a bad slope directly — what it broke was the SATURATION GUARD in
-     * ltic_phase_error_ns(), which sizes the usable band as range_ns/ns_per_volt
-     * and so shrank from ±1.318 V to ±0.886 V about the zero. The picDIV lands
-     * this board's phase 1.06..1.28 V below the zero, a fixed physical offset
-     * that did not move — but it was now OUTSIDE the band, so every landing read
-     * as railed. Algorithm 11's phase-capture bridge then re-armed the divider
-     * every 20 s, eight times, until one landing happened to fall 0.67 V out and
-     * be accepted; the loop locked thirty seconds later. Eight arms for a
-     * calibration artefact.
-     *
-     * So: keep the anchor (the Vsat fit runs over the whole transit and is
-     * robust — LZO agreed to 1.2 mV across the two runs) and replace only the
-     * slope, which is the one number fitted from a handful of points. */
-    if (nsv > 0.0 && span > 0.05 && range_ns > 0.0) {
-        double avg_nsv = range_ns / (double)span;
-        if (avg_nsv > 0.0 && nsv > avg_nsv) {
-            OUT_SERIAL.print("LC: anchor slope ");   OUT_SERIAL.print(nsv, 1);
-            OUT_SERIAL.print(" ns/V is above the whole-transit average ");
-            OUT_SERIAL.print(avg_nsv, 1);
-            OUT_SERIAL.println(" — impossible on an exponential ramp; the local fit did not converge.");
-            nsv = avg_nsv;
-            anchor_n = 0;              /* report it as the average, not the anchor */
+    /* Sanity-check the local anchor slope against the fitted exponential
+    * geometry.
+    *
+    * range_ns/span is not a bound on the local dphi/dV. For
+    *
+    *     V = Vsat * (1 - exp(-phi/tau))
+    *
+    * dphi/dV increases with voltage, and depending on how much of the ramp was
+    * swept the anchor slope may legitimately be either above or below the
+    * range/span value.
+    *
+    * Compare their RATIO with the ratio predicted by the fitted Vsat and the
+    * exact 10%-90% geometry used above. Keep a generous tolerance because the
+    * real detector is not an ideal single-pole exponential; this guard is only
+    * intended to reject a grossly disturbed local fit. */
+    if (nsv > 0.0 && anchor_from_vsat && span > 0.05 && range_ns > 0.0) {
+        double avg_nsv = range_ns / span;
+
+        double a = fitted_vsat - (double)v10;
+        double b = fitted_vsat - (double)v90;
+
+        if (avg_nsv > 0.0 && a > 0.0 && b > 0.0) {
+            double log_span = log(a / b);
+
+            if (log_span > 1e-9) {
+                double expected_ratio =
+                    (0.8 * span) /
+                    ((fitted_vsat - zero_off) * log_span);
+
+                double actual_ratio = nsv / avg_nsv;
+
+                if (actual_ratio < 0.60 * expected_ratio ||
+                    actual_ratio > 1.40 * expected_ratio) {
+
+                    OUT_SERIAL.print("LC: anchor slope ratio ");
+                    OUT_SERIAL.print(actual_ratio, 3);
+                    OUT_SERIAL.print(" differs from exponential prediction ");
+                    OUT_SERIAL.print(expected_ratio, 3);
+                    OUT_SERIAL.println(" — local fit rejected.");
+
+                    nsv = avg_nsv;
+                    anchor_n = 0;
+                }
+            }
         }
     }
     if (nsv <= 0.0 && span > 0.05) {              /* fallback: whole-ramp avg */
