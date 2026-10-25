@@ -649,7 +649,12 @@ static void print_tab_report(const GpsData_t *g, const FreqSnap_t *f,
      * parsing/plotting; the human-readable report shows HDOP:TIME. */
     p = sd  (buf, p, (double)g->hdop/100.0, 2);     buf[p++] = '\t';
     p = si  (buf, p, c->pwm_output);                buf[p++] = '\t';
-    p = sd  (buf, p, (c->avg_vctl_adc/4096.0)*3.3*g_adc_vdiv, 3);        buf[p++] = '\t';
+    p = sd(buf, p,
+       ((double)c->avg_vctl_adc / 4096.0) *
+       ((c->avg_vdd_adc > 0) ? ((1.21 * 4096.0) / (double)c->avg_vdd_adc) : 3.3) *
+       g_adc_vdiv,
+       3);
+buf[p++] = '\t';
     p = sd  (buf, p, (c->avg_vcc_adc /4096.0)*3.3*2.0, 2);    buf[p++] = '\t';
     p = sd  (buf, p, (1.21*4096.0)/(double)c->avg_vdd_adc, 3); buf[p++] = '\t';
     p = sd  (buf, p, g_encl_temp, 1);               buf[p++] = '\t';
@@ -718,7 +723,11 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 
     /* PWM / Vctl */
     p=sa(buf,p,"PWM:"); p=si(buf,p,c->pwm_output);
-    p=sa(buf,p,"  Vctl:"); p=sd(buf,p,((double)c->avg_vctl_adc/4096.0)*3.3*g_adc_vdiv,3);
+    p=sa(buf,p,"  Vctl:"); p=sd(buf,p,
+        ((double)c->avg_vctl_adc / 4096.0) *
+        ((c->avg_vdd_adc > 0) ? ((1.21 * 4096.0) / (double)c->avg_vdd_adc) : 3.3) *
+        g_adc_vdiv,
+        3);
     p=sa(buf,p,"V");
     if (c->holdover_mode) p=sa(buf,p," [HOLDOVER]");
     else { p=sa(buf,p," "); p=sa(buf,p,c->trendstr); }
@@ -2234,7 +2243,11 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #endif
 
       { static char fv[8];
-        double vctl = ((double)c->avg_vctl_adc / 4096.0) * 3.3 * g_adc_vdiv;
+        double vdd = (c->avg_vdd_adc > 0)
+                ? (1.21 * 4096.0) / (double)c->avg_vdd_adc
+                : 3.3;
+
+        double vctl = ((double)c->avg_vctl_adc / 4096.0) * vdd * g_adc_vdiv;
         dtostrf(vctl, 5, 3, fv);
 #if defined(GPSDO_TFT_ILI9488)
         /* Split, so "Vct: 1.970 V" can sit on the alignment line while "PWM:"
@@ -3971,7 +3984,11 @@ void vDisplayTask(void *pvParameters)
              *   Auto-holdover:   "[A]" blinks with "   " at HOLDOVER_BLINK_MS rate. */
             {
                 static char fv_str[7];
-                double vctl = ((double)snap_c.avg_vctl_adc / 4096.0) * 3.3 * g_adc_vdiv;
+                double vdd = (snap_c.avg_vdd_adc > 0)
+                        ? (1.21 * 4096.0) / (double)snap_c.avg_vdd_adc
+                        : 3.3;
+
+                double vctl = ((double)snap_c.avg_vctl_adc / 4096.0) * vdd * g_adc_vdiv;
                 dtostrf(vctl, 4, 2, fv_str);   /* 4 chars at AV=1.0; wider values expand as needed */
 
                 /* Build indicator string (exactly 3 chars + NUL) */

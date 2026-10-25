@@ -236,6 +236,32 @@ static int16_t movavg_update(MovAvg10_t *m, int16_t v)
     return (int16_t)(m->sum / (m->full ? 10 : (m->idx == 0 ? 10 : m->idx)));
 }
 
+/* ADC1 is shared by Vctl, Vcc, VREFINT and LTIC.
+ * Discard the first PB1 conversion after switching channels, then use the
+ * median of five conversions to reject the impulsive PB1 ADC glitches seen
+ * on PCB v0.1.0 without adding long-term filtering. */
+static int16_t read_vctl_adc_settled()
+{
+    (void)analogRead(PIN_VCTL_ADC);   /* discard after channel switch */
+
+    int16_t s[5];
+
+    for (int i = 0; i < 5; ++i)
+        s[i] = (int16_t)analogRead(PIN_VCTL_ADC);
+
+    for (int i = 1; i < 5; ++i) {
+        int16_t v = s[i];
+        int j = i - 1;
+
+        while (j >= 0 && s[j] > v) {
+            s[j + 1] = s[j];
+            --j;
+        }
+        s[j + 1] = v;
+    }
+
+    return s[2];
+}
 static MovAvg10_t s_avg_vctl = {0}, s_avg_vcc = {0}, s_avg_vdd = {0};
 
 /* ---- Wait N seconds, yielding to RTOS ---------------------------------
@@ -257,7 +283,7 @@ static void wait_secs_pwm(uint16_t n, uint16_t cur_pwm)
          * only, then publish under the usual mutex. */
         vTaskSuspendAll();
         int16_t cal_vctl = movavg_update(&s_avg_vctl,
-                               (int16_t)analogRead(PIN_VCTL_ADC));
+                                read_vctl_adc_settled());
         xTaskResumeAll();
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             gCtrl.pwm_output   = cur_pwm;
@@ -1266,10 +1292,10 @@ static void do_warmup(void)
          * wait_secs_pwm() uses during calibration. */
         vTaskSuspendAll();
         int16_t wu_vctl = movavg_update(&s_avg_vctl,
-                              (int16_t)analogRead(PIN_VCTL_ADC));
+                                read_vctl_adc_settled());
 #ifdef GPSDO_VCC
-        int16_t wu_vcc  = movavg_update(&s_avg_vcc,
-                              (int16_t)analogRead(PIN_VCC_DIV2));
+        int16_t wu_vcc = movavg_update(&s_avg_vcc,
+                                       (int16_t)analogRead(PIN_VCC_DIV2));
 #endif
 #ifdef GPSDO_VDD
         int16_t wu_vdd  = movavg_update(&s_avg_vdd,
@@ -1368,13 +1394,15 @@ void vControlTask(void *pvParameters)
              * 0.9x, which is one conversion returning zero into a 10-deep
              * moving average, seven times in the 03.09 10:08 capture.
              *
-             * Three conversions is about 60 µs with interrupts still enabled.
-             * The phase read cannot wait - its 50 µs settle is a deadline on a
-             * 5 ms decay - so this side is the one that becomes atomic. */
+             * Keep this section short: while the scheduler is suspended the
+             * LTIC phase task cannot run, so diagnostic ADC bursts do not belong
+             * here.  The Vctl helper's median rejects the observed impulsive
+             * conversion errors instead. */
             vTaskSuspendAll();
-            int16_t raw;
-            raw = (int16_t)analogRead(PIN_VCTL_ADC);
+
+            int16_t raw = read_vctl_adc_settled();
             int16_t avg_vctl = movavg_update(&s_avg_vctl, raw);
+
 #ifdef GPSDO_VCC
             raw = (int16_t)analogRead(PIN_VCC_DIV2);
             int16_t avg_vcc = movavg_update(&s_avg_vcc, raw);

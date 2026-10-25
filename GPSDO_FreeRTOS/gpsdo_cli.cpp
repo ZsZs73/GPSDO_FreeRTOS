@@ -591,7 +591,11 @@ static void dispatch(char *line)
 
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             /* g_adc_vdiv: the divider before the pin (AV), 1.0 = none. */
-            double vm = ((double)gCtrl.avg_vctl_adc / 4096.0) * 3.3 * g_adc_vdiv;
+            double vdd = (gCtrl.avg_vdd_adc > 0)
+                    ? (1.21 * 4096.0) / (double)gCtrl.avg_vdd_adc
+                    : 3.3;
+
+            double vm = ((double)gCtrl.avg_vctl_adc / 4096.0) * vdd * g_adc_vdiv;
             xSemaphoreGive(xCtrlMutex);
             dtostrf(vm, -1, 4, b1);
             /* COMMANDED AGAINST MEASURED — the one check that catches a jumper
