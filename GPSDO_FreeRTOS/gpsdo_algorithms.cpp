@@ -523,19 +523,27 @@ static double ltic_phase_error_ns(bool *valid, uint32_t ppscount)
     float v = g_ltic_voltage;
     *valid = (v > 0.02f && v < 3.28f);          /* not railed low/high */
 
-    /* SATURATION GUARD for the Kaashoek RC detector. The voltage-to-phase
-     * mapping is only linear over the swept band measured by LC (span =
-     * range_ns / ns_per_volt, centred on zero_offset). Outside it the cap is
-     * plateaued: V no longer tracks phase, so a "phase_ns" computed from a
-     * near-rail V is garbage that the loop then integrates — the mechanism of
-     * the observed ~370 s limit cycle (saturate → false phase → integrator
-     * overshoot → re-saturate). Mark such samples invalid so the loop holds
-     * instead of chasing a phantom. Allow ~10 % margin past the band. */
-    if (*valid && g_ltic.range_ns > 1.0f && g_ltic.ns_per_volt > 1.0f) {
-        double span_v = (double)g_ltic.range_ns / (double)g_ltic.ns_per_volt;
-        double lo = (double)g_ltic.zero_offset - 0.55 * span_v;
-        double hi = (double)g_ltic.zero_offset + 0.55 * span_v;
-        if ((double)v < lo || (double)v > hi) *valid = false;
+    /* SATURATION GUARD for the Kaashoek RC detector.
+     *
+     * LC stores zero_offset at the exponential operating-point anchor
+     * Vsat*(1 - 1/e) ~= 0.63212*Vsat, NOT at the midpoint of a linear
+     * voltage span.  range_ns/ns_per_volt therefore cannot be used to build
+     * symmetric voltage limits around zero_offset.
+     *
+     * Recover Vsat from the calibrated anchor and use the same physical
+     * 15%..85% detector band as the display path.  Outside this region the
+     * exponential is too compressed / close to the rails for a trustworthy
+     * phase measurement. */
+    if (*valid &&
+        g_ltic.zero_offset > 0.001f &&
+        g_ltic.ns_per_volt > 1.0f) {
+
+        double vsat = (double)g_ltic.zero_offset / 0.63212;
+        double lo   = 0.15 * vsat;
+        double hi   = 0.85 * vsat;
+
+        if ((double)v < lo || (double)v > hi)
+            *valid = false;
     }
 
     /* Centre: use the calibrated zero_offset when we have one (LC sets it to
