@@ -1,5 +1,6 @@
 #include "gpsdo_log.h"
 #include "gpsdo_config.h"
+#include "gpsdo_state.h"
 
 #include <Arduino.h>
 #include <stdarg.h>
@@ -59,7 +60,19 @@ static void log_emit(gpsdo_log_level_t level,
                         fields);
     }
 
-    OUT_SERIAL.println(line);
+    /*
+    * During early boot xSerialMutex does not exist yet, so output directly.
+    * Once the RTOS objects have been created, serialize log records with the
+    * same mutex used by the CLI/report streams.
+    */
+    if (xSerialMutex != nullptr) {
+        if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            OUT_SERIAL.println(line);
+            xSemaphoreGive(xSerialMutex);
+        }
+    } else {
+        OUT_SERIAL.println(line);
+    }
 }
 
 void gpsdo_log_event(gpsdo_log_level_t level,
