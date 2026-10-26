@@ -50,6 +50,7 @@
  * date of THIS build and not of whenever the sketch last changed. See
  * gpsdo_build_id.h — and the CRC in the banner, which cannot be stale either way. */
 #include "gpsdo_build_id.h"
+#include "gpsdo_log.h"
 #include <Arduino.h>
 #include <Wire.h>
 /* EEPROM library removed in v0.96 — persistence via flash_ring (sector 7). */
@@ -242,6 +243,7 @@ void setup()
 #endif
 
     OUT_SERIAL.println("\r\n================================================");
+    gpsdo_log_event(GPSDO_LOG_INFO, "BOOT", "START");
     /* Build stamp in the banner: GPSDO vX.YY-rtos compiled YYYY-MM-DD HH:MM:SS.
      * __DATE__ is "Mmm dd yyyy" (day space-padded), __TIME__ "HH:MM:SS" — both
      * resolved at compile time, no RTC needed. Digits read by hand: sscanf is
