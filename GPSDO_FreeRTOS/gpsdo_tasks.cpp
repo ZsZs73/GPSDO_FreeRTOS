@@ -28,6 +28,7 @@
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_algorithms.h"   /* g_ltic (calibrated span) for the ADC outlier gate */
 #include "gpsdo_dac.h"          /* g_adc_vdiv: scale Vctl ADC readings */
+#include "gpsdo_adc.h"
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
@@ -107,7 +108,8 @@ void ltic_read_fast(void)
 {
     /* THE WHOLE MEASUREMENT IS ATOMIC AGAINST OTHER TASKS, AND IT HAD TO BE.
      *
-     * This part is 50 µs of settling followed by sixteen conversions, and both
+     * This part is 50 µs of settling followed by one discarded settling
+     * conversion and the retained median burst, and both
      * halves were interruptible by any other task. Two things follow from that,
      * and both were measured on the bench rather than reasoned about here:
      *
@@ -130,8 +132,8 @@ void ltic_read_fast(void)
      * capture, the timers and SysTick are untouched - and the section is about
      * 350 µs, which is 7 % of the leakage constant and 0.035 % of a second.
      *
-     * ControlTask does the same around its own three conversions (about 60 µs),
-     * so the cheap side yields to the deadline instead of the other way round.
+     * ControlTask does the same around its own ADC measurements, so the cheap
+     * side yields to the deadline instead of the other way round.
      * A mutex was considered and rejected: the only correct timeout on this
      * side is zero, and a zero-timeout take that fails leaves the choice
      * between racing anyway and dropping a phase measurement. */
@@ -142,17 +144,14 @@ void ltic_read_fast(void)
      * widest pulse while sitting only ~1 % down the ~5 ms leakage decay. */
     delayMicroseconds(50);
 
-    int16_t s[LTIC_OVERSAMPLE];
-    for (int i = 0; i < LTIC_OVERSAMPLE; i++) {
-        int16_t x = (int16_t)analogRead(PIN_LTIC_VPHASE);
-        int j = i;
-        while (j > 0 && s[j-1] > x) { s[j] = s[j-1]; j--; }
-        s[j] = x;
-    }
+    int16_t samples[LTIC_OVERSAMPLE];
+    int16_t med =
+        gpsdo_adc_read_median_settled(PIN_LTIC_VPHASE,
+                                      samples,
+                                      LTIC_OVERSAMPLE);
 
     xTaskResumeAll();
 
-    int16_t med = s[LTIC_OVERSAMPLE / 2];
     g_ltic_adc_raw = med;
 
     static int16_t last_ok = -1, pending = -1;

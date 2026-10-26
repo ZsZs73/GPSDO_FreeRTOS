@@ -26,6 +26,7 @@
 #include "gpsdo_settings_store.h"
 #include "gpsdo_algorithms.h"
 #include "gpsdo_span.h"
+#include "gpsdo_adc.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -242,25 +243,8 @@ static int16_t movavg_update(MovAvg10_t *m, int16_t v)
  * on PCB v0.1.0 without adding long-term filtering. */
 static int16_t read_vctl_adc_settled()
 {
-    (void)analogRead(PIN_VCTL_ADC);   /* discard after channel switch */
-
-    int16_t s[5];
-
-    for (int i = 0; i < 5; ++i)
-        s[i] = (int16_t)analogRead(PIN_VCTL_ADC);
-
-    for (int i = 1; i < 5; ++i) {
-        int16_t v = s[i];
-        int j = i - 1;
-
-        while (j >= 0 && s[j] > v) {
-            s[j + 1] = s[j];
-            --j;
-        }
-        s[j + 1] = v;
-    }
-
-    return s[2];
+    int16_t samples[5];
+    return gpsdo_adc_read_median_settled(PIN_VCTL_ADC, samples, 5);
 }
 static MovAvg10_t s_avg_vctl = {0}, s_avg_vcc = {0}, s_avg_vdd = {0};
 

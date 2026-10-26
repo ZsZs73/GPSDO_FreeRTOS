@@ -492,7 +492,7 @@ extern "C" {
 #ifdef GPSDO_LTIC
   #define PIN_LTIC_VPHASE   PA1   /* ADC input + open-drain output to discharge 1nF cap */
   #define LTIC_DISCHARGE_MS   1   /* ms to discharge 1nF capacitor via open-drain low   */
-  #define LTIC_OVERSAMPLE    16   /* fast ADC reads per PPS, median taken (glitch-proof) */
+  #define LTIC_OVERSAMPLE    15   /* fast ADC reads per PPS, median taken (glitch-proof) */
   /* How many consecutive railed cycles with no improvement in |e_freq| before
    * the loop declares a runaway and freezes. A cold or far-off OCXO rails the
    * detector while it is legitimately being pulled in, so the guard waits for
