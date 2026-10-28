@@ -72,8 +72,7 @@ extern "C" void Timer_ISR_2Hz(void);
 /* declared in gpsdo_state.cpp */
 extern SemaphoreHandle_t xTwoHzSemaphore;
 
-/* declared in gpsdo_gps.cpp */
-extern void gpsdo_gps_init(void);
+#include "gpsdo_gps.h"
 
 /* declared in gpsdo_state.cpp */
 extern bool persist_check_on_boot(void);

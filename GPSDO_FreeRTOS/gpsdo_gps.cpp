@@ -20,11 +20,19 @@
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
 #include "gpsdo_ubx_timtp.h"
+#include "gpsdo_gps.h"
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include <string.h>
 
 static TinyGPSPlus gps;
+
+static gpsdo_gnss_info_t s_gnss_info = {};
+
+const gpsdo_gnss_info_t *gpsdo_gps_info(void)
+{
+    return &s_gnss_info;
+}
 
 /* Serial port for echo / messages */
 #if defined(GPSDO_BLUETOOTH_PARALLEL)
@@ -65,6 +73,199 @@ static void ubx_cksum(uint8_t *msg, uint8_t len)
     for (uint8_t i = 2; i < len - 2; i++) { cka += msg[i]; ckb += cka; }
     msg[len - 2] = cka;
     msg[len - 1] = ckb;
+}
+
+/*
+ * recv_ubx_frame — receive one checksum-valid UBX frame of the requested
+ * class/id while ignoring interleaved NMEA and unrelated UBX messages.
+ */
+static bool recv_ubx_frame(uint8_t want_cls, uint8_t want_id,
+                           uint8_t *payload, uint16_t payload_cap,
+                           uint16_t *payload_len, uint32_t timeout_ms)
+{
+    enum {
+        RX_SYNC1, RX_SYNC2, RX_CLASS, RX_ID,
+        RX_LEN1, RX_LEN2, RX_PAYLOAD, RX_CKA, RX_CKB
+    } state = RX_SYNC1;
+
+    bool sched_running = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
+
+    uint8_t  rx_cls = 0, rx_id = 0;
+    uint16_t rx_len = 0, pos = 0;
+    uint8_t  cka = 0, ckb = 0;
+
+    uint32_t t0 = millis();
+
+    while ((millis() - t0) < timeout_ms) {
+        if (!Serial1.available()) {
+            if (sched_running) vTaskDelay(pdMS_TO_TICKS(1));
+            else               delay(1);
+            continue;
+        }
+
+        uint8_t b = (uint8_t)Serial1.read();
+
+        switch (state) {
+        case RX_SYNC1:
+            if (b == 0xB5) state = RX_SYNC2;
+            break;
+
+        case RX_SYNC2:
+            if (b == 0x62) {
+                state = RX_CLASS;
+            } else {
+                state = (b == 0xB5) ? RX_SYNC2 : RX_SYNC1;
+            }
+            break;
+
+        case RX_CLASS:
+            rx_cls = b;
+            cka = b;
+            ckb = cka;
+            state = RX_ID;
+            break;
+
+        case RX_ID:
+            rx_id = b;
+            cka += b;
+            ckb += cka;
+            state = RX_LEN1;
+            break;
+
+        case RX_LEN1:
+            rx_len = b;
+            cka += b;
+            ckb += cka;
+            state = RX_LEN2;
+            break;
+
+        case RX_LEN2:
+            rx_len |= (uint16_t)b << 8;
+            cka += b;
+            ckb += cka;
+            pos = 0;
+            state = (rx_len == 0) ? RX_CKA : RX_PAYLOAD;
+            break;
+
+        case RX_PAYLOAD:
+            cka += b;
+            ckb += cka;
+
+            if (rx_cls == want_cls && rx_id == want_id && pos < payload_cap)
+                payload[pos] = b;
+
+            if (++pos >= rx_len)
+                state = RX_CKA;
+            break;
+
+        case RX_CKA:
+            if (b == cka) {
+                state = RX_CKB;
+            } else {
+                state = (b == 0xB5) ? RX_SYNC2 : RX_SYNC1;
+            }
+            break;
+
+        case RX_CKB:
+            if (b == ckb &&
+                rx_cls == want_cls &&
+                rx_id == want_id &&
+                rx_len <= payload_cap) {
+                if (payload_len) *payload_len = rx_len;
+                return true;
+            }
+
+            state = (b == 0xB5) ? RX_SYNC2 : RX_SYNC1;
+            break;
+        }
+    }
+
+    return false;
+}
+
+static void copy_ubx_text(char *dst, size_t dst_size,
+                          const uint8_t *src, size_t src_size)
+{
+    if (dst_size == 0) return;
+
+    size_t n = 0;
+    while (n < src_size && src[n] != '\0' && n + 1 < dst_size) {
+        dst[n] = (char)src[n];
+        n++;
+    }
+
+    while (n > 0 && dst[n - 1] == ' ')
+        n--;
+
+    dst[n] = '\0';
+}
+
+/*
+ * UBX-MON-VER:
+ *   swVersion  CH[30]
+ *   hwVersion  CH[10]
+ *   extension  CH[30] repeated
+ */
+static bool ubx_poll_mon_ver(void)
+{
+    static const uint8_t poll[] = {
+        0xB5, 0x62,
+        0x0A, 0x04,
+        0x00, 0x00,
+        0x0E, 0x34
+    };
+
+    uint8_t payload[400];
+    uint16_t len = 0;
+
+    send_ubx(poll, sizeof(poll));
+
+    if (!recv_ubx_frame(0x0A, 0x04,
+                        payload, sizeof(payload),
+                        &len, 1000))
+        return false;
+
+    /* MON-VER is 40 bytes plus zero or more 30-byte extensions. */
+    if (len < 40 || ((len - 40) % 30) != 0)
+        return false;
+
+    s_gnss_info.ubx_seen = true;
+    s_gnss_info.detected = true;
+
+    copy_ubx_text(s_gnss_info.sw_version,
+                  sizeof(s_gnss_info.sw_version),
+                  payload, 30);
+
+    copy_ubx_text(s_gnss_info.hw_version,
+                  sizeof(s_gnss_info.hw_version),
+                  payload + 30, 10);
+
+    s_gnss_info.model[0] = '\0';
+    s_gnss_info.fw_version[0] = '\0';
+    s_gnss_info.prot_version[0] = '\0';
+
+    for (uint16_t off = 40; off + 30 <= len; off += 30) {
+        char ext[31];
+        copy_ubx_text(ext, sizeof(ext), payload + off, 30);
+
+        if (strncmp(ext, "MOD=", 4) == 0) {
+            strncpy(s_gnss_info.model, ext + 4,
+                    sizeof(s_gnss_info.model) - 1);
+            s_gnss_info.model[sizeof(s_gnss_info.model) - 1] = '\0';
+        }
+        else if (strncmp(ext, "FWVER=", 6) == 0) {
+            strncpy(s_gnss_info.fw_version, ext + 6,
+                    sizeof(s_gnss_info.fw_version) - 1);
+            s_gnss_info.fw_version[sizeof(s_gnss_info.fw_version) - 1] = '\0';
+        }
+        else if (strncmp(ext, "PROTVER=", 8) == 0) {
+            strncpy(s_gnss_info.prot_version, ext + 8,
+                    sizeof(s_gnss_info.prot_version) - 1);
+            s_gnss_info.prot_version[sizeof(s_gnss_info.prot_version) - 1] = '\0';
+        }
+    }
+
+    return true;
 }
 
 /*
@@ -1088,6 +1289,11 @@ static uint32_t detect_nmea_baud(void)
 
         if (nmea_sentence_ok(NMEA_SWEEP_WINDOW_MS)) {
             OUT_SERIAL.print("GPS: NMEA traffic at "); OUT_SERIAL.println(baud);
+
+            s_gnss_info.detected = true;
+            s_gnss_info.nmea_seen = true;
+            s_gnss_info.baud = baud;
+
             while (Serial1.available()) Serial1.read();
             return baud;
         }
@@ -1098,38 +1304,58 @@ static uint32_t detect_nmea_baud(void)
 static uint32_t detect_gps_baud(void)
 {
     uint32_t nmea = detect_nmea_baud();
-    if (nmea != 0) return nmea;
 
+    if (nmea != 0) {
+        /*
+         * Presence is already proven by a valid NMEA sentence.
+         * MON-VER is best-effort identification; failure does not undo
+         * the valid NMEA detection.
+         */
+        if (ubx_poll_mon_ver()) {
+            OUT_SERIAL.print("GPS: UBX receiver");
+            if (s_gnss_info.model[0]) {
+                OUT_SERIAL.print(" model=");
+                OUT_SERIAL.print(s_gnss_info.model);
+            }
+            OUT_SERIAL.println();
+        }
+
+        return nmea;
+    }
+
+    /*
+     * No valid NMEA was seen. Try a checksum-valid UBX-MON-VER response
+     * at each candidate baud. Random serial bytes are not detection.
+     */
     for (uint8_t i = 0; i < N_BAUD_CANDIDATES; i++) {
         uint32_t baud = BAUD_CANDIDATES[i];
+
         Serial1.end();
         Serial1.begin(baud);
         delay(50);
-        /* Flush any junk */
         while (Serial1.available()) Serial1.read();
 
-        /* Send poll */
-        for (uint8_t b = 0; b < sizeof(UBX_POLL_PRT); b++)
-            Serial1.write(UBX_POLL_PRT[b]);
-        Serial1.flush();
+        if (ubx_poll_mon_ver()) {
+            s_gnss_info.baud = baud;
 
-        /* Wait up to 350ms for any response byte */
-        uint32_t t0 = millis();
-        while ((millis() - t0) < 350) {
-            if (Serial1.available()) {
-                OUT_SERIAL.print("GPS detected at "); OUT_SERIAL.println(baud);
-                /* Flush partial response before returning */
-                delay(10);
-                while (Serial1.available()) Serial1.read();
-                return baud;
+            OUT_SERIAL.print("GPS: UBX receiver at ");
+            OUT_SERIAL.print(baud);
+
+            if (s_gnss_info.model[0]) {
+                OUT_SERIAL.print(" model=");
+                OUT_SERIAL.print(s_gnss_info.model);
             }
-            delay(1);
+
+            OUT_SERIAL.println();
+            return baud;
         }
-        OUT_SERIAL.print("No GPS response at "); OUT_SERIAL.println(baud);
+
+        OUT_SERIAL.print("No GPS response at ");
+        OUT_SERIAL.println(baud);
     }
-    /* Nothing responded — default to 9600 */
-    OUT_SERIAL.println("GPS baud detect failed, defaulting to 9600");
-    return 9600;
+
+    OUT_SERIAL.println("GPS baud detect failed");
+    return 0;
 }
 
 /*
@@ -1167,6 +1393,7 @@ static uint32_t detect_gps_baud(void)
 
 void gpsdo_gps_init(void)
 {
+    memset(&s_gnss_info, 0, sizeof(s_gnss_info));
     OUT_SERIAL.println("GPS init: probing baud rate...");
 
 #ifdef GPSDO_UBX_CONFIG
