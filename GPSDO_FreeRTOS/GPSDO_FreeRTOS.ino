@@ -51,6 +51,7 @@
  * gpsdo_build_id.h — and the CRC in the banner, which cannot be stale either way. */
 #include "gpsdo_build_id.h"
 #include "gpsdo_log.h"
+#include "gpsdo_hw.h"
 #include <Arduino.h>
 #include <Wire.h>
 /* EEPROM library removed in v0.96 — persistence via flash_ring (sector 7). */
@@ -108,36 +109,6 @@ TeeSerial g_tee(Serial, Serial2);
 #endif
 
 /* ====================================================================== */
-
-/* Why did we just restart?
- *
- * The board was rebooting intermittently, always at the same point in GPS
- * configuration, and there was no way to tell a brown-out from a software fault
- * by looking at the log — both leave the same silence followed by a fresh banner.
- * RCC->CSR holds the answer and costs nothing to read.
- *
- * BOR/POR means the 3V3 rail dipped: the regulator on the BlackPill feeds the
- * GPS, the TFT, the LTIC detector and the clock display, and the receiver draws a
- * step of current when it changes mode. PIN is the reset button or a floating
- * NRST. SFT is NVIC_SystemReset, i.e. our own RB command. The flags latch, so
- * they must be cleared afterwards or the next boot reports this one. */
-static void print_reset_cause(void)
-{
-    uint32_t csr = RCC->CSR;
-    OUT_SERIAL.print("Reset cause:");
-    if (csr & RCC_CSR_LPWRRSTF) OUT_SERIAL.print(" LOW-POWER");
-    if (csr & RCC_CSR_WWDGRSTF) OUT_SERIAL.print(" WINDOW-WDG");
-    if (csr & RCC_CSR_IWDGRSTF) OUT_SERIAL.print(" INDEP-WDG");
-    if (csr & RCC_CSR_SFTRSTF)  OUT_SERIAL.print(" SOFTWARE");
-    if (csr & RCC_CSR_PORRSTF)  OUT_SERIAL.print(" POWER-ON/BROWN-OUT");
-    if (csr & RCC_CSR_PINRSTF)  OUT_SERIAL.print(" PIN/NRST");
-    if (csr & RCC_CSR_BORRSTF)  OUT_SERIAL.print(" BROWN-OUT");
-    OUT_SERIAL.println();
-    if (csr & (RCC_CSR_BORRSTF | RCC_CSR_PORRSTF))
-        OUT_SERIAL.println("  -> supply dipped: check the 3V3 rail under load");
-
-    RCC->CSR |= RCC_CSR_RMVF;      /* clear, or the next boot reports this one */
-}
 
 extern "C" void gpsdo_assert_diagnostic(const char *file, int line)
 {
@@ -303,7 +274,7 @@ void setup()
     OUT_SERIAL.println(DEBUG_BUILD_TAG);
 #endif
     OUT_SERIAL.println("================================================\r\n");
-    print_reset_cause();
+    gpsdo_hw_log_reset_cause();
 
     /* ---- I2C ---- */
     Wire.begin();
@@ -419,6 +390,9 @@ void setup()
     OUT_SERIAL.print("Initial PWM=");    OUT_SERIAL.print(gCtrl.pwm_output);
     OUT_SERIAL.print(" algo=");          OUT_SERIAL.print(gCtrl.active_algo);
     OUT_SERIAL.print(" time_offset_min="); OUT_SERIAL.println((int)g_time_offset_min);
+
+    /* ---- Hardware POST ---- */
+    gpsdo_hw_post_begin();
 
     /* ---- GPS init ---- */
     gpsdo_gps_init();
