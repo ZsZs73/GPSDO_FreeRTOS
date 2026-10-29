@@ -145,34 +145,63 @@ int fr_begin_fresh_count(fr_state_t *st, uint16_t prev_ec)
     return 0;   /* no data yet */
 }
 
-uint16_t fr_read_newest(fr_state_t *st, uint8_t type,
-                        uint8_t *out, uint16_t maxlen)
+fr_read_status_t fr_read_newest_ex(fr_state_t *st, uint8_t type,
+                                   uint8_t *out, uint16_t maxlen,
+                                   uint16_t *stored_len)
 {
-    if (!st->have_data) return 0;
+    if (stored_len) *stored_len = 0u;
 
-    /* Scan for the newest valid slot of the requested type. Each scan is
-     * O(slot_count) — 256 reads worst case. Acceptable because reads are
-     * called rarely (boot + a few CLI commands), never from a hot loop. */
+    /* Slots are appended in physical order within the current ring generation.
+     * Track the newest usable record and the newest record of this type. If a
+     * corrupt record was written after the usable one, report recovery. */
     uint8_t slot[FR_SLOT_SIZE];
-    uint16_t best_seq = 0, best_idx = 0xFFFFu;
+    uint16_t best_seq = 0u, best_idx = 0xFFFFu;
+    uint16_t newest_type_idx = 0xFFFFu;
+
     for (uint16_t i = 0; i < st->slot_count; i++) {
         st->ops->read(fr_slot_off(st, i), slot, FR_SLOT_SIZE);
-        if (fr_slot_blank(slot)) continue;       /* first blank ends live area */
-        if (!fr_slot_valid(slot)) continue;
+        if (fr_slot_blank(slot)) continue;
         if (fr_slot_type(slot) != type) continue;
+
+        newest_type_idx = i;
+        if (!fr_slot_valid(slot)) continue;
+
         uint16_t seq = fr_slot_seq(slot);
         if (best_idx == 0xFFFFu || fr_seq_newer(seq, best_seq)) {
-            best_seq = seq; best_idx = i;
+            best_seq = seq;
+            best_idx = i;
         }
     }
-    if (best_idx == 0xFFFFu) return 0;
+
+    if (best_idx == 0xFFFFu)
+        return (newest_type_idx != 0xFFFFu) ? FR_READ_CHECKSUM : FR_READ_MISSING;
+
+    const int recovered =
+        (newest_type_idx != 0xFFFFu && newest_type_idx > best_idx);
 
     st->ops->read(fr_slot_off(st, best_idx), slot, FR_SLOT_SIZE);
     uint16_t len = fr_slot_len(slot);
-    if (len > FR_PAYLOAD) len = FR_PAYLOAD;
-    if (len > maxlen)     len = maxlen;
-    memcpy(out, slot + FR_SLOT_HDR, len);   /* payload follows the 6-byte header */
-    return len;
+    if (stored_len) *stored_len = len;
+
+    if (len > FR_PAYLOAD)
+        return FR_READ_LENGTH;
+
+    uint16_t copy_len = len;
+    if (copy_len > maxlen) copy_len = maxlen;
+    if (copy_len > 0u && out != NULL)
+        memcpy(out, slot + FR_SLOT_HDR, copy_len);
+
+    return recovered ? FR_READ_RECOVERED : FR_READ_OK;
+}
+
+uint16_t fr_read_newest(fr_state_t *st, uint8_t type,
+                        uint8_t *out, uint16_t maxlen)
+{
+    uint16_t stored_len = 0u;
+    fr_read_status_t rs = fr_read_newest_ex(st, type, out, maxlen, &stored_len);
+    if (rs != FR_READ_OK && rs != FR_READ_RECOVERED)
+        return 0u;
+    return (stored_len > maxlen) ? maxlen : stored_len;
 }
 
 int fr_write(fr_state_t *st, uint8_t type,

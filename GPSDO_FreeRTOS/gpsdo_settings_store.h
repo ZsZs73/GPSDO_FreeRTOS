@@ -205,12 +205,21 @@ typedef enum {
                       /* the PID group, the LTIC loop gains, and pwm       */
 } settings_partial_t;
 
-/* Boot-time recall. Reads the newest REC_SETTINGS slot from the ring,
- * validates version + per-field range guards, and applies the values to the
- * runtime globals (gCtrl, g_pid, g_ltic, g_tz_*, flags). Safe to call
- * before the scheduler starts (no mutex use). Returns true if a valid
- * stored block was found and applied; false if the ring had no settings
- * slot (compile-time defaults remain in effect). */
+typedef enum {
+    SETTINGS_LOAD_OK = 0,
+    SETTINGS_LOAD_RECOVERED,
+    SETTINGS_LOAD_MISSING,
+    SETTINGS_LOAD_CHECKSUM,
+    SETTINGS_LOAD_VERSION,
+    SETTINGS_LOAD_SIZE,
+    SETTINGS_LOAD_STORAGE
+} settings_load_status_t;
+
+/* Detailed boot-time recall. stored_version receives the record's version byte
+ * when one could be read. */
+settings_load_status_t settings_recall_status(uint8_t *stored_version);
+
+/* Compatibility wrapper. */
 bool settings_recall(void);
 
 /* Full save: snapshot every settings field from runtime into a fresh

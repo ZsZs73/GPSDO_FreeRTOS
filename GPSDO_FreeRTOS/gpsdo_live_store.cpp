@@ -99,13 +99,31 @@ static void ls_apply(const uint8_t *buf)
     s_have_last  = true;
 }
 
-bool live_store_begin(void)
+live_load_status_t live_store_begin_status(void)
 {
     uint8_t buf[LS_PAYLOAD];
-    uint16_t n = flash_ring_read_newest(REC_LIVE, buf, sizeof(buf));
-    if (n < LS_PAYLOAD) return false;      /* nothing stored yet */
+    uint16_t n = 0u;
+    flash_ring_read_status_t rs =
+        flash_ring_read_newest_ex(REC_LIVE, buf, sizeof(buf), &n);
+
+    if (rs == FLASH_RING_READ_MISSING)   return LIVE_LOAD_MISSING;
+    if (rs == FLASH_RING_READ_CHECKSUM)  return LIVE_LOAD_CHECKSUM;
+    if (rs == FLASH_RING_READ_NOT_READY) return LIVE_LOAD_STORAGE;
+    if (rs == FLASH_RING_READ_LENGTH)    return LIVE_LOAD_SIZE;
+
+    const bool recovered = (rs == FLASH_RING_READ_RECOVERED);
+    if (rs != FLASH_RING_READ_OK && !recovered)
+        return LIVE_LOAD_STORAGE;
+    if (n != LS_PAYLOAD) return LIVE_LOAD_SIZE;
+
     ls_apply(buf);
-    return true;
+    return recovered ? LIVE_LOAD_RECOVERED : LIVE_LOAD_OK;
+}
+
+bool live_store_begin(void)
+{
+    live_load_status_t st = live_store_begin_status();
+    return st == LIVE_LOAD_OK || st == LIVE_LOAD_RECOVERED;
 }
 
 static bool ls_should_save(uint32_t now_ms)

@@ -4012,7 +4012,7 @@ static void kf_reset(const kf_scale_t *k)
  * misread. */
 #define A13_REC_VER 2u          /* 1 = R,Q,KT (12 B); 2 = adds KC (14 B) */
 
-void kf_store_save(void)
+bool kf_store_save(void)
 {
     uint8_t b[14];
     b[0] = A13_REC_VER; b[1] = 0;
@@ -4023,30 +4023,74 @@ void kf_store_save(void)
     b[3] = (uint8_t)(g_kf_horizon_s >> 8);
     b[12] = (uint8_t)(g_kf_ctl_s & 0xFFu);
     b[13] = (uint8_t)(g_kf_ctl_s >> 8);
-    (void)flash_ring_write(REC_A13, b, sizeof(b));
+    return flash_ring_write(REC_A13, b, sizeof(b));
 }
 
-bool kf_store_load(void)
+kf_config_status_t kf_store_load_status(uint8_t *stored_version)
 {
-    /* VERSION 1 STILL LOADS. Rejecting it would have been two lines shorter and
-     * would have silently reset an operator's KR/KQ/KT on the one upgrade that
-     * had no reason to touch them. */
+    if (stored_version) *stored_version = 0u;
+
+    /* A load is a complete transaction: start from documented firmware
+     * defaults, then apply the saved set only if the whole record is valid. */
+    g_kf_r_ns      = 0.0f;
+    g_kf_q         = 0.0f;
+    g_kf_horizon_s = 100u;
+    g_kf_ctl_s     = 0u;
+
     uint8_t b[14];
-    uint16_t n = flash_ring_read_newest(REC_A13, b, sizeof(b));
-    if (n < 12u) return false;
-    if (b[0] != 1u && b[0] != A13_REC_VER) return false;
+    memset(b, 0, sizeof(b));
+
+    uint16_t n = 0u;
+    flash_ring_read_status_t rs =
+        flash_ring_read_newest_ex(REC_A13, b, sizeof(b), &n);
+
+    if (rs == FLASH_RING_READ_MISSING)   return KF_CONFIG_MISSING;
+    if (rs == FLASH_RING_READ_CHECKSUM)  return KF_CONFIG_CHECKSUM;
+    if (rs == FLASH_RING_READ_NOT_READY) return KF_CONFIG_STORAGE;
+    if (rs == FLASH_RING_READ_LENGTH)    return KF_CONFIG_SIZE;
+
+    const bool recovered = (rs == FLASH_RING_READ_RECOVERED);
+    if (rs != FLASH_RING_READ_OK && !recovered)
+        return KF_CONFIG_STORAGE;
+
+    if (n == 0u) return KF_CONFIG_SIZE;
+    if (stored_version) *stored_version = b[0];
+
+    if (b[0] != 1u && b[0] != A13_REC_VER)
+        return KF_CONFIG_VERSION;
+
+    if ((b[0] == 1u && n != 12u) ||
+        (b[0] == A13_REC_VER && n != 14u))
+        return KF_CONFIG_SIZE;
+
     float r, q;
     memcpy(&r, &b[4], 4);
     memcpy(&q, &b[8], 4);
     uint16_t t = (uint16_t)b[2] | ((uint16_t)b[3] << 8);
-    if (r >= 0.0f && r <= 1000.0f)   g_kf_r_ns = r;
-    if (q >= 0.0f && q <= 1.0f)      g_kf_q    = q;
-    if (t >= 10u && t <= (uint16_t)KF_HORIZON_MAX) g_kf_horizon_s = t;
-    if (b[0] == A13_REC_VER && n >= 14u) {
-        uint16_t c = (uint16_t)b[12] | ((uint16_t)b[13] << 8);
-        if (c == 0u || (c >= 10u && c <= (uint16_t)KF_HORIZON_MAX)) g_kf_ctl_s = c;
+
+    if (!(r >= 0.0f && r <= 1000.0f)) return KF_CONFIG_INVALID_KR;
+    if (!(q >= 0.0f && q <= 1.0f))    return KF_CONFIG_INVALID_KQ;
+    if (!(t >= 10u && t <= (uint16_t)KF_HORIZON_MAX))
+        return KF_CONFIG_INVALID_KT;
+
+    uint16_t c = 0u;
+    if (b[0] == A13_REC_VER) {
+        c = (uint16_t)b[12] | ((uint16_t)b[13] << 8);
+        if (!(c == 0u || (c >= 10u && c <= (uint16_t)KF_HORIZON_MAX)))
+            return KF_CONFIG_INVALID_KC;
     }
-    return true;
+
+    g_kf_r_ns      = r;
+    g_kf_q         = q;
+    g_kf_horizon_s = t;
+    g_kf_ctl_s     = c;
+    return recovered ? KF_CONFIG_RECOVERED : KF_CONFIG_OK;
+}
+
+bool kf_store_load(void)
+{
+    kf_config_status_t st = kf_store_load_status(NULL);
+    return st == KF_CONFIG_OK || st == KF_CONFIG_RECOVERED;
 }
 
 uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)

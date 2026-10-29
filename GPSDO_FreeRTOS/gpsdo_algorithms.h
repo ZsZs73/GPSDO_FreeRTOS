@@ -350,8 +350,23 @@ typedef struct {
     uint32_t arms;          /* picDIV re-arms this session                    */
 } kf_stats_t;
 void kf_get_stats(kf_stats_t *out);   /* kf_locked() is declared above */
-void kf_store_save(void);   /* write KR/KQ/KT to their own ring record */
-bool kf_store_load(void);   /* read them back at boot                  */
+typedef enum {
+    KF_CONFIG_OK = 0,
+    KF_CONFIG_RECOVERED,
+    KF_CONFIG_MISSING,
+    KF_CONFIG_CHECKSUM,
+    KF_CONFIG_VERSION,
+    KF_CONFIG_SIZE,
+    KF_CONFIG_STORAGE,
+    KF_CONFIG_INVALID_KR,
+    KF_CONFIG_INVALID_KQ,
+    KF_CONFIG_INVALID_KT,
+    KF_CONFIG_INVALID_KC
+} kf_config_status_t;
+
+bool kf_store_save(void);
+kf_config_status_t kf_store_load_status(uint8_t *stored_version);
+bool kf_store_load(void);   /* compatibility wrapper */
 
 #ifdef GPSDO_LTIC
 uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount);

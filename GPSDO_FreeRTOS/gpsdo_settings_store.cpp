@@ -342,37 +342,46 @@ static void apply_full(const SettingsBlock_t *s)
 
 /* ---- public API ---- */
 
-bool settings_recall(void)
+settings_load_status_t settings_recall_status(uint8_t *stored_version)
 {
-    /* Zeroed first: flash_ring_read_newest() copies only as many bytes as the
-     * stored record holds, so a record written by a build with a smaller block
-     * would leave the tail of this struct as stack garbage. Requiring the exact
-     * size as well means a layout change can never be half-applied. */
+    if (stored_version) *stored_version = 0u;
+
     SettingsBlock_t s;
     memset(&s, 0, sizeof(s));
-    uint16_t n = flash_ring_read_newest(REC_SETTINGS, (uint8_t *)&s, sizeof(s));
-    /* Migration. A v4 block is shorter than a v5 one and carries no algo-12
-     * fields; rejecting it outright would throw away a working PID, LC and
-     * timezone because a new algorithm was added. Accept it, apply what it has,
-     * and leave the algo-12 block at its defaults — the user notices nothing
-     * except that algorithm 12 starts untuned, which it would anyway. */
+
+    uint16_t n = 0u;
+    flash_ring_read_status_t rs =
+        flash_ring_read_newest_ex(REC_SETTINGS, (uint8_t *)&s, sizeof(s), &n);
+
+    if (rs == FLASH_RING_READ_MISSING)   return SETTINGS_LOAD_MISSING;
+    if (rs == FLASH_RING_READ_CHECKSUM)  return SETTINGS_LOAD_CHECKSUM;
+    if (rs == FLASH_RING_READ_NOT_READY) return SETTINGS_LOAD_STORAGE;
+    if (rs == FLASH_RING_READ_LENGTH)    return SETTINGS_LOAD_SIZE;
+
+    const bool recovered = (rs == FLASH_RING_READ_RECOVERED);
+    if (rs != FLASH_RING_READ_OK && !recovered)
+        return SETTINGS_LOAD_STORAGE;
+
+    if (n == 0u) return SETTINGS_LOAD_SIZE;
+    if (stored_version) *stored_version = s.ver;
+
     if (s.ver == 4u && n == offsetof(SettingsBlock_t, a12_gain)) {
-        /* the fields beyond the v4 layout are already at their defaults */
+        /* fields appended after v4 stay at their defaults */
     } else if (s.ver == 5u && n == offsetof(SettingsBlock_t, dac_vref_cv)) {
-        /* and one version later, the same deal for the DV/AV output scales:
-         * accepted with defaults, so a v1.06 board keeps its PID, LC, algo-12
-         * tuning and DAC path while gaining the new knobs unset. */
-    } else if (s.ver != SETTINGS_VER ||
-               n < SETTINGS_V6_BYTES || n > sizeof(s)) {
-        return false;
+        /* fields appended after v5 stay at their defaults */
+    } else {
+        if (s.ver != SETTINGS_VER) return SETTINGS_LOAD_VERSION;
+        if (n < SETTINGS_V6_BYTES || n > sizeof(s)) return SETTINGS_LOAD_SIZE;
     }
-    /* Anything between SETTINGS_V6_BYTES and the current size is a record from
-     * a build that had fewer appended fields. The struct was zeroed above, so
-     * those fields read as 0, which every one of them defines as "unset" — the
-     * same deal the two migrations above give, but without needing a new case
-     * each time a byte is added. */
+
     apply_full(&s);
-    return true;
+    return recovered ? SETTINGS_LOAD_RECOVERED : SETTINGS_LOAD_OK;
+}
+
+bool settings_recall(void)
+{
+    settings_load_status_t st = settings_recall_status(NULL);
+    return st == SETTINGS_LOAD_OK || st == SETTINGS_LOAD_RECOVERED;
 }
 
 bool settings_save(void)

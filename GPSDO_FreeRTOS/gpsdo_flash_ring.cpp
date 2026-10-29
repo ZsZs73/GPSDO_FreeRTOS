@@ -116,10 +116,33 @@ bool flash_ring_wipe(void)
     return (r == 1);
 }
 
+flash_ring_read_status_t flash_ring_read_newest_ex(
+    uint8_t type, uint8_t *out, uint16_t maxlen, uint16_t *stored_len)
+{
+    if (stored_len) *stored_len = 0u;
+    if (!s_ready) return FLASH_RING_READ_NOT_READY;
+
+    fr_read_status_t st =
+        fr_read_newest_ex(&s_state, type, out, maxlen, stored_len);
+
+    switch (st) {
+    case FR_READ_OK:        return FLASH_RING_READ_OK;
+    case FR_READ_RECOVERED: return FLASH_RING_READ_RECOVERED;
+    case FR_READ_MISSING:  return FLASH_RING_READ_MISSING;
+    case FR_READ_CHECKSUM: return FLASH_RING_READ_CHECKSUM;
+    case FR_READ_LENGTH:   return FLASH_RING_READ_LENGTH;
+    default:               return FLASH_RING_READ_LENGTH;
+    }
+}
+
 uint16_t flash_ring_read_newest(uint8_t type, uint8_t *out, uint16_t maxlen)
 {
-    if (!s_ready) return 0;
-    return fr_read_newest(&s_state, type, out, maxlen);
+    uint16_t stored_len = 0u;
+    flash_ring_read_status_t rs =
+        flash_ring_read_newest_ex(type, out, maxlen, &stored_len);
+    if (rs != FLASH_RING_READ_OK && rs != FLASH_RING_READ_RECOVERED)
+        return 0u;
+    return (stored_len > maxlen) ? maxlen : stored_len;
 }
 
 bool flash_ring_write(uint8_t type, const uint8_t *data, uint16_t len)

@@ -29,9 +29,19 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Load the newest live payload from the ring (if any) into the globals /
- * g_ltic. Call once at boot AFTER flash_ring_begin(). Returns true if live
- * data was applied. */
+typedef enum {
+    LIVE_LOAD_OK = 0,
+    LIVE_LOAD_RECOVERED,
+    LIVE_LOAD_MISSING,
+    LIVE_LOAD_CHECKSUM,
+    LIVE_LOAD_SIZE,
+    LIVE_LOAD_STORAGE
+} live_load_status_t;
+
+/* Detailed load for startup diagnostics. */
+live_load_status_t live_store_begin_status(void);
+
+/* Compatibility wrapper. */
 bool live_store_begin(void);
 
 /* Periodic tick from the control task (once per second is plenty). Applies

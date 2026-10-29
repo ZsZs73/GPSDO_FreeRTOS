@@ -54,8 +54,21 @@
  * scheduler starts. Returns true if at least one valid slot exists. */
 bool     flash_ring_begin(void);
 
-/* Copy the most recent payload of the given type into out (up to maxlen).
- * Returns the stored length, or 0 if no slot of that type exists. */
+typedef enum {
+    FLASH_RING_READ_OK = 0,
+    FLASH_RING_READ_RECOVERED,
+    FLASH_RING_READ_MISSING,
+    FLASH_RING_READ_CHECKSUM,
+    FLASH_RING_READ_LENGTH,
+    FLASH_RING_READ_NOT_READY
+} flash_ring_read_status_t;
+
+/* Detailed read for user-facing diagnostics. stored_len is the length recorded
+ * in flash; at most maxlen bytes are copied to out. */
+flash_ring_read_status_t flash_ring_read_newest_ex(
+    uint8_t type, uint8_t *out, uint16_t maxlen, uint16_t *stored_len);
+
+/* Compatibility wrapper: returns copied payload length, or 0 on failure. */
 uint16_t flash_ring_read_newest(uint8_t type, uint8_t *out, uint16_t maxlen);
 
 /* Append a new payload of the given type as the next ring slot. Erases +
@@ -79,6 +92,8 @@ uint8_t  flash_ring_sector_no(void);
 
 /* Erase and reformat the ring sector (cold-restart wipe). After this the ring
  * reads empty and the next recall falls back to defaults. Returns true on OK. */
+
+
 bool     flash_ring_wipe(void);
 
 #endif /* GPSDO_FLASH_RING_H */

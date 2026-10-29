@@ -105,14 +105,29 @@ uint16_t fr_crc16(const uint8_t *p, uint32_t n);
 int  fr_begin(fr_state_t *st, const fr_ops_t *ops);
 int  fr_begin_fresh_count(fr_state_t *st, uint16_t prev_ec);
 
-/* Copy newest payload of the requested type to out (<= maxlen).
- * Scans the ring for the highest-seq valid slot whose type matches.
- * Returns payload length, or 0 if no slot of that type exists. */
+typedef enum {
+    FR_READ_OK = 0,
+    FR_READ_RECOVERED,
+    FR_READ_MISSING,
+    FR_READ_CHECKSUM,
+    FR_READ_LENGTH
+} fr_read_status_t;
+
+/* Detailed read used by the persistence layers. A corrupt record is reported
+ * only when no older valid record of the requested type can be recovered.
+ * stored_len is the length recorded in flash; at most maxlen bytes are copied. */
+fr_read_status_t fr_read_newest_ex(fr_state_t *st, uint8_t type,
+                                   uint8_t *out, uint16_t maxlen,
+                                   uint16_t *stored_len);
+
+/* Compatibility wrapper: returns copied payload length, or 0 on failure. */
 uint16_t fr_read_newest(fr_state_t *st, uint8_t type,
                         uint8_t *out, uint16_t maxlen);
 
 /* Append payload as the next slot of the given type; wraps (erase) when full.
  * Returns 0 ok. */
+
+
 int  fr_write(fr_state_t *st, uint8_t type,
               const uint8_t *data, uint16_t len);
 

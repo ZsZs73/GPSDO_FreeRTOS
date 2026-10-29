@@ -13,9 +13,9 @@
  * FreeRTOS scheduler.  loop() is intentionally empty — it is never called
  * after the scheduler starts with the STM32duino FreeRTOS port.
  *
- * On boot, EEPROM is checked for a valid signature.  If found, stored
- * PWM, algorithm, time offset and PID parameters are recalled.  Otherwise
- * compile-time defaults are used and the calibration sequence is armed.
+ * On boot, the flash ring is checked for stored configuration/state.
+ * Valid records are recalled; otherwise compile-time defaults are used and
+ * the calibration sequence is armed.
  *
  * Requires:
  *   - STM32duino core >= 2.2.0
@@ -23,7 +23,6 @@
  *   - TinyGPS++, Adafruit_AHTX0, Adafruit_BMP280, Adafruit_INA219
  *   - U8g2, TM1637Display (local copy in project)
  *   - hd44780 (if GPSDO_LCD_20x4 is enabled)
- *   - EEPROM (STM32 emulated)
  *   Arduino IDE: Tools > C Runtime Library > Newlib Nano + Float Printf/Scanf
  *
  * SERIAL RX BUFFER (build_opt.h)
@@ -43,7 +42,6 @@
 #include "gpsdo_backlight.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
-#include "gpsdo_algorithms.h"
 #include "gpsdo_build.h"
 /* Not used for anything except its own existence: including it is what
  * makes the Arduino builder recompile this file, so __DATE__ below is the
@@ -52,6 +50,7 @@
 #include "gpsdo_build_id.h"
 #include "gpsdo_log.h"
 #include "gpsdo_hw.h"
+#include "gpsdo_config_load.h"
 #include <Arduino.h>
 #include <Wire.h>
 /* EEPROM library removed in v0.96 — persistence via flash_ring (sector 7). */
@@ -75,16 +74,7 @@ extern SemaphoreHandle_t xTwoHzSemaphore;
 
 #include "gpsdo_gps.h"
 
-/* declared in gpsdo_state.cpp */
-extern bool persist_check_on_boot(void);
-extern void persist_recall(void);
-#include "gpsdo_flash_ring.h"
-#include "gpsdo_live_store.h"
-#include "gpsdo_settings_store.h"
 #include "gpsdo_span.h"
-
-/* declared in gpsdo_cli.cpp — single byte, safe to read without mutex */
-extern int16_t g_time_offset_min;
 
 /* ---- pinModeAF helper ------------------------------------------------- */
 static void pinModeAF(int ulPin, uint32_t Alternate)
@@ -213,7 +203,6 @@ void setup()
 #endif
 
     OUT_SERIAL.println("\r\n================================================");
-    gpsdo_log_event(GPSDO_LOG_INFO, "BOOT", "START");
     /* Build stamp in the banner: GPSDO vX.YY-rtos compiled YYYY-MM-DD HH:MM:SS.
      * __DATE__ is "Mmm dd yyyy" (day space-padded), __TIME__ "HH:MM:SS" — both
      * resolved at compile time, no RTC needed. Digits read by hand: sscanf is
@@ -301,7 +290,7 @@ void setup()
     /* ---- TFT backlight PWM on PB5 (TIM3 CH2) ----
      * Early, and before the splash: the panel should be lit by the time
      * anything is drawn on it. Applies the compile-time default here; the
-     * stored percentage arrives with settings_recall() below, which calls
+     * stored percentage arrives with gpsdo_config_load() below, which calls
      * backlight_set() itself. */
     backlight_begin();
 
@@ -331,65 +320,29 @@ void setup()
      * and would be fought over the moment a second PWM exists. The backlight
      * on PB5 is that second PWM. */
 
-    /* ---- Default control state (overwritten by EEPROM recall below) ---- */
-    gCtrl.pwm_output  = DEFAULT_PWM_OUTPUT;
-    gCtrl.active_algo = 0;
+    /* ---- Runtime control state ---------------------------------------- */
     gCtrl.holdover_mode = false;
     strcpy(gCtrl.trendstr, " ___");
-    g_time_offset_min = 0;
 
-    /* ---- flash ring boot (settings + live data) -----------------------
+    /* ---- Persistent configuration -------------------------------------
      *
-     * Order matters: flash_ring_begin() validates the sector header and
-     * scans slots (any record type). Then settings_recall() applies the
-     * newest REC_SETTINGS slot (PWM, algo, TZ, PID, LTIC params, flags).
-     * Finally live_store_begin() applies the newest REC_LIVE slot, which
-     * OVERRIDES PWM and LRN/LTIC calibration with fresher values.
-     *
-     * All three are safe before vTaskStartScheduler (no mutex use). If the
-     * sector is blank/foreign, flash_ring_begin() reformats it and the two
-     * recalls return false — compile-time defaults stay in effect and the
-     * user re-runs CT/LC/TZ/ES.
+     * Establish defaults, load common settings/live state, then load only
+     * the selected algorithm's private configuration. Storage details and
+     * CONFIG logging live in gpsdo_config_load.cpp.
      * ------------------------------------------------------------------ */
-    if (flash_ring_begin())
-        OUT_SERIAL.println("Flash ring: sector 7 ready");
-    else
-        OUT_SERIAL.println("Flash ring: sector 7 blank/formatted (defaults)");
-
-    /* recall user settings (PID, TZ, flags, LTIC params) */
-    if (settings_recall()) {
-        g_persist_valid = true;   /* legacy flag: "settings loaded" */
-        OUT_SERIAL.println("Settings: recalled from flash ring");
-    } else {
-        OUT_SERIAL.println("Settings: none stored (compile-time defaults)");
-    }
-    gpsdo_dac_write16(gCtrl.pwm_output);
-
-    /* recall learned/calibration values from the ring (if present) */
-#ifdef GPSDO_LTIC
-    /* Algorithm 13's three numbers live in their own ring record — see
-     * kf_store_load(). Silent when there is nothing stored: the defaults are
-     * "measure R, adapt Q", which is what a fresh board should do anyway. */
-    if (kf_store_load())
-        OUT_SERIAL.println("Kalman: KR/KQ/KT recalled from flash ring");
-#endif
-    if (live_store_begin())
-        OUT_SERIAL.println("Live store: LRN + LC applied from flash ring");
+    gpsdo_config_load();
 
     /* Span jumper on PB14: which calibration this board is running on, and —
      * if the jumper was moved while it was off — the recalled code remapped
-     * into the span it is now in. Here, after both recalls and before the
-     * write below, so the oscillator never sees a code from the wrong span. */
+     * into the span it is now in. This must remain after configuration load
+     * and before the final PWM write. */
     span_begin();
 
-    /* Re-apply PWM: live_store may have overridden the settings value with a
-     * fresher one. The OCXO should not sit at the stale PWM until the loop's
-     * first cycle; apply the final value now. */
+    /* Apply the final PWM after stored state and SPAN remapping. */
     gpsdo_dac_write16(gCtrl.pwm_output);
 
-    OUT_SERIAL.print("Initial PWM=");    OUT_SERIAL.print(gCtrl.pwm_output);
-    OUT_SERIAL.print(" algo=");          OUT_SERIAL.print(gCtrl.active_algo);
-    OUT_SERIAL.print(" time_offset_min="); OUT_SERIAL.println((int)g_time_offset_min);
+    /* Log the final active configuration after SPAN remapping. */
+    gpsdo_config_log_active();
 
     /* ---- Hardware POST ---- */
     gpsdo_hw_post_begin();
@@ -435,8 +388,8 @@ void setup()
 
     xSysEvents = xEventGroupCreate();
 
-    /* Request calibration only when EEPROM was blank/erased.
-     * When EEPROM was valid, the recalled PWM is already close to optimal
+    /* Request calibration only when no stored configuration was found.
+     * When stored configuration was valid, the recalled PWM is already close to optimal
      * and calibration would temporarily disturb the OCXO. */
     if (!g_persist_valid)
         xEventGroupSetBits(xSysEvents, EVT_NEED_CALIBRATION);
