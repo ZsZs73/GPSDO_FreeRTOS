@@ -31,6 +31,7 @@
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
+#include "gpsdo_config_load.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_span.h"
 #include <Arduino.h>
@@ -120,7 +121,11 @@ static void cli_manual_save(const char *escmd)
         cli_putln("  [not saved — value out of range; accepted range shown above]");
         return;
     }
-    cli_puts("  [not saved — run '"); cli_puts(escmd); cli_putln("' to keep it]");
+    if (!gpsdo_algo_selection_is_saved(gCtrl.active_algo)) {
+        cli_puts("  [not saved — run '");
+        cli_puts(escmd);
+        cli_putln("' to keep it]");
+    }
 }
 
 static void cli_putint(int v)
@@ -1183,6 +1188,7 @@ static void dispatch(char *line)
                            "(enable GPSDO_LTIC and run LC)");
                 return;
 #endif
+                gpsdo_algo_config_load(13u);
                 if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                     gCtrl.active_algo = 13;
                     xSemaphoreGive(xCtrlMutex);
@@ -1897,7 +1903,7 @@ static void dispatch(char *line)
             cli_putln("Done.");
         } else if (cli_ieq(arg, "ALGO")) {
             cli_putln("Saving algo+PWM...");
-            settings_save_partial(SET_ALGO);
+            gpsdo_algo_save_active(gCtrl.active_algo);
             cli_putln("Done.");
         } else if (cli_ieq(arg, "PO")) {
             cli_putln("Saving pressure/alt offset...");
@@ -2226,7 +2232,8 @@ static void dispatch(char *line)
         cli_putln("  R and Q are measured by default; KR/KQ pin them for an experiment.");
         return;
     }
-    if (cli_ieq(verb, "MF")) {                 /* where the limits come from */
+
+if (cli_ieq(verb, "MF")) {                 /* where the limits come from */
         /* Separate from MG on purpose. The gain is a property of the
          * OSCILLATOR — LSB per ns, and a different OCXO has a different Vctl
          * sensitivity — while the limits are a property of the PHASE NOISE the
