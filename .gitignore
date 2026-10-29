@@ -7,3 +7,6 @@
 compile_commands.json
 __pycache__/
 *.pyc
+.venv/
+tools/*.log
+TODO.md
