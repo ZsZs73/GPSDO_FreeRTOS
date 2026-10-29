@@ -148,6 +148,18 @@ extern "C" {
  * Needs the Serial2 wiring (PA2/PA3). This switch supersedes GPSDO_BLUETOOTH;
  * leave that one off when using parallel mode. */
 #define GPSDO_BLUETOOTH_PARALLEL
+/*
+ * The remote serial/TCP bridge path can lose back-to-back startup log records.
+ *
+ * During early boot the RTOS scheduler is not running yet, so structured
+ * LOG1 records are emitted synchronously. Serial2.flush() only guarantees
+ * that bytes have left the STM32 UART; it does not guarantee that the
+ * downstream bridge/client path has consumed them.
+ *
+ * Give the transport a short inter-record guard during early boot.
+ * This does not affect normal runtime logging after the scheduler starts.
+ */
+#define GPSDO_BT_BOOT_GUARD_MS 40
 #define GPSDO_VCC
 #define GPSDO_VDD
 #define GPSDO_UBX_CONFIG

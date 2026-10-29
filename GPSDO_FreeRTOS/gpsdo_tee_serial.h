@@ -18,6 +18,8 @@
 #define GPSDO_TEE_SERIAL_H
 
 #include <Arduino.h>
+#include "FreeRTOS.h"
+#include "task.h"
 
 class TeeSerial : public Stream
 {
@@ -25,17 +27,47 @@ public:
     TeeSerial(Stream &a, Stream &b) : _a(a), _b(b) {}
 
     /* ---- Print/Stream write path: fan out to both ports ---- */
+
     size_t write(uint8_t c) override
     {
         size_t n = _a.write(c);
         _b.write(c);
+
+        boot_line_guard(c == '\n');
         return n;                 /* report the primary port's count */
     }
 
     size_t write(const uint8_t *buf, size_t size) override
     {
         size_t n = _a.write(buf, size);
-        _b.write(buf, size);
+
+        /*
+        * Before the scheduler starts, pace the secondary UART at line
+        * boundaries. The ESP serial/TCP bridge can lose bytes when startup
+        * diagnostics arrive as one continuous burst even though the STM32 UART
+        * itself has transmitted them successfully.
+        *
+        * Split only the secondary copy so USB retains its normal behaviour.
+        */
+        if (boot_guard_active()) {
+            size_t start = 0;
+
+            for (size_t i = 0; i < size; ++i) {
+                if (buf[i] != '\n')
+                    continue;
+
+                _b.write(buf + start, i - start + 1);
+                _b.flush();
+                delay(GPSDO_BT_BOOT_GUARD_MS);
+                start = i + 1;
+            }
+
+            if (start < size)
+                _b.write(buf + start, size - start);
+        } else {
+            _b.write(buf, size);
+        }
+
         return n;
     }
 
@@ -90,6 +122,27 @@ public:
     }
 
 private:
+    bool boot_guard_active() const
+    {
+#if defined(GPSDO_BT_BOOT_GUARD_MS) && GPSDO_BT_BOOT_GUARD_MS > 0
+        return xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED;
+#else
+        return false;
+#endif
+    }
+
+    void boot_line_guard(bool end_of_line)
+    {
+#if defined(GPSDO_BT_BOOT_GUARD_MS) && GPSDO_BT_BOOT_GUARD_MS > 0
+        if (end_of_line && boot_guard_active()) {
+            _b.flush();
+            delay(GPSDO_BT_BOOT_GUARD_MS);
+        }
+#else
+        (void)end_of_line;
+#endif
+    }
+
     Stream &_a;
     Stream &_b;
 };
