@@ -34,7 +34,7 @@ static void log_emit(gpsdo_log_level_t level,
         event = "-";
 
     int n = snprintf(line, sizeof(line),
-                     "LOG1 ts=- up_ms=%lu lvl=%s sub=%s evt=%s",
+                     "LOG1 ts=- up_ms=%lu lvl=%s [%s] %s",
                      (unsigned long)millis(),
                      log_level_name(level),
                      subsystem,
@@ -80,6 +80,20 @@ void gpsdo_log_event(gpsdo_log_level_t level,
                      const char *event)
 {
     gpsdo_log_eventf(level, subsystem, event, nullptr);
+}
+
+void gpsdo_logf(gpsdo_log_level_t level,
+                const char *subsystem,
+                const char *fmt, ...)
+{
+    char msg[192];
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    gpsdo_log_event(level, subsystem, msg);
 }
 
 void gpsdo_log_eventf(gpsdo_log_level_t level,

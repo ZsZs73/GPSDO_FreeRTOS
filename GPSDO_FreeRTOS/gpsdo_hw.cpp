@@ -38,7 +38,7 @@ static gpsdo_hw_info_t s_hw = {
 static void append_reset_cause(char *buf, size_t len, const char *cause)
 {
     if (buf[0] != '\0')
-        strncat(buf, "+", len - strlen(buf) - 1);
+        strncat(buf, " + ", len - strlen(buf) - 1);
 
     strncat(buf, cause, len - strlen(buf) - 1);
 }
@@ -51,33 +51,27 @@ void gpsdo_hw_log_reset_cause(void)
     char cause[96] = "";
 
     if (csr & RCC_CSR_LPWRRSTF)
-        append_reset_cause(cause, sizeof(cause), "low_power");
+        append_reset_cause(cause, sizeof(cause), "low-power reset");
 
     if (csr & (RCC_CSR_WWDGRSTF | RCC_CSR_IWDGRSTF))
         append_reset_cause(cause, sizeof(cause), "watchdog");
 
     if (csr & RCC_CSR_SFTRSTF)
-        append_reset_cause(cause, sizeof(cause), "software_restart");
+        append_reset_cause(cause, sizeof(cause), "software restart");
 
     if (csr & RCC_CSR_PORRSTF) {
-        append_reset_cause(cause, sizeof(cause), "power_on");
+        append_reset_cause(cause, sizeof(cause), "power on");
     } else if (csr & RCC_CSR_BORRSTF) {
-        append_reset_cause(cause, sizeof(cause), "supply_drop");
+        append_reset_cause(cause, sizeof(cause), "supply voltage drop");
     }
 
     if (csr & RCC_CSR_PINRSTF)
-        append_reset_cause(cause, sizeof(cause), "reset_pin");
+        append_reset_cause(cause, sizeof(cause), "reset pin");
 
     if (cause[0] == '\0')
         strcpy(cause, "unknown");
 
-    gpsdo_log_eventf(
-        GPSDO_LOG_INFO,
-        "BOOT",
-        "RESET",
-        "cause=%s",
-        cause
-    );
+    gpsdo_logf(GPSDO_LOG_INFO, "BOOT", "Reset cause: %s.", cause);
 
     /* Clear latched reset causes after recording them. */
     RCC->CSR |= RCC_CSR_RMVF;
@@ -112,7 +106,7 @@ static const char *mcu_clock_input_name(gpsdo_mcu_clock_input_t input)
             return "crystal";
 
         case GPSDO_MCU_CLOCK_EXTERNAL:
-            return "external_clock";
+            return "external clock";
 
         default:
             return "unknown";
@@ -178,14 +172,21 @@ void gpsdo_hw_post_begin(void)
         mcu_clock_input_name(s_hw.mcu_clock_input);
 
     /* Structured log */
-    gpsdo_log_eventf(
-        pass ? GPSDO_LOG_INFO : GPSDO_LOG_WARN,
-        "POST",
-        "MCU_CLOCK",
-        "result=%s source=%s",
-        pass ? "PASS" : "FAIL",
-        source
-    );
+    if (pass) {
+        gpsdo_logf(GPSDO_LOG_INFO, "POST", "MCU clock source: %s.", source);
+    } else if (strcmp(source, "crystal") == 0) {
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "POST",
+            "MCU clock check failed: processor is not running from the crystal oscillator.");
+    } else if (strcmp(source, "external clock") == 0) {
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "POST",
+            "MCU clock check failed: processor is not running from the external clock input.");
+    } else {
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "POST",
+            "MCU clock check failed: clock source could not be identified.");
+    }
 }
 
 

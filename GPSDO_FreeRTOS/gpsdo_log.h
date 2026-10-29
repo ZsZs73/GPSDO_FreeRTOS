@@ -48,6 +48,13 @@ void gpsdo_log_event(gpsdo_log_level_t level,
  *                    "algo=%u pwm=%u vctl_mv=%ld",
  *                    algo, pwm, vctl_mv);
  */
+/* Human-facing log message. The LOG1/timestamp/level/subsystem envelope stays
+ * structured; fmt is normal operator-readable text. */
+void gpsdo_logf(gpsdo_log_level_t level,
+                const char *subsystem,
+                const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
 void gpsdo_log_eventf(gpsdo_log_level_t level,
                       const char *subsystem,
                       const char *event,
