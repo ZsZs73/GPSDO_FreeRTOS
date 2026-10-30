@@ -1312,12 +1312,6 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           OUT_SERIAL.println("TFT: data sprite (1-bit) created");
       else
           OUT_SERIAL.println("TFT: data sprite FAILED — direct-draw fallback");
-
-#if defined(GPSDO_TFT_ILI9488)
-      OUT_SERIAL.println("HW: TFT 480x320 ILI9488    enabled (SPI1, UNTESTED, write-only)");
-#else
-      OUT_SERIAL.println("HW: TFT 320x240            enabled (SPI1, write-only - not verifiable)");
-#endif
   }
 
   /* Draw the static operating-screen layout (header + separators).
@@ -1575,14 +1569,11 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
                      (int)SPL_AMP*2 + SPL_GAP + SPL_GAPB + 8, TFT_COL_BG);
 
       /* --- hardware checklist (rows light up sequentially) ---
-       * `show` reflects whether the device is COMPILED IN (#ifdef), so a
-       * device absent from the build is omitted entirely rather than shown
-       * as "not detected". `ok` reflects runtime detection: a compiled-in
-       * device that wasn't found stays as an orange [ ]. OCXO/GPS are always
-       * present. Sensors collapse to one row, shown if ANY sensor is built
-       * in. Keeping this consistent across all rows is the whole point —
-       * OLED and the sensor row previously forced show=true and so appeared
-       * even when not compiled. */
+       * `show` reflects whether the device is compiled into this build, so an
+       * unsupported device is omitted entirely. `ok` reflects presence recorded
+       * by the boot-time hardware inventory. Devices whose physical presence
+       * cannot be verified are handled separately.
+       */
       struct { const char *label; bool ok; bool show; } rows[] = {
           { "OCXO  discipline loop", true,   true   },
 #ifdef GPSDO_GPS_TIMING
