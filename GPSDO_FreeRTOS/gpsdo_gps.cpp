@@ -21,6 +21,7 @@
 #include "gpsdo_state.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_gps.h"
+#include "gpsdo_log.h"
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include <string.h>
@@ -318,7 +319,8 @@ static int8_t get_ubx_ack(const uint8_t *msg, uint32_t timeout_ms = 1500)
 
             if (b == nak_frame[nak_id]) {
                 if (++nak_id >= 10) {
-                    OUT_SERIAL.println("UBX: NAK received");
+                    gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                                    "Receiver rejected a configuration command.");
                     return -1;
                 }
             } else {
@@ -435,7 +437,8 @@ static bool ubx_start_survey_in(void)
         ubx_cksum(m, sizeof(m));
         send_ubx(m, sizeof(m));
         if (get_ubx_ack(m, 1500) == +1) {
-            OUT_SERIAL.println("LEA-T: accepted CFG-TMODE2 (28B)");
+            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                            "Timing: survey-in configuration accepted using TMODE2.");
             return true;
         }
     }
@@ -455,7 +458,8 @@ static bool ubx_start_survey_in(void)
         ubx_cksum(m, sizeof(m));
         send_ubx(m, sizeof(m));
         if (get_ubx_ack(m, 1500) == +1) {
-            OUT_SERIAL.println("LEA-T: accepted CFG-TMODE (0x1D, 28B)");
+            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                            "Timing: survey-in configuration accepted using legacy TMODE.");
             return true;
         }
     }
@@ -491,7 +495,8 @@ static bool ubx_start_survey_in(void)
         ubx_cksum(m, sizeof(m));
         send_ubx(m, sizeof(m));
         if (get_ubx_ack(m, 1500) == +1) {
-            OUT_SERIAL.println("LEA-T: accepted CFG-VALSET (F9T/Gen9)");
+            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                            "Timing: survey-in configuration accepted using VALSET.");
             return true;
         }
     }
@@ -807,16 +812,20 @@ static bool ubx_config(void)
         0x12, 0x54                          /* CK_A, CK_B (verified)        */
     };
 
-    OUT_SERIAL.println("UBX: sending CFG-NAV5 (stationary mode)...");
     send_ubx(setNav, sizeof(setNav));
     int8_t r = get_ubx_ack(setNav, 1500);
 
-    if (r == +1) { OUT_SERIAL.println("UBX: CFG-NAV5 ACK"); return true; }
+    if (r == +1) {
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Stationary-mode configuration accepted.");
+        return true;
+    }
 
     if (r == -1 || r == 0) {
         const char *why = (r == -1) ? "NAK" : "timeout";
-        OUT_SERIAL.print("UBX: CFG-NAV5 "); OUT_SERIAL.print(why);
-        OUT_SERIAL.println(" — retrying with dynModel-only mask");
+        gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                   "Stationary-mode configuration failed (%s); "
+                   "retrying with reduced settings.", why);
 
         /* Minimal mask: apply dynModel field only */
         uint8_t setNavMin[sizeof(setNav)];
@@ -826,12 +835,18 @@ static bool ubx_config(void)
         flush_rx(50);
         send_ubx(setNavMin, sizeof(setNavMin));
         int8_t r2 = get_ubx_ack(setNavMin, 1500);
-        if (r2 == +1) { OUT_SERIAL.println("UBX: CFG-NAV5 (min mask) ACK"); return true; }
-        OUT_SERIAL.print("UBX: minimal mask also "); OUT_SERIAL.println(r2==-1?"NAK":"no response");
+        if (r2 == +1) {
+            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                            "Reduced stationary-mode configuration accepted.");
+            return true;
+        }
+        gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                   "Reduced stationary-mode configuration also failed (%s).",
+                   r2 == -1 ? "rejected" : "no response");
     }
 
-    OUT_SERIAL.println("UBX: CFG-NAV5 skipped — firmware may have locked nav config");
-    OUT_SERIAL.println("UBX: GPSDO operates normally without stationary mode");
+    gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                    "Stationary mode could not be configured; position filtering may be less stable");
     return false;
 }
 #endif /* UBX_CONFIG */
@@ -1288,7 +1303,9 @@ static uint32_t detect_nmea_baud(void)
         while (Serial1.available()) Serial1.read();
 
         if (nmea_sentence_ok(NMEA_SWEEP_WINDOW_MS)) {
-            OUT_SERIAL.print("GPS: NMEA traffic at "); OUT_SERIAL.println(baud);
+            gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                       "NMEA traffic detected at %lu baud.",
+                       (unsigned long)baud);
 
             s_gnss_info.detected = true;
             s_gnss_info.nmea_seen = true;
@@ -1312,14 +1329,14 @@ static uint32_t detect_gps_baud(void)
          * the valid NMEA detection.
          */
         if (ubx_poll_mon_ver()) {
-            OUT_SERIAL.print("GPS: UBX receiver");
             if (s_gnss_info.model[0]) {
-                OUT_SERIAL.print(" model=");
-                OUT_SERIAL.print(s_gnss_info.model);
+                gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                        "Receiver: %s.", s_gnss_info.model);
+            } else {
+                gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                                "UBX receiver detected.");
             }
-            OUT_SERIAL.println();
         }
-
         return nmea;
     }
 
@@ -1338,23 +1355,27 @@ static uint32_t detect_gps_baud(void)
         if (ubx_poll_mon_ver()) {
             s_gnss_info.baud = baud;
 
-            OUT_SERIAL.print("GPS: UBX receiver at ");
-            OUT_SERIAL.print(baud);
-
             if (s_gnss_info.model[0]) {
-                OUT_SERIAL.print(" model=");
-                OUT_SERIAL.print(s_gnss_info.model);
+                gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                        "Receiver: %s at %lu baud.",
+                        s_gnss_info.model,
+                        (unsigned long)baud);
+            } else {
+                gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                        "UBX receiver detected at %lu baud.",
+                        (unsigned long)baud);
             }
 
-            OUT_SERIAL.println();
             return baud;
         }
 
-        OUT_SERIAL.print("No GPS response at ");
-        OUT_SERIAL.println(baud);
+        gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                "No receiver response at %lu baud; trying another serial speed.",
+                (unsigned long)baud);
     }
 
-    OUT_SERIAL.println("GPS baud detect failed");
+    gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                    "Receiver did not respond at the tested serial speeds.");
     return 0;
 }
 
@@ -1394,7 +1415,6 @@ static uint32_t detect_gps_baud(void)
 void gpsdo_gps_init(void)
 {
     memset(&s_gnss_info, 0, sizeof(s_gnss_info));
-    OUT_SERIAL.println("GPS init: probing baud rate...");
 
 #ifdef GPSDO_UBX_CONFIG
     /* ---- Step 1: detect current baud rate ---- */
@@ -1403,12 +1423,14 @@ void gpsdo_gps_init(void)
         /* No response at any baud — assume 9600 and continue.
          * Some modules need extra settle time after power-on;
          * NMEA may still arrive and GPSDO will work without UBX config. */
-        OUT_SERIAL.println("GPS: no response to baud probe, defaulting to 9600");
+        gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                        "Receiver did not answer the serial-speed probe; using 9600 baud.");
         working_baud = 9600;
         Serial1.end();
         Serial1.begin(9600);
         flush_rx(200);
-        OUT_SERIAL.println("GPS init done (no UBX config applied)");
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Initialization complete without receiver configuration.");
         return;
     }
 
@@ -1429,8 +1451,10 @@ void gpsdo_gps_init(void)
      * Lost with the config: NMEA silencing, stationary mode, survey-in /
      * Time Mode (position stays 3D-nav; the extra phase wander is exactly
      * what the loose default algo-12 limits were sized for) and qErr. */
-    OUT_SERIAL.println("GPS: clone/compatible module — baud probe only, no UBX config");
-    OUT_SERIAL.println("GPS init done");
+    gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                    "Receiver appears clone/compatible; skipping UBX configuration.");
+    gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                    "Initialization complete.");
     return;
 #endif
 
@@ -1449,12 +1473,17 @@ void gpsdo_gps_init(void)
      * CFG-MSG commands for each disabled sentence receive their own ACK,
      * which also verifies that UBX write commands work on this firmware.
      */
-    OUT_SERIAL.print("GPS: disabling noisy NMEA at "); OUT_SERIAL.print(working_baud); OUT_SERIAL.println(" baud");
     uint8_t nmea_ok = ubx_reduce_nmea();
-    OUT_SERIAL.print("GPS: "); OUT_SERIAL.print(nmea_ok); OUT_SERIAL.println("/4 NMEA sentences disabled");
+    if (nmea_ok == 4) {
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Disabled 4 of 4 noisy NMEA sentences.");
+    } else {
+        gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                "Disabled %u of 4 noisy NMEA sentences; some settings were not accepted.",
+                (unsigned)nmea_ok);
+    }
 
     /* ---- Step 3: send UBX-CFG-NAV5 at working baud ---- */
-    OUT_SERIAL.print("GPS: sending UBX config at "); OUT_SERIAL.print(working_baud); OUT_SERIAL.println(" baud");
     bool cfg_ok = ubx_config();
 
 #ifdef GPSDO_GPS_TIMING
@@ -1466,7 +1495,8 @@ void gpsdo_gps_init(void)
      * hangs the system if called before vTaskStartScheduler(). Monitoring
      * happens in vGpsTask once the scheduler is running. */
     if (!g_svin_enabled) {
-        OUT_SERIAL.println("LEA-T: survey-in DISABLED (SV 0) — staying in nav mode");
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Timing: survey-in is disabled; staying in navigation mode.");
     } else {
         /* Ask first, command second. After a warm reboot (RB) the receiver keeps
          * its own power and its own state, so a survey completed before the reset
@@ -1478,52 +1508,117 @@ void gpsdo_gps_init(void)
          * Time Mode with a finished survey behind it, which is the condition worth
          * skipping for. This runs before the scheduler, which is why ubx_poll_svin()
          * had to stop calling vTaskDelay() unconditionally. */
-        bool already_timing = false;
+        bool timing_state_known = false;
+
+        /* Query first: do not disturb a completed Time Mode fix or a survey
+         * that is already running. */
         {
             uint32_t d0 = 0, a0 = 0;
             bool v0 = false, act0 = false;
+
             bool got = ubx_poll_svin(&d0, &a0, &v0, &act0);
-            if (!got) got = ubx_poll_svin_nav(&d0, &a0, &v0, &act0);
+            if (!got)
+                got = ubx_poll_svin_nav(&d0, &a0, &v0, &act0);
+
             if (got && v0 && !act0) {
-                already_timing = true;
-                OUT_SERIAL.print("LEA-T: already in Time Mode from an earlier survey (");
-                OUT_SERIAL.print(d0);
-                OUT_SERIAL.print("s, ");
-                OUT_SERIAL.print(a0 / 1000u);
-                OUT_SERIAL.println("m) - not restarting it");
+                timing_state_known = true;
+
+                gpsdo_logf(
+                    GPSDO_LOG_INFO, "GPS",
+                    "Timing: already in Time Mode from an earlier survey "
+                    "(%lu s, %lu m).",
+                    (unsigned long)d0,
+                    (unsigned long)(a0 / 1000u));
+
                 g_svin_active  = false;
                 g_svin_pending = false;
+                g_svin_dur     = (uint16_t)((d0 > 65535u) ? 65535u : d0);
+                g_svin_acc_m   = (uint16_t)(a0 / 1000u);
+
+            } else if (got && act0) {
+                timing_state_known = true;
+
+                gpsdo_logf(
+                    GPSDO_LOG_INFO, "GPS",
+                    "Timing: survey-in is already active (%lu s, %lu m).",
+                    (unsigned long)d0,
+                    (unsigned long)(a0 / 1000u));
+
+                g_svin_active  = true;
+                g_svin_pending = true;
                 g_svin_dur     = (uint16_t)((d0 > 65535u) ? 65535u : d0);
                 g_svin_acc_m   = (uint16_t)(a0 / 1000u);
             }
         }
 
-        if (!already_timing) {
-            OUT_SERIAL.println("LEA-T: starting survey-in (Time Mode)");
+        if (!timing_state_known) {
             if (ubx_start_survey_in()) {
-            OUT_SERIAL.println("LEA-T: survey-in command accepted");
+                gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                                "Timing: survey-in started.");
+
+                g_svin_active  = true;
+                g_svin_pending = true;
+                g_svin_dur     = 0;
+                g_svin_acc_m   = 0;
+
             } else {
-            /* No variant ACKed. The module is usually ALREADY in Time Mode
-             * (its survey config was stored in flash, e.g. via u-center), so
-             * a fresh command is rejected — but it is still timing. Monitor
-             * anyway: TIM-SVIN polling reports the stored survey's progress;
-             * if the module is merely in nav mode the poll finds nothing and
-             * the monitor stops itself. */
-            OUT_SERIAL.println("LEA-T: no start command ACKed — module may already be timing");
-            OUT_SERIAL.println("LEA-T: monitoring via TIM-SVIN");
+                /*
+                 * The command was not acknowledged. Query again before
+                 * reporting a failure: the ACK may have been missed, or the
+                 * receiver may already have entered Time Mode / survey-in.
+                 */
+                uint32_t d1 = 0, a1 = 0;
+                bool v1 = false, act1 = false;
+
+                bool got = ubx_poll_svin(&d1, &a1, &v1, &act1);
+                if (!got)
+                    got = ubx_poll_svin_nav(&d1, &a1, &v1, &act1);
+
+                if (got && v1 && !act1) {
+                    gpsdo_logf(
+                        GPSDO_LOG_INFO, "GPS",
+                        "Timing: receiver is already in Time Mode "
+                        "(%lu s, %lu m).",
+                        (unsigned long)d1,
+                        (unsigned long)(a1 / 1000u));
+
+                    g_svin_active  = false;
+                    g_svin_pending = false;
+                    g_svin_dur     = (uint16_t)((d1 > 65535u) ? 65535u : d1);
+                    g_svin_acc_m   = (uint16_t)(a1 / 1000u);
+
+                } else if (got && act1) {
+                    gpsdo_logf(
+                        GPSDO_LOG_INFO, "GPS",
+                        "Timing: survey-in is active (%lu s, %lu m).",
+                        (unsigned long)d1,
+                        (unsigned long)(a1 / 1000u));
+
+                    g_svin_active  = true;
+                    g_svin_pending = true;
+                    g_svin_dur     = (uint16_t)((d1 > 65535u) ? 65535u : d1);
+                    g_svin_acc_m   = (uint16_t)(a1 / 1000u);
+
+                } else {
+                    gpsdo_log_event(
+                        GPSDO_LOG_WARN, "GPS",
+                        "Timing: survey-in could not be started or confirmed.");
+
+                    g_svin_active  = false;
+                    g_svin_pending = false;
+                    g_svin_dur     = 0;
+                    g_svin_acc_m   = 0;
+                }
             }
-            /* Ask vGpsTask to poll TIM-SVIN once the scheduler runs. */
-            g_svin_active = true;
-            g_svin_pending = true;
-            g_svin_dur = 0; g_svin_acc_m = 0;
-        }   /* if (!already_timing) */
+        }
     }
 #endif
 
     /* ---- Step 3: optional upgrade to 38400 ---- */
 #ifdef GPSDO_PREFER_38400
     if (working_baud != 38400) {
-        OUT_SERIAL.println("GPS: attempting upgrade to 38400 baud...");
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Trying 38400 baud for faster receiver communication...");
 
         /* Suppress VTG to reduce traffic during switch */
         Serial1.print("$PUBX,40,VTG,0,0,0,0,0,0*5E\r\n");
@@ -1557,15 +1652,18 @@ void gpsdo_gps_init(void)
         flush_rx(50);
 
         if (switched) {
-            OUT_SERIAL.println("GPS: now at 38400 baud");
+            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                            "Receiver serial speed is now 38400 baud.");
             /* If ubx_config failed at the original baud, retry at 38400 */
             if (!cfg_ok) {
-                OUT_SERIAL.println("GPS: retrying UBX config at 38400");
+                gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                                "Retrying receiver configuration at 38400 baud.");
                 ubx_config();
             }
         } else {
             /* Switch did not take — fall back to working_baud */
-            OUT_SERIAL.println("GPS: baud switch failed, reverting");
+            gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                            "Receiver did not switch to 38400 baud; keeping the previous serial speed.");
             Serial1.end();
             Serial1.begin(working_baud);
             flush_rx(100);
@@ -1579,16 +1677,22 @@ void gpsdo_gps_init(void)
     Serial1.end();
     Serial1.begin(working_baud);
     flush_rx(100);
-    OUT_SERIAL.print("GPS: running at "); OUT_SERIAL.print(working_baud); OUT_SERIAL.println(" baud (no UBX config)");
+    gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+               "Receiver running at %lu baud without UBX configuration.",
+               (unsigned long)working_baud);
 #endif /* GPSDO_UBX_CONFIG */
 
     /* Enable UBX-TIM-TP (0x0D 0x01) so we receive per-pulse qErr for the
      * sawtooth correction. Harmless if unused; the sniffer only acts on it
      * when SAW is on. Works on 6T/M8T/F9T (same message id). */
     if (ubx_send_cfg_msg(0x0D, 0x01, 1))
-        OUT_SERIAL.println("GPS: UBX-TIM-TP enabled (sawtooth qErr)");
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Timing: sawtooth correction enabled (TIM-TP).");
     else
-        OUT_SERIAL.println("GPS: TIM-TP enable not ACKed (receiver may lack it)");
+        gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                        "Timing: sawtooth correction could not be enabled; "
+                        "receiver may not support TIM-TP.");
 
-    OUT_SERIAL.println("GPS init done");
+    gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                    "Initialization complete.");
 }
