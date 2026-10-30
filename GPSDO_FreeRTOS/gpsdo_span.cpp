@@ -14,7 +14,6 @@
 #include "gpsdo_span.h"
 #include "gpsdo_algorithms.h"
 #include "gpsdo_dac.h"
-#include "gpsdo_dac_ext.h"          /* PIN_DAC_*, for the collision check    */
 #include "gpsdo_health.h"
 #include "gpsdo_settings_store.h"
 #include "gpsdo_live_store.h"
@@ -22,25 +21,14 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- SPAN sense pin and DAC collision guard ----------------------------
+/* ---- SPAN sense pin ---------------------------------------------------
  *
- * PB14 is used for SPAN sense because the pin audit in gpsdo_dac_ext.h found
- * it free in the normal hardware configuration.
- *
- * If the external DAC pin assignments are overridden, PB14 must not be used
- * by the DAC as well: INPUT_PULLUP here would take the pin away from the DAC,
- * while DAC activity on the pin could be misread as a jumper change. Catch
- * that conflict at compile time for all three DAC pins, since each can be
- * overridden.
+ * PB14 is reserved for SPAN sense in the normal hardware configuration.
  */
 #ifdef GPSDO_SPAN_SENSE
 #ifndef PIN_SPAN_SENSE
 #define PIN_SPAN_SENSE PB14
 #endif
-static_assert(PIN_SPAN_SENSE != PIN_DAC_CS,
-              "PIN_SPAN_SENSE collides with PIN_DAC_CS - move one (PC14/PC15 are the others free)");
-static_assert(PIN_SPAN_SENSE != PIN_DAC_SCK,  "PIN_SPAN_SENSE collides with PIN_DAC_SCK");
-static_assert(PIN_SPAN_SENSE != PIN_DAC_MOSI, "PIN_SPAN_SENSE collides with PIN_DAC_MOSI");
 #endif
 
 /* Consecutive identical readings, at the control task's 5 Hz, before a change

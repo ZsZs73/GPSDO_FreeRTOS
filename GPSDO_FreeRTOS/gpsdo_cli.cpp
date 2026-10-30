@@ -252,10 +252,8 @@ static void print_help(void)
     cli_putln("  CT          Calibrate + auto-Tune PID for all algos");
     cli_putln("  T [baud]    GPS tunnel on USB (300s; opt. GPS UART baud for u-center)");
     cli_putln("  SP <n>      Set PWM DAC directly (1-65535)");
-    cli_putln("  DAC [PWM|DITH|EXT]  output path (no arg = report + Vctl check)");
-    cli_putln("  DV [v]      volts at full code for 'commanded' (3.30 = PWM, 5.00 = AD5680)");
+    cli_putln("  DAC [PWM|DITH]  output path (no arg = report + Vctl check)");
     cli_putln("  AV [x]      ADC divide ratio for 'measured' (1.00 = direct)");
-    cli_putln("  VS [VCC|VREF]  what the PA0 divider is jumpered to (auto-saved)");
     cli_putln("  SPAN [CLR FULL|REDUCED]  EFC span jumper (PB14): K per position");
 #if defined(GPSDO_TFT_BL_PWM)
     cli_putln("  BL [%]      TFT backlight 30-100% (auto-saved; 100 = no switching)");
@@ -511,8 +509,7 @@ static void dispatch(char *line)
             uint8_t want;
             if      (cli_ieq(arg, "PWM"))  want = DAC_PATH_PWM;
             else if (cli_ieq(arg, "DITH")) want = DAC_PATH_DITH;
-            else if (cli_ieq(arg, "EXT"))  want = DAC_PATH_EXT;
-            else { cli_reject("DAC: PWM | DITH | EXT  (no argument = report)"); return; }
+            else { cli_reject("DAC: PWM | DITH  (no argument = report)"); return; }
             if (!gpsdo_dac_path_available(want)) {
                 snprintf(l, sizeof(l), "DAC: %s is not compiled into this build",
                          gpsdo_dac_path_name(want));
@@ -536,7 +533,7 @@ static void dispatch(char *line)
 
         {
             char av[40]; int ap = 0;
-            for (uint8_t i = 0; i <= DAC_PATH_EXT; i++)
+            for (uint8_t i = 0; i <= DAC_PATH_DITH; i++)
                 if (gpsdo_dac_path_available(i))
                     ap += snprintf(av + ap, sizeof(av) - ap, "%s%s",
                                    ap ? " " : "", gpsdo_dac_path_name(i));
@@ -544,11 +541,8 @@ static void dispatch(char *line)
                      gpsdo_dac_path_name(g_dac_path), av);
             cli_putln(l);
         }
-        if (g_dac_path == DAC_PATH_EXT) {
-            cli_putln("        external SPI DAC (AD5680, bit-banged)");
-        }
 #if defined(GPSDO_PWM_DITHER)
-        else if (g_dac_path == DAC_PATH_DITH) {
+        if (g_dac_path == DAC_PATH_DITH) {
         snprintf(l, sizeof(l), "        %u-bit PWM + dither -> 24 bit, PB9/TIM4 CH4, DMA",
                  (unsigned)PWM24_N);
         cli_putln(l);
@@ -570,14 +564,11 @@ static void dispatch(char *line)
         }
 #endif
 
-        /* The scales the two numbers below are computed with, stated up front
-         * because they are the first thing to check when commanded and
-         * measured disagree: DV says what full code means at the output
-         * (3.30 V = the PWM model, the historical default), AV says what
-         * divide ratio sits before the ADC pin (1.00 = none). */
-        dtostrf(g_dac_vref, -1, 3, b1);   /* three: a 4.096 V reference */
+        /* The commanded scale is fixed by the PWM output at 3.3 V.
+        * AV states the divide ratio before the ADC pin (1.00 = none). */
         dtostrf(g_adc_vdiv, -1, 2, b2);
-        snprintf(l, sizeof(l), "  scales: commanded at %s V full-code, ADC x%s", b1, b2);
+        snprintf(l, sizeof(l),
+                "  scales: commanded at 3.300 V full-code, ADC x%s", b2);
         cli_putln(l);
 
         /* Three views of one number. Printing all three is the point: a fraction
@@ -603,26 +594,17 @@ static void dispatch(char *line)
             double vm = ((double)gCtrl.avg_vctl_adc / 4096.0) * vdd * g_adc_vdiv;
             xSemaphoreGive(xCtrlMutex);
             dtostrf(vm, -1, 4, b1);
-            /* COMMANDED AGAINST MEASURED — the one check that catches a jumper
-             * that does not match the setting. The firmware cannot see the
-             * jumper, so the only evidence is that the control voltage is not
-             * where it was told to put it.
-             *
-             * Half a volt of slack, deliberately: the ADC divider and the
-             * reference are good to a few percent at best, so a tight bound
-             * would cry wolf on every board. What this has to catch is the
-             * gross case — commanded 1.8 V, measured 0.0 V because the driver
-             * that is selected is not the one wired to the filter — and half a
-             * volt catches that without ever firing on a scale error.
-             *
-             * The commanded side is scaled by g_dac_vref (DV), not the
-             * hardcoded 3.3 V it used to be: on a 5 V external DAC the old
-             * model under-stated commanded by 1.5x and the check cried wolf
-             * on every reading — the false MISMATCH that started the whole
-             * DV/AV business. */
-            double vc = ((double)v16 / 65536.0) * g_dac_vref;
+            /* COMMANDED AGAINST MEASURED — checks that the actual Vctl follows
+            * the value the PWM output was asked to produce.
+            *
+            * Half a volt of slack is deliberate: ADC and divider tolerances are much
+            * smaller than that, but the check is intended to catch gross faults rather
+            * than act as a precision calibration test.
+            */
+            double vc = ((double)v16 / 65536.0) * 3.3;
             dtostrf(vc, -1, 4, b2);
-            snprintf(l, sizeof(l), "  Vctl: %s V measured, %s V commanded", b1, b2);
+            snprintf(l, sizeof(l),
+                    "  Vctl: %s V measured, %s V commanded", b1, b2);
             cli_putln(l);
             if (vm < vc - 0.5 || vm > vc + 0.5) {
                 cli_putln("  ** MISMATCH — the control voltage is not following the");
@@ -632,43 +614,18 @@ static void dispatch(char *line)
             }
         }
 
-        /* WHAT THE OTHER DIVIDER IS LOOKING AT, and whether it agrees.
-         *
-         * On the 5 V rail this is the reading the telemetry line has always
-         * carried. On the reference it is the only check the firmware has that
-         * the part fitted is the part DV describes — and the failure it catches
-         * is not subtle: a 5.000 V device where DV says 4.096 makes every
-         * frequency figure the board prints a fifth too small, silently. */
+        /* Report the monitored 5 V rail. */
         if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             int16_t raw = gCtrl.avg_vcc_adc;
             xSemaphoreGive(xCtrlMutex);
+
             if (raw > 0) {
-                /* The divider halves it; the ADC's own reference is the
-                 * nominal 3.3 V, so this is an indication, not a measurement.
-                 * Good to a percent or two, which is all the check needs. */
+                /* The divider halves the rail; the ADC reference is nominally 3.3 V. */
                 double v = ((double)raw / 4096.0) * 3.3 * 2.0;
                 dtostrf(v, -1, 3, b1);
-                if (g_vsense_src == VSENSE_VREF) {
-                    dtostrf(g_dac_vref, -1, 3, b2);
-                    snprintf(l, sizeof(l),
-                             "  Vref: %s V measured, %s V per DV", b1, b2);
-                    cli_putln(l);
-                    /* Five percent: wide enough that the ADC reference and the
-                     * divider's own tolerance never trip it, narrow enough to
-                     * catch the wrong part, which is always out by 20 % or
-                     * more, and a reference that has stopped working. */
-                    if (v < g_dac_vref * 0.95 || v > g_dac_vref * 1.05) {
-                        cli_putln("  ** the reference is not where DV says it is.");
-                        cli_putln("     Check VS against the jumper, DV against the");
-                        cli_putln("     part actually fitted, and the reference's");
-                        cli_putln("     own supply — it needs headroom above its");
-                        cli_putln("     output to regulate at all.");
-                    }
-                } else {
-                    snprintf(l, sizeof(l), "  Vcc:  %s V (5 V rail; VS VREF if the"
-                             " jumper feeds the reference)", b1);
-                    cli_putln(l);
-                }
+
+                snprintf(l, sizeof(l), "  Vcc:  %s V", b1);
+                cli_putln(l);
             }
         }
 
@@ -678,26 +635,14 @@ static void dispatch(char *line)
         double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
         if (lsb_per_hz > 0.0) {
             /* TWO STEPS, AND THEY ARE NOT THE SAME NUMBER.
-             *
-             * The control value is 24-bit on every path — that is what the loop
-             * commands and what the fine carry delivers on average. What the
-             * OUTPUT moves in a single write is the live driver's own width:
-             * 2^24 on DITH (the dither table averages the 24-bit value
-             * exactly), 2^18 on the AD5680, 2^16 on plain PWM riding the
-             * dither engine — and 50 000, which is not a power of two at all,
-             * on a build with no dither engine, where the timer's period is
-             * the resolution. See gpsdo_dac_output_steps().
-             *
-             * This used to print 16-bit and 24-bit regardless of the path, so
-             * on Dan Wiering's AD5680 board the report offered 0.094 uHz as a
-             * step — 64 counts of the control value make one move at that pin,
-             * so the smallest real one is about 6 uHz — while at the same time
-             * understating the part by quoting a 16-bit figure four times
-             * coarser than it can do. Both lines were wrong on the same board
-             * in opposite directions, which is what a fixed pair of widths gets
-             * you when there are three converters.
-             *
-             * uHz on both lines, so they are comparable at a glance. */
+            *
+            * The control value is 24-bit on every path — that is what the loop
+            * commands and what the fine carry delivers on average.
+            *
+            * The physical output resolution depends on the active PWM mode:
+            * DITH averages the full 24-bit value, while plain PWM moves in
+            * whole PWM counts. See gpsdo_dac_output_steps().
+            */
             uint32_t osteps = gpsdo_dac_output_steps();
             uint8_t  obits  = cli_exact_bits(osteps);   /* 0 = not a power of 2 */
             char lbl[16];
@@ -747,95 +692,42 @@ static void dispatch(char *line)
         return;
     }
 
-    /* ---- DV / AV: the two scales the DAC report computes with ----
-     *
-     * DV states what full code means at the output the firmware is steering:
-     * the PWM paths run from the 3.3 V rail (the default), an external DAC
-     * from its own reference — 5.00 for the AD5680 boards. AV states the
-     * divide ratio between the measured node and the ADC pin, 1.00 = direct.
-     * Together they turn the DAC report's commanded-against-measured check
-     * from a PWM-board assumption into a statement about THIS board. Both
-     * save immediately with the ALGO block — the same partial the DAC path
-     * rides in — so nobody has to remember an ES afterwards. */
-    if (cli_ieq(verb, "DV") || cli_ieq(verb, "AV")) {
-        char l[80], b1[16];
-        bool isDV = cli_ieq(verb, "DV");
-        if (arg == NULL) {
-            if (isDV) {
-                dtostrf(g_dac_vref, -1, 3, b1);
-                snprintf(l, sizeof(l), "DV: %s V at full code (3.30 = PWM model)", b1);
-            } else {
-                dtostrf(g_adc_vdiv, -1, 2, b1);
-                snprintf(l, sizeof(l), "AV: ADC divide ratio x%s (1.00 = direct)", b1);
-            }
-            cli_putln(l);
-            return;
-        }
-        double v = atof(arg);
-        if (isDV) {
-            if (v < 2.50 || v > 5.50) {
-                cli_reject("DV: 2.50..5.50 V (3.30 = the PWM model)");
-                return;
-            }
-            g_dac_vref = v;
-            /* Three decimals, as stored since the v1.07 DAC settings format (dac_vref_mv): with two,
-             * DV 4.096 echoed back as 4.10 and was saved as 4.10 too. */
-            dtostrf(v, -1, 3, b1);
-            snprintf(l, sizeof(l), "DV: commanded now scaled at %s V full code", b1);
-        } else {
-            if (v < 1.00 || v > 10.00) {
-                cli_reject("AV: 1.00..10.00 (divide ratio at the ADC pin)");
-                return;
-            }
-            g_adc_vdiv = v;
-            dtostrf(v, -1, 2, b1);
-            snprintf(l, sizeof(l), "AV: Vctl readings now scaled x%s", b1);
-        }
+/* ---- AV: ADC scale for Vctl measurements -----------------------------
+ *
+ * AV states the divide ratio between the measured node and the ADC pin,
+ * 1.00 = direct. It is a board-level calibration value and is auto-saved
+ * with the ALGO settings.
+ */
+if (cli_ieq(verb, "AV")) {
+    char l[80], b1[16];
+
+    if (arg == NULL) {
+        dtostrf(g_adc_vdiv, -1, 2, b1);
+        snprintf(l, sizeof(l),
+                 "AV: ADC divide ratio x%s (1.00 = direct)", b1);
         cli_putln(l);
-        /* AUTO-SAVED, not "run ES ALGO". These two describe the board's output
-         * stage — they are typed once when the hardware is built and never
-         * again — and the v1.07 changelog and the notes sent to the people
-         * building those boards both said so. The code did not, so a DV set
-         * and not followed by an ES came back as 3.30 after a reset and the
-         * MISMATCH warning returned with it, which looks like a hardware fault
-         * rather than a lost setting. The promise was the right one; this is
-         * the code catching up to it. */
-        cli_autosaved(SET_ALGO, isDV ? "DV: DAC full-code volts"
-                                     : "AV: ADC divide ratio");
         return;
     }
 
-    /* ---- VS: what the PA0 divider is measuring ----
-     *
-     * A jumper on the top of that divider chooses between the 5 V rail and the
-     * voltage reference. The firmware cannot see it, so it is told — the same
-     * arrangement as DV, AV and the DAC path, and for the same reason: the one
-     * piece of evidence a jumper leaves behind is a voltage that is not where
-     * the firmware expected it, and that only helps if the firmware was told
-     * what to expect. */
-    if (cli_ieq(verb, "VS")) {
-        char l[80];
-        if (arg == NULL) {
-            snprintf(l, sizeof(l), "VS: PA0 divider reads %s (VCC | VREF)",
-                     (g_vsense_src == VSENSE_VREF) ? "VREF" : "VCC");
-            cli_putln(l);
-            return;
-        }
-        if      (cli_ieq(arg, "VCC"))  g_vsense_src = VSENSE_VCC;
-        else if (cli_ieq(arg, "VREF")) g_vsense_src = VSENSE_VREF;
-        else { cli_reject("VS: VCC or VREF (what the jumper feeds the PA0 divider)");
-               return; }
-        snprintf(l, sizeof(l), "VS: PA0 divider now read as %s",
-                 (g_vsense_src == VSENSE_VREF) ? "VREF (checked against DV)"
-                                               : "VCC (the 5 V rail)");
-        cli_putln(l);
-        cli_autosaved(SET_ALGO, "ALGO: path/DV/AV/VS");
+    double v = atof(arg);
+    if (v < 1.00 || v > 10.00) {
+        cli_reject("AV: 1.00..10.00 (divide ratio at the ADC pin)");
         return;
     }
+
+    g_adc_vdiv = v;
+
+    dtostrf(v, -1, 2, b1);
+    snprintf(l, sizeof(l), "AV: Vctl readings now scaled x%s", b1);
+    cli_putln(l);
+
+    cli_autosaved(SET_ALGO, "AV: ADC divide ratio");
+    return;
+}
 
     /* ---- SPAN: the EFC span jumper on PB14 ----
      *
-     * Unlike VS, nothing to TELL the firmware here: the jumper's second pole
+     * Nothing to TELL the firmware here: the jumper's second pole
      * is wired to PB14 and the firmware reads it. What this shows is the other
      * half — the calibration each position carries — and CLR is the one
      * correction a person may need: forgetting a position that was calibrated

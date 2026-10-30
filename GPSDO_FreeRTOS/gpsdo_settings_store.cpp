@@ -18,7 +18,6 @@
 #include "gpsdo_backlight.h"
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_state.h"
-#include <stddef.h>   /* offsetof, for the v4 migration */
 #include "gpsdo_algorithms.h"
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
@@ -96,15 +95,11 @@ static void snapshot_full(SettingsBlock_t *s)
     s->ver = SETTINGS_VER;
     s->pwm  = gCtrl.pwm_output;
     s->algo = gCtrl.active_algo;
-    s->dac_path   = (uint8_t)(g_dac_path + 1u);   /* 0 stays "unset" */
-    s->vsense_src = (uint8_t)(g_vsense_src + 1u); /* likewise           */
-    s->bl_pct   = g_tft_bl_pct;                 /* already clamped to 30..100 */
-    /* ×100 encodings, never 0 from runtime — the CLI's range checks keep
-     * vref in 2.50..5.50 V and the divider in 1.00..10.00, both well away
-     * from the "unset" zero. */
-    s->dac_vref_cv = (uint16_t)(g_dac_vref * 100.0 + 0.5);
-    s->dac_vref_mv = (uint16_t)(g_dac_vref * 1000.0 + 0.5);   /* the same DV */
-    s->adc_vdiv_h  = (uint16_t)(g_adc_vdiv * 100.0 + 0.5);
+    s->dac_path = (uint8_t)(g_dac_path + 1u);   /* +1 reserves 0 as unset */
+    s->bl_pct   = g_tft_bl_pct;
+
+    /* ADC divider scale ×100; zero is reserved as "unset" on recall. */
+    s->adc_vdiv_h = (uint16_t)(g_adc_vdiv * 100.0 + 0.5);
     s->a12_gain      = g_mlacc_gain;
     s->a12_run_level = g_mlacc_run_level;
     s->a12_thr_src   = g_mlacc_thr_src;
@@ -189,19 +184,14 @@ static void apply_full(const SettingsBlock_t *s)
      * build shipped with 13 in the dispatcher and 12 here, so LA 13 + ES ALGO
      * came back as algo 0 after reset - exactly this trap. */
     if (s->algo <= 13u) gCtrl.active_algo = s->algo;
-    /* 0 = never written (old record, or a build before this field existed) and
-     * means "use the default"; 1..3 are the paths, offset by one so that zero
-     * can carry that meaning. Whatever comes out is resolved against what is
-     * actually compiled in before it reaches the pin. */
-    if (s->dac_path >= 1u && s->dac_path <= 3u)
+    /* 0 = unset/default; 1 = PWM, 2 = DITH. */
+    if (s->dac_path >= 1u && s->dac_path <= 2u)
         g_dac_path = gpsdo_dac_path_resolve((uint8_t)(s->dac_path - 1u));
     /* Through the setter rather than straight into the variable: it is the one
      * place the clamp lives, and on a board whose timer is already running it
-     * also puts the value on the pin. 0 = older record, leave the default. */
+     * also puts the value on the pin. 0 = unset, so leave the default. */
     if (s->bl_pct >= BL_PCT_MIN && s->bl_pct <= BL_PCT_MAX)
         backlight_set(s->bl_pct);
-    if (s->vsense_src >= 1u && s->vsense_src <= 2u)
-        g_vsense_src = (uint8_t)(s->vsense_src - 1u);
     {
         /* Range checks live with the meaning, in span_store_put(). */
         span_store_t st;
@@ -212,31 +202,12 @@ static void apply_full(const SettingsBlock_t *s)
         st.pair[1] = s->span_pair[1];
         span_store_put(&st);
     }
-    /* 0 = unset (v5 record, or never configured): leave the compile-time
-     * defaults in force. The ranges mirror the CLI's, with a little slack on
-     * the upper ends so a hand-edited record is not silently crippled. */
-    if (s->dac_vref_cv >= 250u && s->dac_vref_cv <= 550u) {
-        g_dac_vref = (double)s->dac_vref_cv / 100.0;
-        /* The millivolt field carries the third decimal (4.096, not 4.10) —
-         * when it is there, and when it says the same DV to the centivolt.
-         * Every build that writes it writes dac_vref_cv from the same value,
-         * and the two roundings can differ by at most 5 mV, so a larger gap
-         * means dac_vref_cv was written by something that did not know about
-         * this field, and dac_vref_cv is the one to believe. 0 is an older
-         * record, which the range check turns away. */
-        int32_t d = (int32_t)s->dac_vref_mv - 10 * (int32_t)s->dac_vref_cv;
-        if (s->dac_vref_mv >= 2500u && s->dac_vref_mv <= 5500u && d >= -5 && d <= 5)
-            g_dac_vref = (double)s->dac_vref_mv / 1000.0;
-    }
+    /* 0 = unset: leave the default ADC divider scale in force. */
     if (s->adc_vdiv_h >= 100u && s->adc_vdiv_h <= 1000u)
         g_adc_vdiv = (double)s->adc_vdiv_h / 100.0;
     if (s->a12_gain >= 0.0f && s->a12_gain <= 10000.0f) g_mlacc_gain = s->a12_gain;
     if (s->a12_run_level < 11u) g_mlacc_run_level = s->a12_run_level;
-    /* 0 is the valid "default limit source" / "use the default target" pair,
-     * which is also what an older block's padding reads back as — so no guard
-     * is needed for the old-record case, only for a corrupted one. (0 used to
-     * mean "follow MG"; it now means the noise formula, so a saved 0 recalls
-     * the better behaviour rather than the old coupling.) */
+    /* Source 0 selects the noise formula; target 0 selects its default. */
     if (s->a12_thr_src <= 3u) g_mlacc_thr_src = s->a12_thr_src;
     if (s->a12_thr_tgt_s == 0u || s->a12_thr_tgt_s >= (1u << MLACC_LEVELS))
         g_mlacc_thr_tgt_s = s->a12_thr_tgt_s;
@@ -287,37 +258,33 @@ static void apply_full(const SettingsBlock_t *s)
     }
     if (is_finite_pos(s->ltic_centre_v, 0.0f, 3.3f)) g_ltic.centre_v = s->ltic_centre_v;
 
-    /* LTIC-Lars (algo 11), stored from SETTINGS_VER 2. gain 0 is valid (auto),
-     * so its guard allows 0; the rest range-check like the LTIC block above. */
-    if (s->ver >= 2u) {
-        if (isfinite(s->lars_gain) && s->lars_gain >= 0.0f && s->lars_gain <= 10000.0f)
-            g_lars.gain = s->lars_gain;
-        if (is_finite_pos(s->lars_damping, 0.001f, 1000.0f)) g_lars.damping = s->lars_damping;
-        if (s->lars_tc >= 1u && s->lars_tc <= 600u)   g_lars.time_const_s = s->lars_tc;
-        if (s->lars_fdiv >= 1u && s->lars_fdiv <= 100u) g_lars.filter_div = s->lars_fdiv;
-        if (s->lars_tic_off <= 4095u)                 g_lars.tic_offset  = s->lars_tic_off;
-        if (s->lars_lock_lim >= 1u && s->lars_lock_lim <= 10000u) g_lars.lock_ns_lim = s->lars_lock_lim;
-        if (s->lars_lock_fac >= 1u && s->lars_lock_fac <= 100u)   g_lars.lock_factor = s->lars_lock_fac;
-        g_lars.temp_coeff = s->lars_tcoeff;           /* full int16 range valid */
-        if (s->lars_tref <= 4095u)                    g_lars.temp_ref = s->lars_tref;
-        g_lars.flags = s->lars_flags;
-        /* FA damping windows: only the three legal values are accepted, so a
-         * corrupt or zero field leaves the compile-time default in place. */
-        if (s->fa_win_dpll == 10u || s->fa_win_dpll == 100u || s->fa_win_dpll == 1000u)
-            g_freq_damp_win_dpll = s->fa_win_dpll;
-        if (s->fa_win_lock == 10u || s->fa_win_lock == 100u || s->fa_win_lock == 1000u)
-            g_freq_damp_win_lock = s->fa_win_lock;
-        if (s->ver >= 4u) g_show_local_time = (s->lt_local != 0u);
-    }
+    /* LTIC-Lars (algo 11). Gain 0 is valid (auto); the remaining fields are
+     * range-checked like the LTIC block above. */
+    if (isfinite(s->lars_gain) && s->lars_gain >= 0.0f && s->lars_gain <= 10000.0f)
+        g_lars.gain = s->lars_gain;
+    if (is_finite_pos(s->lars_damping, 0.001f, 1000.0f)) g_lars.damping = s->lars_damping;
+    if (s->lars_tc >= 1u && s->lars_tc <= 600u)   g_lars.time_const_s = s->lars_tc;
+    if (s->lars_fdiv >= 1u && s->lars_fdiv <= 100u) g_lars.filter_div = s->lars_fdiv;
+    if (s->lars_tic_off <= 4095u)                 g_lars.tic_offset  = s->lars_tic_off;
+    if (s->lars_lock_lim >= 1u && s->lars_lock_lim <= 10000u) g_lars.lock_ns_lim = s->lars_lock_lim;
+    if (s->lars_lock_fac >= 1u && s->lars_lock_fac <= 100u)   g_lars.lock_factor = s->lars_lock_fac;
+    g_lars.temp_coeff = s->lars_tcoeff;           /* full int16 range valid */
+    if (s->lars_tref <= 4095u)                    g_lars.temp_ref = s->lars_tref;
+    g_lars.flags = s->lars_flags;
+    /* FA damping windows: only the three legal values are accepted, so a
+     * corrupt or zero field leaves the compile-time default in place. */
+    if (s->fa_win_dpll == 10u || s->fa_win_dpll == 100u || s->fa_win_dpll == 1000u)
+        g_freq_damp_win_dpll = s->fa_win_dpll;
+    if (s->fa_win_lock == 10u || s->fa_win_lock == 100u || s->fa_win_lock == 1000u)
+        g_freq_damp_win_lock = s->fa_win_lock;
+    g_show_local_time = (s->lt_local != 0u);
 
     /* LRN (fallback when ring not yet populated by live_store) */
     g_lrn_enable = (s->lrn_en != 0u);
     if (is_finite_pos(s->lrn_drift, -400.0f, 400.0f)) g_lrn_drift = s->lrn_drift;
     if (is_finite_pos(s->lrn_damp, LRN_DAMP_LO, LRN_DAMP_HI)) g_lrn_damp = s->lrn_damp;
 
-    /* enable flags (0xFF from blank flash reads as "on" for these — matches
-     * the legacy EEPROM convention so a fresh board comes up with the same
-     * defaults) */
+    /* enable flags */
     g_warmup_enable = (s->warmup_en != 0u);
     g_splash_enable = (s->splash_en != 0u);
     g_qerr_enable   = (s->saw_en == 1u);
@@ -365,15 +332,11 @@ settings_load_status_t settings_recall_status(uint8_t *stored_version)
     if (n == 0u) return SETTINGS_LOAD_SIZE;
     if (stored_version) *stored_version = s.ver;
 
-    if (s.ver == 4u && n == offsetof(SettingsBlock_t, a12_gain)) {
-        /* fields appended after v4 stay at their defaults */
-    } else if (s.ver == 5u && n == offsetof(SettingsBlock_t, dac_vref_cv)) {
-        /* fields appended after v5 stay at their defaults */
-    } else {
-        if (s.ver != SETTINGS_VER) return SETTINGS_LOAD_VERSION;
-        if (n < SETTINGS_V6_BYTES || n > sizeof(s)) return SETTINGS_LOAD_SIZE;
-    }
+    if (s.ver != SETTINGS_VER)
+        return SETTINGS_LOAD_VERSION;
 
+    if (n != sizeof(s))
+        return SETTINGS_LOAD_SIZE;
     apply_full(&s);
     return recovered ? SETTINGS_LOAD_RECOVERED : SETTINGS_LOAD_OK;
 }
@@ -393,19 +356,16 @@ bool settings_save(void)
 
 bool settings_save_partial(settings_partial_t which)
 {
-    /* Seed from the last stored block if one exists, so untouched fields
-     * keep their values. If none exists, snapshot_full fills every field
-     * from runtime (first partial save behaves like a full save). */
     SettingsBlock_t s;
     memset(&s, 0, sizeof(s));
     uint16_t n = flash_ring_read_newest(REC_SETTINGS, (uint8_t *)&s, sizeof(s));
-    /* A short record is fine — the struct was zeroed, so the fields a shorter
-     * layout did not carry seed as "unset" and the write below promotes them
-     * to the current layout. What is NOT fine is a record from a different
-     * version, which would be a different meaning for the same bytes. */
+
     bool have_stored = (s.ver == SETTINGS_VER &&
-                        n >= SETTINGS_V6_BYTES && n <= sizeof(s));
-    if (!have_stored) snapshot_full(&s);
+                        n == sizeof(s));
+
+    if (!have_stored)
+        snapshot_full(&s);
+
     s.ver = SETTINGS_VER;
 
     /* Update only the requested group from runtime. */
@@ -461,19 +421,11 @@ bool settings_save_partial(settings_partial_t which)
         s.bl_pct    = g_tft_bl_pct;
         break;
     case SET_ALGO:
-        s.pwm  = gCtrl.pwm_output;
-        s.algo = gCtrl.active_algo;
+        s.pwm      = gCtrl.pwm_output;
+        s.algo     = gCtrl.active_algo;
         s.dac_path = (uint8_t)(g_dac_path + 1u);
-        /* The scales ride with the path for the same reason the path rides
-         * here: they are one physical description of the output stage, and
-         * `DAC EXT` / `DV` / `AV` all land in the same partial save. */
-        s.dac_vref_cv = (uint16_t)(g_dac_vref * 100.0 + 0.5);
-        s.dac_vref_mv = (uint16_t)(g_dac_vref * 1000.0 + 0.5);
-        s.adc_vdiv_h  = (uint16_t)(g_adc_vdiv * 100.0 + 0.5);
-        /* And what the PA0 divider is looking at, for the same reason: it is
-         * one more thing about this board's wiring that the firmware cannot
-         * see and has to be told. */
-        s.vsense_src  = (uint8_t)(g_vsense_src + 1u);
+
+        s.adc_vdiv_h = (uint16_t)(g_adc_vdiv * 100.0 + 0.5);
         break;
     case SET_ALGO12:
         /* Saved on its own so tuning algorithm 12 does not rewrite the PID or

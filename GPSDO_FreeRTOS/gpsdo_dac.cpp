@@ -12,9 +12,6 @@
   #include "stm32f4xx_hal.h"      /* the plain path owns TIM4 itself — see below */
 #endif
 
-#if defined(GPSDO_DAC_EXT)
-  #include "gpsdo_dac_ext.h"
-#endif
 #if defined(GPSDO_PWM_DITHER)
   #include "gpsdo_pwm24.h"
 #endif
@@ -29,17 +26,8 @@ static uint32_t s_code24 = 0;
  * in at bring-up, so this initial value is a request rather than a promise. */
 volatile uint8_t g_dac_path = DAC_PATH_DITH;
 
-/* See gpsdo_dac.h for what these mean. Plain non-volatile doubles: they are
- * written only from the CLI task and read everywhere, and a torn read of a
- * double on this part would at worst put one odd-looking Vctl line on a
- * display — the loop never consumes either value. */
-double g_dac_vref = 3.3;
+/* ADC divider ratio for Vctl measurements. */
 double g_adc_vdiv = 1.0;
-
-/* The 5 V rail, which is what every board before the V3 had on that divider
- * and therefore the only safe default: a board without the jumper reads its
- * rail and says so, exactly as it always did. */
-uint8_t g_vsense_src = VSENSE_VCC;
 
 /* ---------------------------------------------------------------------------
  * PLAIN PWM, WITHOUT THE CORE'S analogWrite()
@@ -128,9 +116,6 @@ bool gpsdo_dac_path_available(uint8_t path)
 #if defined(GPSDO_PWM_DITHER)
     case DAC_PATH_DITH: return true;
 #endif
-#if defined(GPSDO_DAC_EXT)
-    case DAC_PATH_EXT:  return true;
-#endif
     /* PWM is always available: with the dither engine present it is that
      * engine driven at whole-LSB granularity, and without it, analogWrite. */
     case DAC_PATH_PWM:  return true;
@@ -142,16 +127,13 @@ uint8_t gpsdo_dac_path_resolve(uint8_t want)
 {
     if (gpsdo_dac_path_available(want)) return want;
     if (gpsdo_dac_path_available(DAC_PATH_DITH)) return DAC_PATH_DITH;
-    if (gpsdo_dac_path_available(DAC_PATH_PWM))  return DAC_PATH_PWM;
-    return DAC_PATH_EXT;
+    return DAC_PATH_PWM;
 }
-
 const char *gpsdo_dac_path_name(uint8_t path)
 {
     switch (path) {
     case DAC_PATH_PWM:  return "PWM";
     case DAC_PATH_DITH: return "DITH";
-    case DAC_PATH_EXT:  return "EXT";
     default:            return "?";
     }
 }
@@ -166,16 +148,9 @@ static void dac_emit(uint32_t code24, uint16_t code16);
 
 bool gpsdo_dac_begin(void)
 {
-    /* Bring up EVERY path that is compiled in, not just the selected one. The
-     * jumper decides which signal reaches the filter, and a path that is not
-     * initialised until it is first selected would give a glitch — or a dead
-     * output — at the moment of switching, which is the worst possible moment.
-     * The unselected drivers sit there holding their last code and nothing is
-     * connected to them. */
+    /* Initialize the compiled PWM output hardware.
+    * DITH, when enabled, uses the same Vctl output path. */
     bool ok = true;
-#if defined(GPSDO_DAC_EXT)
-    if (!dac_ext_begin()) ok = false;
-#endif
 #if defined(GPSDO_PWM_DITHER)
     if (!pwm24_begin())   ok = false;
 #else
@@ -208,14 +183,6 @@ void gpsdo_dac_write16(uint16_t v)
 static void dac_emit(uint32_t code24, uint16_t code16)
 {
     switch (g_dac_path) {
-#if defined(GPSDO_DAC_EXT)
-    case DAC_PATH_EXT:
-        /* Scale rather than shift: the external part is not necessarily 24 bits,
-         * and 16-bit full scale must still map to its full scale exactly or the
-         * constants CT measured against the PWM path would all be off. */
-        dac_ext_write((uint32_t)(((uint64_t)code24 * DAC_EXT_MAX) / 0x00FFFFFFu));
-        return;
-#endif
 #if defined(GPSDO_PWM_DITHER)
     case DAC_PATH_DITH:
         pwm24_write(code24);            /* native: this is what it is for */
@@ -282,13 +249,11 @@ uint32_t gpsdo_dac_last24(void)  { return s_code24; }
 /* See the note in gpsdo_dac.h. A property of the ACTIVE path, like
  * gpsdo_dac_fine_available() and for the same reason.
  *
- * STEPS AND NOT BITS, because one of the four answers is not a power of two.
- * A bit width could only express the plain timer's 50 000 duty values by
- * rounding them to 65 536 or to 32 768 — the first overstates the part by a
- * third, the second throws away a third of it — and reporting a resolution
- * the hardware does not have is the exact bug build 46 fixed for the AD5680.
- * The CLI turns a power of two back into "N-bit" for the report and prints
- * the count itself when it is not one. */
+ * STEPS AND NOT BITS, because the plain non-dither PWM period is not a
+ * power of two. Reporting a bit width would therefore misstate its actual
+ * resolution. The CLI turns powers of two into "N-bit" for display and
+ * prints the step count directly when it is not one.
+ */
 uint32_t gpsdo_dac_output_steps(void)
 {
     switch (g_dac_path) {
@@ -298,9 +263,6 @@ uint32_t gpsdo_dac_output_steps(void)
      * the low eight bits of the 24-bit code are cleared rather than the whole
      * fraction, so what reaches the filter really does resolve 16 bits. */
     case DAC_PATH_PWM:  return 1UL << 16;
-#endif
-#if defined(GPSDO_DAC_EXT)
-    case DAC_PATH_EXT:  return 1UL << DAC_EXT_BITS;
 #endif
 #if !defined(GPSDO_PWM_DITHER)
     case DAC_PATH_PWM:  return PWM16_PERIOD;
@@ -317,7 +279,6 @@ bool gpsdo_dac_fine_available(void)
      * whole-LSB path throws away. */
     switch (g_dac_path) {
     case DAC_PATH_DITH: return gpsdo_dac_path_available(DAC_PATH_DITH);
-    case DAC_PATH_EXT:  return gpsdo_dac_path_available(DAC_PATH_EXT);
     default:            return false;   /* PWM: whole LSBs only */
     }
 }

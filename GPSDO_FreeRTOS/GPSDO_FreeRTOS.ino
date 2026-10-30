@@ -304,11 +304,11 @@ void setup()
     /* ---- control-voltage output on PB9 (TIM4 CH4) ---- */
     analogReadResolution(12);
 
-    /* Output stage first: under GPSDO_DAC_EXT this brings the DAC up, and under
-     * GPSDO_PWM_DITHER it claims TIM4 and starts the DMA replay. Either way the
-     * first command must not arrive before the stage is ready. */
+    /* Initialize the Vctl output before the first command. */
     if (!gpsdo_dac_begin()) {
-        OUT_SERIAL.println("HW: control-voltage output failed to start");
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "CONTROL",
+            "Control-voltage output failed to initialize.");
     }
     gpsdo_dac_write16(127);
 

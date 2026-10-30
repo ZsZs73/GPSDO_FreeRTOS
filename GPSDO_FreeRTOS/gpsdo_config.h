@@ -206,19 +206,11 @@ extern "C" {
 /* GPSDO_EEPROM removed in v1.00: persistence is 100% flash ring
  * (settings_store + live_store, sector 7). See doc/FLASH_RING_BRINGUP_*. */
 /* ---- Control-voltage output --------------------------------------------
- * Default is the 16-bit PWM on PIN_VCTL_PWM: about 50 uV per step at 3.3 V,
- * near 2.7e-11 fractional on a 5.3 Hz/V oscillator.
+ * Without GPSDO_PWM_DITHER, the control-voltage output is plain PWM on
+ * PIN_VCTL_PWM: about 50 uV per step at 3.3 V, near 2.7e-11 fractional on
+ * a 5.3 Hz/V oscillator.
  *
- * GPSDO_DAC_EXT switches to the external AD5680 SPI DAC (18-bit, external
- * REF5045 reference): about 17 uV per step, near 9e-12 fractional, with no
- * filter delay in the loop. Bit-banged on PIN_DAC_SCK/MOSI/CS (PB0/PB2/PB4,
- * Dan Wiering's PCB routing; PB2 is BOOT1 - keep the MOSI trace pull-up free).
- * 2 kHz generator are skipped at compile time when this is on.
- *
- * No hardware SPI is needed: the DAC is written once per second, so bit-banging
- * costs microseconds. See gpsdo_dac_ext.h for the pin proposal and the reasoning. */
- 
-/* GPSDO_PWM_DITHER replaces the plain 16-bit PWM with a shorter PWM whose duty
+ * GPSDO_PWM_DITHER replaces the plain 16-bit PWM with a shorter PWM whose duty
  * is dithered from period to period, giving 24 bits after the filter. Idea from
  * Alan Cashin (MIS42N); the table is replayed by DMA rather than run in an
  * interrupt, so it costs no measurable CPU.
@@ -232,8 +224,6 @@ extern "C" {
  * Costs 2 x 2^(24-N) x 2 bytes of RAM: 8 KB at 13 bits, 16 KB at 12. */
 #define GPSDO_PWM_DITHER
 #define GPSDO_PWM_DITHER_BITS  13   /* 12 = 24.4 kHz/16 KB, 13 = 12.2 kHz/8 KB */
-
-//#define GPSDO_DAC_EXT
 
 /* ---- EFC span jumper on PB14 -------------------------------------------
  * A board with the EFC level shifter runs its oscillator over the full control
@@ -269,24 +259,10 @@ extern "C" {
   #error "Select only one OLED type"
 #endif
 /*
- * BOTH MAY NOW BE COMPILED TOGETHER. They used to be mutually exclusive because
- * both drive the control voltage — but the thing that must not happen is two
- * drivers fighting over one node, and that is settled by the JUMPERS on the
- * board, not by the build. Compiling both lets one binary serve either wiring
- * and lets the DAC command switch between them at runtime for a back-to-back
- * comparison, which is otherwise a reflash apart. The pins do not collide:
- * dither is PB9/TIM4, the AD5680 is PB4/PB0/PB2. See gpsdo_dac.h.
+ * The control-voltage output supports plain PWM and dithered PWM on PB9/TIM4.
+ * The DAC command can switch between those two modes at runtime when both are
+ * compiled in.
  */
-
-/*
- * With the external DAC enabled, the 2 kHz test generator yields its conflicting
- * pin instead of failing the build. The generator is a bring-up aid and is off
- * by default, so disabling it under GPSDO_DAC_EXT has no effect on normal
- * operation.
- */
-#if defined(GPSDO_DAC_EXT)
-  #undef GPSDO_GEN_2kHz_PB5
-#endif
 /* exactly one TFT driver */
 #if (defined(GPSDO_TFT_ILI9341) + defined(GPSDO_TFT_ST7789) + defined(GPSDO_TFT_ILI9488)) > 1
   #error "Select only one TFT type: GPSDO_TFT_ILI9341, GPSDO_TFT_ST7789 or GPSDO_TFT_ILI9488"
@@ -308,9 +284,8 @@ extern "C" {
  * IT YIELDS TO THE 2 kHz GENERATOR, not the other way round. Both want PB5,
  * and the generator is an explicit opt-in a person had to type; the backlight
  * is on by default. A default must never take a pin away from a deliberate
- * choice, so the deliberate one wins and nothing has to #error. (Under
- * GPSDO_DAC_EXT the generator has already been undefined just above, so on
- * those boards the question does not arise.) */
+ * choice, so the deliberate one wins and nothing has to #error.
+ */
 #if defined(GPSDO_TFT) && !defined(GPSDO_GEN_2kHz_PB5)
   #define GPSDO_TFT_BL_PWM
 #endif

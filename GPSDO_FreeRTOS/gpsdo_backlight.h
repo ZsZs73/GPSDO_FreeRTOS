@@ -39,7 +39,7 @@
  * TIM3 is otherwise completely unused by this firmware. (Several old comments
  * claimed the 1 PPS capture lived there; it does not — that is TIM2 channel 3
  * on PB10, see gpsdo_isr.cpp.) PB5 carries only the 2 kHz test square wave,
- * which is off by default and compiled out entirely under GPSDO_DAC_EXT.
+ * which is off by default.
  *
  * PA8 was the first candidate and is worse: it doubles as I2C3_SCL, and the
  * STM32 core has been observed reconfiguring it to AF4 during I2C setup.
