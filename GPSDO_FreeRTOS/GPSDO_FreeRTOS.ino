@@ -347,6 +347,7 @@ void setup()
     /* ---- Hardware POST ---- */
     gpsdo_hw_post_begin();
 
+    gpsdo_hw_discover();
     /* ---- GPS init ---- */
     gpsdo_gps_init();
 

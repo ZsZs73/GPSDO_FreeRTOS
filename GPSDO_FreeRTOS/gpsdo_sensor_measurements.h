@@ -15,4 +15,4 @@ bool gpsdo_sensor_aht_available();
 bool gpsdo_sensor_bmp280_available();
 bool gpsdo_sensor_bme280_available();
 bool gpsdo_sensor_ina219_available();
-bool gpsdo_sensor_lm75_available();
+bool gpsdo_sensor_ocxo_temp_available();

@@ -24,6 +24,8 @@
 
 #include "gpsdo_config.h"
 #include "gpsdo_state.h"
+#include "gpsdo_log.h"
+#include "gpsdo_hw.h"
 #include "gpsdo_health.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_algorithms.h"   /* g_ltic (calibrated span) for the ADC outlier gate */
@@ -234,8 +236,8 @@ static bool ltic_display_phase(double *ns_out)
 
 #endif /* GPSDO_LTIC */
 
-/* Set true by vSensorTask once all sensor detection has completed, so the
- * TFT boot splash (in vDisplayTask) can wait briefly for valid flags. */
+/* Set true by vSensorTask once sensor driver initialization has completed,
+ * so the TFT boot splash can wait briefly for valid runtime flags. */
 static volatile bool s_sensors_probed = false;
 
 extern float g_pressure_offset;
@@ -264,11 +266,7 @@ void vSensorTask(void *pvParameters)
     analogRead(PIN_LTIC_VPHASE);   /* dummy read to settle ADC mux */
     xTaskResumeAll();
     ltic_read_fast();              /* no discharge; pin stays analog */
-    /* NOT "OK": nothing here can tell a fitted ramp detector from a floating
-     * pin. All this line may claim is that the firmware was built with the
-     * detector path compiled in and PA1 configured for it. Dave's board was
-     * built without the hardware and this line told him it was fine. */
-    OUT_SERIAL.println("HW: LTIC phase input      enabled (PA1) - needs the ramp detector hw");
+    /* PA1 setup only; external detector presence is not inferable here. */
 #endif
 
     s_sensors_probed = true;   /* signal vDisplayTask the flags are valid */
@@ -1457,7 +1455,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 
   static void tft_splash(bool oled_ok, bool lcd_ok, bool ht_ok,
                          bool aht_ok, bool bmp_ok, bool bme_ok,
-                         bool ina_ok, bool lm75_ok)
+                         bool ina_ok, bool ocxo_temp_ok)
   {
       s_tft.fillScreen(TFT_COL_BG);
 
@@ -1697,8 +1695,8 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #elif defined(GPSDO_TM1637)
           { "TM1637 clock HH:MM",     true,   true   },
 #endif
-          { "Sensors EN/OCXO",       (aht_ok||bmp_ok||bme_ok||ina_ok||lm75_ok),
-#if defined(GPSDO_AHT10) || defined(GPSDO_BMP280_I2C) || defined(GPSDO_BME280_I2C) || defined(GPSDO_INA219) || defined(GPSDO_LM75)
+          { "Sensors EN/OCXO",       (aht_ok||bmp_ok||bme_ok||ina_ok||ocxo_temp_ok),
+#if defined(GPSDO_AHT10) || defined(GPSDO_BMP280_I2C) || defined(GPSDO_BME280_I2C) || defined(GPSDO_INA219) || defined(GPSDO_OCXO_TEMP)
                                               true
 #else
                                               false
@@ -1940,7 +1938,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
   static void tft_update(const GpsData_t *g, const FreqSnap_t *f,
                          const CtrlData_t *c, const Uptime_t *u,
                          bool aht_ok, bool bmp_ok, bool bme_ok,
-                         bool ina_ok, bool lm75_ok)
+                         bool ina_ok, bool ocxo_temp_ok)
   {
       char s[28];
 
@@ -2587,7 +2585,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
           tft_val(12, TFT_COL_L, TFT_SENS_Y + TFT_ROW_H,
                   rh_pad, TFT_COL_VALUE, s);
 
-          if (lm75_ok) {
+          if (ocxo_temp_ok) {
               static char fot[8];
               dtostrf(g_ocxo_temp,4,1,fot);
               snprintf(s,sizeof(s),"OX:%s C",fot);
@@ -2600,12 +2598,12 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
 #else
       /* Second sensor row: enclosure humidity + OCXO temperature.
        * Compact form keeps both measurements inside the 156 px left cell. */
-      if (encl_humi_ok || lm75_ok) {
+      if (encl_humi_ok || ocxo_temp_ok) {
           static char fh[8], fot[8];
           if (encl_humi_ok) dtostrf(g_encl_humi,4,1,fh);
-          if (lm75_ok)      dtostrf(g_ocxo_temp,4,1,fot);
+          if (ocxo_temp_ok)      dtostrf(g_ocxo_temp,4,1,fot);
 
-          if (encl_humi_ok && lm75_ok)
+          if (encl_humi_ok && ocxo_temp_ok)
               snprintf(s,sizeof(s),"EN:%s%% OX:%sC",fh,fot);
           else if (encl_humi_ok)
               snprintf(s,sizeof(s),"EN:%s%%",fh);
@@ -3299,14 +3297,12 @@ void vDisplayTask(void *pvParameters)
      *   cycle finishes, then acquire the mutex before touching Wire.
      */
     vTaskDelay(pdMS_TO_TICKS(200));
-    if (xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    s_oled_ok = gpsdo_hw_is_present(GPSDO_HW_OLED);
+    if (s_oled_ok && xSemaphoreTake(xWireMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         s_oled.begin();               /* also calls Wire.begin()           */
         #if GPSDO_OLED_FLIP
             s_oled.setFlipMode(1);
         #endif
-        /* u8x8.begin() does not verify the display is present — probe the
-         * bus ourselves so the HW report reflects reality.               */
-        s_oled_ok = i2c_probe(0x3C);
         if (s_oled_ok) {
             s_oled.clear();
             memset(oled_prev, 0, sizeof(oled_prev));
@@ -3324,10 +3320,13 @@ void vDisplayTask(void *pvParameters)
             /* Row 0 not cached → forced redraw to clock after splash */
         }
         xSemaphoreGive(xWireMutex);
-        OUT_SERIAL.println(s_oled_ok ? "HW: OLED 128x64           OK  (I2C 0x3C)"
-                                     : "HW: OLED 128x64           not found");
-    } else {
-        OUT_SERIAL.println("HW: OLED 128x64           init failed (I2C mutex timeout)");
+        gpsdo_hw_set_initialized(GPSDO_HW_OLED, true);
+    } else if (s_oled_ok) {
+        s_oled_ok = false;
+        gpsdo_hw_set_initialized(GPSDO_HW_OLED, false);
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "DISPLAY",
+            "OLED was detected but initialization could not access the I2C bus; OLED output unavailable.");
     }
 #endif /* GPSDO_OLED */
 
@@ -3451,7 +3450,7 @@ void vDisplayTask(void *pvParameters)
 
         bool oled_ok = false, lcd_ok = false, ht_ok = false;
         bool aht_ok = false, bmp_ok = false, bme_ok = false,
-             ina_ok = false, lm75_ok = false;
+             ina_ok = false, ocxo_temp_ok = false;
 #ifdef GPSDO_OLED
         oled_ok = s_oled_ok;
 #endif
@@ -3473,11 +3472,11 @@ void vDisplayTask(void *pvParameters)
 #ifdef GPSDO_BME280_I2C
         bme_ok = gpsdo_sensor_bme280_available();
 #endif
-#ifdef GPSDO_LM75
-        lm75_ok = gpsdo_sensor_lm75_available();
+#ifdef GPSDO_OCXO_TEMP
+        ocxo_temp_ok = gpsdo_sensor_ocxo_temp_available();
 #endif
         tft_splash(oled_ok, lcd_ok, ht_ok,
-                   aht_ok, bmp_ok, bme_ok, ina_ok, lm75_ok);
+                   aht_ok, bmp_ok, bme_ok, ina_ok, ocxo_temp_ok);
         tft_draw_layout();
     }
 #endif
@@ -3885,7 +3884,7 @@ void vDisplayTask(void *pvParameters)
                 gpsdo_sensor_bmp280_available() || gpsdo_sensor_bme280_available();
 
             const bool lcd_ocxo_ok =
-                gpsdo_sensor_lm75_available() && gpsdo_sensor_ina219_available();
+                gpsdo_sensor_ocxo_temp_available() && gpsdo_sensor_ina219_available();
 
             /* ---- Line 2: rotating view ----
              * Modes: 0=GPS coords, 1=Sats+HDOP, 2=Date+day, 3=enclosure RH, 4=OCXO, 5=enclosure pressure
@@ -4026,7 +4025,7 @@ void vDisplayTask(void *pvParameters)
                         gpsdo_sensor_bmp280_available(),
                         gpsdo_sensor_bme280_available(),
                         gpsdo_sensor_ina219_available(),
-                        gpsdo_sensor_lm75_available());
+                        gpsdo_sensor_ocxo_temp_available());
 #endif
 
 
