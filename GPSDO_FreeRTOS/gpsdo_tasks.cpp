@@ -218,10 +218,6 @@ static bool ltic_display_phase(double *ns_out)
 
 #endif /* GPSDO_LTIC */
 
-/* Set true by vSensorTask once sensor driver initialization has completed,
- * so the TFT boot splash can wait briefly for valid runtime flags. */
-static volatile bool s_sensors_probed = false;
-
 extern float g_pressure_offset;
 extern float g_altitude_offset;
 
@@ -250,8 +246,6 @@ void vSensorTask(void *pvParameters)
     ltic_read_fast();              /* no discharge; pin stays analog */
     /* PA1 setup only; external detector presence is not inferable here. */
 #endif
-
-    s_sensors_probed = true;   /* signal vDisplayTask the flags are valid */
 
     for (;;)
     {
@@ -3117,11 +3111,6 @@ void vDisplayTask(void *pvParameters)
     /* All detection done — play the boot splash with the real hardware
      * checklist, then draw the operating-screen layout. */
     if (s_tft_ok) {
-        /* Wait up to 1 s for vSensorTask to finish probing, so the
-         * checklist reflects the sensors too (cosmetic only). */
-        for (int w = 0; w < 100 && !s_sensors_probed; w++)
-            vTaskDelay(pdMS_TO_TICKS(10));
-
         bool oled_ok = false;
         bool aht_ok = false, bmp_ok = false, bme_ok = false,
              ina_ok = false, ocxo_temp_ok = false;
@@ -3129,19 +3118,19 @@ void vDisplayTask(void *pvParameters)
         oled_ok = s_oled_ok;
 #endif
 #ifdef GPSDO_AHT10
-        aht_ok = gpsdo_sensor_aht_available();
+        aht_ok = gpsdo_hw_is_present(GPSDO_HW_AHT);
 #endif
 #ifdef GPSDO_BMP280_I2C
-        bmp_ok = gpsdo_sensor_bmp280_available();
+        bmp_ok = gpsdo_hw_is_present(GPSDO_HW_BMP280);
 #endif
 #ifdef GPSDO_INA219
-        ina_ok = gpsdo_sensor_ina219_available();
+        ina_ok = gpsdo_hw_is_present(GPSDO_HW_INA219);
 #endif
 #ifdef GPSDO_BME280_I2C
-        bme_ok = gpsdo_sensor_bme280_available();
+        bme_ok = gpsdo_hw_is_present(GPSDO_HW_BME280);
 #endif
 #ifdef GPSDO_OCXO_TEMP
-        ocxo_temp_ok = gpsdo_sensor_ocxo_temp_available();
+        ocxo_temp_ok = gpsdo_hw_is_present(GPSDO_HW_OCXO_TEMP);
 #endif
         tft_splash(oled_ok,
                    aht_ok, bmp_ok, bme_ok, ina_ok, ocxo_temp_ok);
