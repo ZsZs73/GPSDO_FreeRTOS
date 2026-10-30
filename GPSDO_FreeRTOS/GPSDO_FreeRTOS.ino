@@ -21,8 +21,7 @@
  *   - STM32duino core >= 2.2.0
  *   - STM32duino FreeRTOS library
  *   - TinyGPS++, Adafruit_AHTX0, Adafruit_BMP280, Adafruit_INA219
- *   - U8g2, TM1637Display (local copy in project)
- *   - hd44780 (if GPSDO_LCD_20x4 is enabled)
+ *   - U8g2, (local copy in project)
  *   Arduino IDE: Tools > C Runtime Library > Newlib Nano + Float Printf/Scanf
  *
  * SERIAL RX BUFFER (build_opt.h)

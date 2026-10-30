@@ -22,14 +22,17 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- the pin, and the one way it can collide ---------------------------
+/* ---- SPAN sense pin and DAC collision guard ----------------------------
  *
- * PB14 is the pin the audit in gpsdo_dac_ext.h found free in every
- * configuration, and until now that audit also offered it as the place to move
- * the AD5680's chip select if a board wanted the TM1637 back. Both cannot
- * happen: INPUT_PULLUP here would take the pin away from the DAC, and the DAC's
- * select pulses would read as a jumper. Caught at compile time rather than on a
- * bench, for all three DAC pins because all three can be overridden. */
+ * PB14 is used for SPAN sense because the pin audit in gpsdo_dac_ext.h found
+ * it free in the normal hardware configuration.
+ *
+ * If the external DAC pin assignments are overridden, PB14 must not be used
+ * by the DAC as well: INPUT_PULLUP here would take the pin away from the DAC,
+ * while DAC activity on the pin could be misread as a jumper change. Catch
+ * that conflict at compile time for all three DAC pins, since each can be
+ * overridden.
+ */
 #ifdef GPSDO_SPAN_SENSE
 #ifndef PIN_SPAN_SENSE
 #define PIN_SPAN_SENSE PB14

@@ -855,7 +855,7 @@ static bool ubx_config(void)
 /*
  * run_tunnel_mode — transparent serial bridge between CLI_SER and Serial1.
  *
- * Fix: notifies DisplayTask once per second so OLED and TM1637 keep
+ * Fix: notifies DisplayTask once per second so active displays keep
  * updating with the last valid gGps snapshot during the bridge session.
  * Without this notification both displays froze for the entire tunnel
  * timeout (up to 300 s).
@@ -939,7 +939,7 @@ static void run_tunnel_mode(void)
  *   gps.location.isValid() returns false and the satellite count drops
  *   to 0.  We track the last time a genuine position fix was received
  *   and clear pos_valid (plus zero out position/sats) after 10 s of no
- *   valid location sentence.  This ensures OLED and TM1637 show the
+ *   valid location sentence.  This ensures active displays show the
  *   "no fix" state within 10 s of antenna disconnection.
  *
  * gGps.valid (time valid) follows NMEA presence.

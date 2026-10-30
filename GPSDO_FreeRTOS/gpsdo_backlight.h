@@ -42,8 +42,8 @@
  * which is off by default and compiled out entirely under GPSDO_DAC_EXT.
  *
  * PA8 was the first candidate and is worse: it doubles as I2C3_SCL, and the
- * core has been observed reconfiguring it to AF4 behind the firmware's back —
- * gpsdo_tasks.cpp already has to re-assert it once for the TM1637.
+ * STM32 core has been observed reconfiguring it to AF4 during I2C setup.
+ * Using PB5 avoids that peripheral-function conflict entirely.
  *
  * WHY 30% AND NOT 0%
  * ------------------

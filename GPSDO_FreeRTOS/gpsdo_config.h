@@ -10,7 +10,7 @@
  *
  * All hardware features, pin assignments, display selection, RTOS task
  * priorities and stack sizes are controlled here.  Sanity checks enforce
- * mutual exclusion rules (e.g. LCD 20x4 and TM1637 cannot coexist).
+ * mutual exclusion rules
  *
  * OUT_SERIAL macro routes all user-facing output to Serial2 when
  * GPSDO_BLUETOOTH is defined, or to Serial (USB) otherwise.
@@ -56,21 +56,6 @@ extern "C" {
 //#define GPSDO_OLED_SSD1306       /* SSD1306 128x64 I2C                     */
 //#define GPSDO_OLED_SSD1309       /* SSD1309 128x64 I2C (same init as 1306) */
 #define GPSDO_OLED_FLIP   1   /* 1 = rotate OLED 180°, 0 = normal orientation */
-
-/* ── LCD 20x4 I2C — independent of OLED, enable or comment out ──────── */
-//#define GPSDO_LCD_20x4     /* HD44780 20x4 via PCF8574T I2C expander */
-
-/* ── TM1637 clock display — select exactly one, or comment both out ──── */
-//#define GPSDO_TM1637_6           /* 6-digit TM1637: HH:MM:SS               */
-//#define GPSDO_TM1637             /* 4-digit TM1637: HH:MM                  */
-
-/* ── HT16K33 clock display — 4-digit 7-seg with colon, I2C ────────────
- * Common AliExpress/Adafruit-style 0.56" clock modules (addr 0x70).
- * Shows HH:MM with the colon blinking each second.  Pure I2C device —
- * shares the bus with OLED/LCD/sensors, no extra pins, no conflicts.   */
-//#define GPSDO_HT16K33            /* 4-digit HT16K33: HH:MM                 */
-//#define HT16K33_I2C_ADDR  0x70   /* default; A0/A1/A2 jumpers raise it     */
-//#define HT16K33_BRIGHTNESS  2    /* 0 (dim) .. 15 (max)                    */
 
 /* ── TFT SPI display — select exactly one, or comment all out ─────────
  *
@@ -228,7 +213,7 @@ extern "C" {
  * REF5045 reference): about 17 uV per step, near 9e-12 fractional, with no
  * filter delay in the loop. Bit-banged on PIN_DAC_SCK/MOSI/CS (PB0/PB2/PB4,
  * Dan Wiering's PCB routing; PB2 is BOOT1 - keep the MOSI trace pull-up free).
- * TM1637 and the 2 kHz generator are skipped at compile time when this is on.
+ * 2 kHz generator are skipped at compile time when this is on.
  *
  * No hardware SPI is needed: the DAC is written once per second, so bit-banging
  * costs microseconds. See gpsdo_dac_ext.h for the pin proposal and the reasoning. */
@@ -283,34 +268,23 @@ extern "C" {
 #if defined(GPSDO_OLED_SSD1306) && defined(GPSDO_OLED_SSD1309)
   #error "Select only one OLED type"
 #endif
-#if defined(GPSDO_TM1637) && defined(GPSDO_TM1637_6)
-  #error "Select only one TM1637 mode: GPSDO_TM1637 (4-digit) or GPSDO_TM1637_6 (6-digit)"
-#endif
-#if defined(GPSDO_LCD_20x4) && (defined(GPSDO_TM1637) || defined(GPSDO_TM1637_6))
-  #error "GPSDO_LCD_20x4 and TM1637 cannot be used together (I2C/GPIO conflict). Disable one."
-#endif
-/* The external DAC's chip-select shares PB4 with the TM1637 data line. Both are
- * plain GPIO driven by software, so nothing detects the clash at run time: the
- * display would corrupt every DAC write and the control voltage would jump
- * whenever the clock updated. Caught here instead.
- *
- * If a board needs both, move PIN_DAC_CS — PB2, PB14, PA4, PA6, PA8, PA9 and PA10
- * are free at the time of writing. Nothing in the firmware depends on which. */
-/* BOTH MAY NOW BE COMPILED TOGETHER. They used to be mutually exclusive because
+/*
+ * BOTH MAY NOW BE COMPILED TOGETHER. They used to be mutually exclusive because
  * both drive the control voltage — but the thing that must not happen is two
  * drivers fighting over one node, and that is settled by the JUMPERS on the
  * board, not by the build. Compiling both lets one binary serve either wiring
  * and lets the DAC command switch between them at runtime for a back-to-back
  * comparison, which is otherwise a reflash apart. The pins do not collide:
- * dither is PB9/TIM4, the AD5680 is PB4/PB0/PB2. See gpsdo_dac.h. */
-/* With the external DAC on, TM1637 and the 2 kHz generator yield their pins
- * instead of failing the build: TM1637's data line is the DAC's chip-select
- * (PB4), and both options are historical anyway — the HT16K33 on I2C is the
- * maintained clock display, and the generator was a bring-up aid. The v1.06
- * policy keeps both OFF by default regardless (see the defines above). */
+ * dither is PB9/TIM4, the AD5680 is PB4/PB0/PB2. See gpsdo_dac.h.
+ */
+
+/*
+ * With the external DAC enabled, the 2 kHz test generator yields its conflicting
+ * pin instead of failing the build. The generator is a bring-up aid and is off
+ * by default, so disabling it under GPSDO_DAC_EXT has no effect on normal
+ * operation.
+ */
 #if defined(GPSDO_DAC_EXT)
-  #undef GPSDO_TM1637
-  #undef GPSDO_TM1637_6
   #undef GPSDO_GEN_2kHz_PB5
 #endif
 /* exactly one TFT driver */

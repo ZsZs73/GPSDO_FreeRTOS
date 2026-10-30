@@ -54,14 +54,15 @@
  *
  *   - PB6 and PB7 look free but are NOT. Wire.begin() is called without
  *     arguments, so I2C1 takes its default pins, which on this variant are
- *     exactly those two. Putting the DAC there would break the sensors, the
- *     HT16K33 clock display and anything else on the bus.
+ *     exactly those two. Putting the DAC there would break the sensors and
+ *     anything else sharing the I2C bus.
  *   - Everything below is plain GPIO with no alternate function this firmware
  *     uses, verified against gpsdo_config.h rather than assumed.
  *
  * Change freely — nothing in the firmware depends on these three. Also free at
  * present, if a chosen part needs LDAC, RESET or a busy input: PA4, PA6, PA8,
- * PA9, PA10, PB2, PC14, PC15. */
+ * PA9, PA10, PB2, PC14, PC15.
+ */
 #ifndef PIN_DAC_SCK
 #define PIN_DAC_SCK   PB0
 #endif
