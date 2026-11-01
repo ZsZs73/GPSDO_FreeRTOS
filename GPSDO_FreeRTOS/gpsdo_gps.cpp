@@ -207,65 +207,273 @@ static void copy_ubx_text(char *dst, size_t dst_size,
  *   hwVersion  CH[10]
  *   extension  CH[30] repeated
  */
+
+/* ---- Detailed GNSS identity/capability state -------------------------- */
+typedef enum {
+    GNSS_FW_UNKNOWN = 0,
+    GNSS_FW_ROM,
+    GNSS_FW_FLASH
+} gnss_fw_source_t;
+
+static char s_gnss_rom_version[31] = {0};
+static char s_gnss_fis[31]         = {0};
+static char s_gnss_caps[80]        = {0};
+static gnss_fw_source_t s_gnss_fw_source = GNSS_FW_UNKNOWN;
+static bool s_gnss_flash_reported = false;
+
+static const char *gnss_ext_value(const char *line, const char *key)
+{
+    size_t n = strlen(key);
+    if (strncmp(line, key, n) != 0) return NULL;
+    if (line[n] == '=') return line + n + 1;
+    if (line[n] == ' ') {
+        const char *p = line + n;
+        while (*p == ' ') ++p;
+        return p;
+    }
+    return NULL;
+}
+
+static void gnss_copy_cstr(char *dst, size_t cap, const char *src)
+{
+    if (!dst || cap == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+enum {
+    GNSS_CAP_GPS=1u<<0, GNSS_CAP_SBAS=1u<<1, GNSS_CAP_GLO=1u<<2,
+    GNSS_CAP_GAL=1u<<3, GNSS_CAP_BDS=1u<<4, GNSS_CAP_QZSS=1u<<5,
+    GNSS_CAP_IMES=1u<<6, GNSS_CAP_NAVIC=1u<<7
+};
+
+static uint16_t gnss_caps_from_extension(const char *line)
+{
+    if (!line || !line[0] || strncmp(line, "GNSS ", 5) == 0) return 0;
+    uint16_t caps = 0;
+    const char *p = line;
+    while (*p) {
+        const char *e = strchr(p, ';');
+        size_t n = e ? (size_t)(e-p) : strlen(p);
+        if      (n==3 && strncmp(p,"GPS",3)==0)   caps |= GNSS_CAP_GPS;
+        else if (n==4 && strncmp(p,"SBAS",4)==0)  caps |= GNSS_CAP_SBAS;
+        else if (n==3 && strncmp(p,"GLO",3)==0)   caps |= GNSS_CAP_GLO;
+        else if (n==3 && strncmp(p,"GAL",3)==0)   caps |= GNSS_CAP_GAL;
+        else if (n==3 && strncmp(p,"BDS",3)==0)   caps |= GNSS_CAP_BDS;
+        else if (n==4 && strncmp(p,"QZSS",4)==0)  caps |= GNSS_CAP_QZSS;
+        else if (n==4 && strncmp(p,"IMES",4)==0)  caps |= GNSS_CAP_IMES;
+        else if (n==5 && strncmp(p,"NAVIC",5)==0) caps |= GNSS_CAP_NAVIC;
+        if (!e) break;
+        p = e + 1;
+    }
+    return caps;
+}
+
+static void gnss_append_cap(const char *name)
+{
+    size_t used = strlen(s_gnss_caps);
+    if (used && used + 2 < sizeof(s_gnss_caps)) {
+        s_gnss_caps[used++] = ',';
+        s_gnss_caps[used++] = ' ';
+        s_gnss_caps[used] = '\0';
+    }
+    if (used + 1 < sizeof(s_gnss_caps))
+        strncat(s_gnss_caps, name, sizeof(s_gnss_caps) - used - 1);
+}
+
+static void gnss_format_caps(uint16_t caps)
+{
+    s_gnss_caps[0] = '\0';
+    if (caps & GNSS_CAP_GPS)   gnss_append_cap("GPS");
+    if (caps & GNSS_CAP_SBAS)  gnss_append_cap("SBAS");
+    if (caps & GNSS_CAP_GLO)   gnss_append_cap("GLONASS");
+    if (caps & GNSS_CAP_GAL)   gnss_append_cap("Galileo");
+    if (caps & GNSS_CAP_BDS)   gnss_append_cap("BeiDou");
+    if (caps & GNSS_CAP_QZSS)  gnss_append_cap("QZSS");
+    if (caps & GNSS_CAP_IMES)  gnss_append_cap("IMES");
+    if (caps & GNSS_CAP_NAVIC) gnss_append_cap("NavIC");
+}
+
+static const char *gnss_fw_source_name(void)
+{
+    if (s_gnss_fw_source == GNSS_FW_ROM) return "ROM";
+    if (s_gnss_fw_source == GNSS_FW_FLASH) return "flash";
+    return "unknown";
+}
+
+static bool gnss_poll_message(uint8_t cls, uint8_t id,
+                              uint8_t *payload, uint16_t payload_cap,
+                              uint16_t *payload_len, uint32_t timeout_ms)
+{
+    uint8_t poll[8] = {0xB5,0x62,cls,id,0x00,0x00,0x00,0x00};
+    uint8_t a=0,b=0;
+    for (uint8_t i=2; i<6; ++i) { a=(uint8_t)(a+poll[i]); b=(uint8_t)(b+a); }
+    poll[6]=a; poll[7]=b;
+    flush_rx(20);
+    for (uint8_t i=0; i<sizeof(poll); ++i) Serial1.write(poll[i]);
+    Serial1.flush();
+    return recv_ubx_frame(cls,id,payload,payload_cap,payload_len,timeout_ms);
+}
+
+static bool gnss_tim_tp_qerr_from_payload(const uint8_t *payload,
+                                                uint16_t len,
+                                                int32_t *qerr_ps)
+{
+    if (!payload || !qerr_ps || len < 16) return false;
+
+    uint32_t q = (uint32_t)payload[8] |
+                 ((uint32_t)payload[9] << 8) |
+                 ((uint32_t)payload[10] << 16) |
+                 ((uint32_t)payload[11] << 24);
+    *qerr_ps = (int32_t)q;
+    return true;
+}
+
+static bool gnss_poll_tim_tp_qerr(int32_t *qerr_ps)
+{
+    uint8_t payload[32];
+    uint16_t len = 0;
+    if (!gnss_poll_message(0x0D, 0x01,
+                           payload, sizeof(payload), &len, 500))
+        return false;
+    return gnss_tim_tp_qerr_from_payload(payload, len, qerr_ps);
+}
+
+/* Wait for a TIM-TP frame without polling it. Used only as a fallback when
+ * CFG-MSG cannot report the current UART1 output rate. */
+static bool gnss_wait_tim_tp_qerr(int32_t *qerr_ps, uint32_t timeout_ms)
+{
+    uint8_t payload[32];
+    uint16_t len = 0;
+    if (!recv_ubx_frame(0x0D, 0x01,
+                        payload, sizeof(payload), &len, timeout_ms))
+        return false;
+    return gnss_tim_tp_qerr_from_payload(payload, len, qerr_ps);
+}
+
+static void gnss_log_detailed_identity(void)
+{
+    if (s_gnss_info.model[0])
+        gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                   "Receiver: %s.", s_gnss_info.model);
+    else
+        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
+                        "Receiver: UBX; production model ID not reported.");
+
+    gpsdo_logf(GPSDO_LOG_INFO,"GPS",
+               "Firmware: SW %s; HW %s; protocol %s; source %s.",
+               s_gnss_info.sw_version[0]?s_gnss_info.sw_version:"not reported",
+               s_gnss_info.hw_version[0]?s_gnss_info.hw_version:"not reported",
+               s_gnss_info.prot_version[0]?s_gnss_info.prot_version:"not reported",
+               gnss_fw_source_name());
+
+    if (s_gnss_info.fw_version[0])
+        gpsdo_logf(GPSDO_LOG_INFO,"GPS","Product firmware: %s.",s_gnss_info.fw_version);
+    if (s_gnss_rom_version[0])
+        gpsdo_logf(GPSDO_LOG_INFO,"GPS","Underlying ROM: %s.",s_gnss_rom_version);
+
+    if (s_gnss_caps[0])
+        gpsdo_logf(GPSDO_LOG_INFO,"GPS","GNSS capability: %s.",s_gnss_caps);
+    else
+        gpsdo_log_event(GPSDO_LOG_INFO,"GPS","GNSS capability list not reported.");
+
+    if (s_gnss_flash_reported)
+        gpsdo_logf(GPSDO_LOG_INFO,"GPS",
+                   "Storage: flash reported (%s); write capability not tested.",
+                   s_gnss_fis[0]?s_gnss_fis:"FIS present");
+    else if (s_gnss_fw_source == GNSS_FW_FLASH)
+        gpsdo_log_event(GPSDO_LOG_INFO,"GPS",
+                        "Storage: firmware runs from flash; FIS not reported; write capability not tested.");
+    else
+        gpsdo_log_event(GPSDO_LOG_INFO,"GPS",
+                        "Storage: flash not reported; write capability not tested.");
+}
+
+
 static bool ubx_poll_mon_ver(void)
 {
-    static const uint8_t poll[] = {
-        0xB5, 0x62,
-        0x0A, 0x04,
-        0x00, 0x00,
-        0x0E, 0x34
-    };
-
+    static const uint8_t poll[] = {0xB5,0x62,0x0A,0x04,0x00,0x00,0x0E,0x34};
     uint8_t payload[400];
-    uint16_t len = 0;
+    uint16_t len=0;
 
-    send_ubx(poll, sizeof(poll));
+    for (uint8_t i=0; i<sizeof(poll); ++i) Serial1.write(poll[i]);
+    Serial1.flush();
 
-    if (!recv_ubx_frame(0x0A, 0x04,
-                        payload, sizeof(payload),
-                        &len, 1000))
+    if (!recv_ubx_frame(0x0A,0x04,payload,sizeof(payload),&len,700))
+        return false;
+    if (len < 40 || ((len-40u)%30u)!=0u)
         return false;
 
-    /* MON-VER is 40 bytes plus zero or more 30-byte extensions. */
-    if (len < 40 || ((len - 40) % 30) != 0)
-        return false;
+    copy_ubx_text(s_gnss_info.sw_version,sizeof(s_gnss_info.sw_version),payload,30);
+    copy_ubx_text(s_gnss_info.hw_version,sizeof(s_gnss_info.hw_version),payload+30,10);
 
-    s_gnss_info.ubx_seen = true;
-    s_gnss_info.detected = true;
+    s_gnss_info.model[0]='\0';
+    s_gnss_info.fw_version[0]='\0';
+    s_gnss_info.prot_version[0]='\0';
+    s_gnss_rom_version[0]='\0';
+    s_gnss_fis[0]='\0';
+    s_gnss_caps[0]='\0';
+    s_gnss_fw_source=GNSS_FW_UNKNOWN;
+    s_gnss_flash_reported=false;
 
-    copy_ubx_text(s_gnss_info.sw_version,
-                  sizeof(s_gnss_info.sw_version),
-                  payload, 30);
+    if (strncmp(s_gnss_info.sw_version,"ROM CORE",8)==0)
+        s_gnss_fw_source=GNSS_FW_ROM;
+    else if (strncmp(s_gnss_info.sw_version,"EXT CORE",8)==0)
+        s_gnss_fw_source=GNSS_FW_FLASH;
 
-    copy_ubx_text(s_gnss_info.hw_version,
-                  sizeof(s_gnss_info.hw_version),
-                  payload + 30, 10);
+    uint16_t caps=0;
+    uint16_t ext_count=(uint16_t)((len-40u)/30u);
 
-    s_gnss_info.model[0] = '\0';
-    s_gnss_info.fw_version[0] = '\0';
-    s_gnss_info.prot_version[0] = '\0';
-
-    for (uint16_t off = 40; off + 30 <= len; off += 30) {
+    for (uint16_t i=0; i<ext_count; ++i) {
         char ext[31];
-        copy_ubx_text(ext, sizeof(ext), payload + off, 30);
+        copy_ubx_text(ext,sizeof(ext),payload+40u+30u*i,30);
+        if (!ext[0]) continue;
 
-        if (strncmp(ext, "MOD=", 4) == 0) {
-            strncpy(s_gnss_info.model, ext + 4,
-                    sizeof(s_gnss_info.model) - 1);
-            s_gnss_info.model[sizeof(s_gnss_info.model) - 1] = '\0';
+        const char *v;
+        bool known=false;
+
+        if ((v=gnss_ext_value(ext,"MOD"))!=NULL) {
+            gnss_copy_cstr(s_gnss_info.model,sizeof(s_gnss_info.model),v);
+            known=true;
+        } else if ((v=gnss_ext_value(ext,"FWVER"))!=NULL) {
+            gnss_copy_cstr(s_gnss_info.fw_version,sizeof(s_gnss_info.fw_version),v);
+            known=true;
+        } else if ((v=gnss_ext_value(ext,"PROTVER"))!=NULL) {
+            gnss_copy_cstr(s_gnss_info.prot_version,sizeof(s_gnss_info.prot_version),v);
+            known=true;
+        } else if ((v=gnss_ext_value(ext,"FIS"))!=NULL) {
+            gnss_copy_cstr(s_gnss_fis,sizeof(s_gnss_fis),v);
+            s_gnss_flash_reported=true;
+            known=true;
+        } else if ((v=gnss_ext_value(ext,"ROM BASE"))!=NULL) {
+            gnss_copy_cstr(s_gnss_rom_version,sizeof(s_gnss_rom_version),v);
+            s_gnss_fw_source=GNSS_FW_FLASH;
+            known=true;
         }
-        else if (strncmp(ext, "FWVER=", 6) == 0) {
-            strncpy(s_gnss_info.fw_version, ext + 6,
-                    sizeof(s_gnss_info.fw_version) - 1);
-            s_gnss_info.fw_version[sizeof(s_gnss_info.fw_version) - 1] = '\0';
+
+        if (!known && i==0 && ext[0]>='0' && ext[0]<='9' && strchr(ext,'(')!=NULL) {
+            gnss_copy_cstr(s_gnss_rom_version,sizeof(s_gnss_rom_version),ext);
+            s_gnss_fw_source=GNSS_FW_FLASH;
+            known=true;
         }
-        else if (strncmp(ext, "PROTVER=", 8) == 0) {
-            strncpy(s_gnss_info.prot_version, ext + 8,
-                    sizeof(s_gnss_info.prot_version) - 1);
-            s_gnss_info.prot_version[sizeof(s_gnss_info.prot_version) - 1] = '\0';
-        }
+
+        if (!known)
+            caps |= gnss_caps_from_extension(ext);
     }
 
+    gnss_format_caps(caps);
+
+    if (s_gnss_fw_source==GNSS_FW_UNKNOWN && s_gnss_info.prot_version[0]) {
+        int major=atoi(s_gnss_info.prot_version);
+        if (major>0 && major<=17)
+            s_gnss_fw_source=GNSS_FW_ROM;
+    }
+
+    s_gnss_info.ubx_seen=true;
+    s_gnss_info.detected=true;
     return true;
 }
 
@@ -285,7 +493,27 @@ static bool ubx_poll_mon_ver(void)
  *
  * Returns: +1 = ACK-ACK, -1 = ACK-NAK, 0 = timeout
  */
-static int8_t get_ubx_ack(const uint8_t *msg, uint32_t timeout_ms = 1500)
+static const char *ubx_command_name(uint8_t cls, uint8_t id)
+{
+    if (cls == 0x06) {  /* UBX-CFG */
+        switch (id) {
+        case 0x00: return "CFG-PRT";
+        case 0x01: return "CFG-MSG";
+        case 0x08: return "CFG-RATE";
+        case 0x09: return "CFG-CFG";
+        case 0x1D: return "CFG-TMODE";
+        case 0x24: return "CFG-NAV5";
+        case 0x31: return "CFG-TP5";
+        case 0x3D: return "CFG-TMODE2";
+        case 0x8A: return "CFG-VALSET";
+        default:   break;
+        }
+    }
+
+    return nullptr;
+}
+
+static int8_t get_ubx_ack(const uint8_t *msg, uint32_t timeout_ms = 1500, bool log_nak = true)
 {
     bool sched_running = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
 
@@ -319,8 +547,21 @@ static int8_t get_ubx_ack(const uint8_t *msg, uint32_t timeout_ms = 1500)
 
             if (b == nak_frame[nak_id]) {
                 if (++nak_id >= 10) {
-                    gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
-                                    "Receiver rejected a configuration command.");
+                    if (log_nak) {
+                        const uint8_t cls = msg[2];
+                        const uint8_t id  = msg[3];
+                        const char *name = ubx_command_name(cls, id);
+
+                        if (name) {
+                            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                                       "Receiver rejected %s (UBX %02X/%02X).",
+                                       name, cls, id);
+                        } else {
+                            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                                       "Receiver rejected UBX command %02X/%02X.",
+                                       cls, id);
+                        }
+                    }
                     return -1;
                 }
             } else {
@@ -361,6 +602,39 @@ static bool ubx_send_cfg_msg(uint8_t nmea_class, uint8_t nmea_id, uint8_t rate)
     ubx_cksum(msg, sizeof(msg));
     send_ubx(msg, sizeof(msg));
     return (get_ubx_ack(msg, 500) == +1);
+}
+
+/* Read the current UART1 output rate for one UBX message via CFG-MSG.
+ * No receiver setting is changed by this query. */
+static bool ubx_poll_cfg_msg_uart1_rate(uint8_t msg_class, uint8_t msg_id,
+                                        uint8_t *rate_uart1)
+{
+    if (!rate_uart1) return false;
+
+    uint8_t poll[10] = {
+        0xB5, 0x62,       /* UBX header */
+        0x06, 0x01,       /* CFG-MSG    */
+        0x02, 0x00,       /* length = 2 */
+        msg_class, msg_id,
+        0x00, 0x00        /* CK_A, CK_B */
+    };
+    ubx_cksum(poll, sizeof(poll));
+
+    flush_rx(20);
+    send_ubx(poll, sizeof(poll));
+
+    uint8_t payload[8];
+    uint16_t len = 0;
+    if (!recv_ubx_frame(0x06, 0x01,
+                        payload, sizeof(payload), &len, 700))
+        return false;
+
+    /* CFG-MSG response: class, id, DDC, UART1, UART2, USB, SPI, reserved. */
+    if (len < 8 || payload[0] != msg_class || payload[1] != msg_id)
+        return false;
+
+    *rate_uart1 = payload[3];
+    return true;
 }
 
 /*
@@ -436,9 +710,9 @@ static bool ubx_start_survey_in(void)
         m[6+24]=acc&0xFF; m[6+25]=(acc>>8)&0xFF; m[6+26]=(acc>>16)&0xFF; m[6+27]=(acc>>24)&0xFF;
         ubx_cksum(m, sizeof(m));
         send_ubx(m, sizeof(m));
-        if (get_ubx_ack(m, 1500) == +1) {
+        if (get_ubx_ack(m, 1500, false) == +1) {
             gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                            "Timing: survey-in configuration accepted using TMODE2.");
+                            "Timing: survey-in start accepted using CFG-TMODE2.");
             return true;
         }
     }
@@ -457,9 +731,9 @@ static bool ubx_start_survey_in(void)
         m[6+24]=acc&0xFF; m[6+25]=(acc>>8)&0xFF; m[6+26]=(acc>>16)&0xFF; m[6+27]=(acc>>24)&0xFF;
         ubx_cksum(m, sizeof(m));
         send_ubx(m, sizeof(m));
-        if (get_ubx_ack(m, 1500) == +1) {
+        if (get_ubx_ack(m, 1500, false) == +1) {
             gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                            "Timing: survey-in configuration accepted using legacy TMODE.");
+                            "Timing: survey-in start accepted using legacy CFG-TMODE.");
             return true;
         }
     }
@@ -494,9 +768,9 @@ static bool ubx_start_survey_in(void)
         m[p++]=acc01&0xFF; m[p++]=(acc01>>8)&0xFF; m[p++]=(acc01>>16)&0xFF; m[p++]=(acc01>>24)&0xFF;
         ubx_cksum(m, sizeof(m));
         send_ubx(m, sizeof(m));
-        if (get_ubx_ack(m, 1500) == +1) {
+        if (get_ubx_ack(m, 1500, false) == +1) {
             gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                            "Timing: survey-in configuration accepted using VALSET.");
+                            "Timing: survey-in start accepted using CFG-VALSET.");
             return true;
         }
     }
@@ -732,122 +1006,352 @@ static void ubx_poll_svin_step(void)
 #endif /* GPSDO_GPS_TIMING */
 
 /*
- * ubx_config — send UBX-CFG-NAV5 (stationary navigation engine).
+ * CFG-NAV5 read-back and verification.
  *
- * Called AFTER ubx_reduce_nmea() has quietened the bus.
- * With only GGA+RMC running (~150 B/s) the 256-byte ring buffer can hold
- * ~1.7 s worth of data — far more than the ACK round-trip (~100 ms).
+ * Normal receiver configuration is deliberately volatile: this firmware does
+ * not issue CFG-CFG/save.  Each initialization reads the receiver's current
+ * NAV5 state, changes it only when needed, then polls it again and verifies the
+ * values actually in use.  Read-back is authoritative: an ACK with unchanged
+ * state is a failure, while a lost ACK followed by the requested state is OK.
+ */
+typedef struct {
+    uint8_t  dyn_model;
+    uint8_t  fix_mode;
+    int32_t  fixed_alt_cm;
+    uint32_t fixed_alt_var_1e4_m2;
+    int8_t   min_elev_deg;
+    uint16_t p_dop_x10;
+    uint16_t t_dop_x10;
+    uint16_t p_acc_m;
+    uint16_t t_acc_m;
+    uint8_t  static_hold_thresh_cm_s;
+    uint8_t  dgps_timeout_s;
+    uint8_t  cno_thresh_num_svs;
+    uint8_t  cno_thresh_dbhz;
+    uint16_t static_hold_max_dist_m;
+    uint8_t  utc_standard;
+} nav5_config_t;
+
+static uint16_t nav5_u16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t nav5_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static bool nav5_parse(const uint8_t *p, uint16_t len, nav5_config_t *cfg)
+{
+    if (!p || !cfg || len < 36) return false;
+
+    cfg->dyn_model               = p[2];
+    cfg->fix_mode                = p[3];
+    cfg->fixed_alt_cm            = (int32_t)nav5_u32(p + 4);
+    cfg->fixed_alt_var_1e4_m2    = nav5_u32(p + 8);
+    cfg->min_elev_deg            = (int8_t)p[12];
+    cfg->p_dop_x10               = nav5_u16(p + 14);
+    cfg->t_dop_x10               = nav5_u16(p + 16);
+    cfg->p_acc_m                 = nav5_u16(p + 18);
+    cfg->t_acc_m                 = nav5_u16(p + 20);
+    cfg->static_hold_thresh_cm_s = p[22];
+    cfg->dgps_timeout_s          = p[23];
+    cfg->cno_thresh_num_svs      = p[24];
+    cfg->cno_thresh_dbhz         = p[25];
+    cfg->static_hold_max_dist_m  = nav5_u16(p + 28);
+    cfg->utc_standard            = p[30];
+    return true;
+}
+
+static bool ubx_poll_nav5(nav5_config_t *cfg)
+{
+    uint8_t payload[36];
+    uint16_t len = 0;
+    if (!gnss_poll_message(0x06, 0x24, payload, sizeof(payload), &len, 700))
+        return false;
+    return nav5_parse(payload, len, cfg);
+}
+
+static bool nav5_matches(const nav5_config_t *a, const nav5_config_t *b)
+{
+    return a && b &&
+           a->dyn_model    == b->dyn_model &&
+           a->fix_mode     == b->fix_mode &&
+           a->min_elev_deg == b->min_elev_deg &&
+           a->p_dop_x10    == b->p_dop_x10 &&
+           a->t_dop_x10    == b->t_dop_x10 &&
+           a->p_acc_m      == b->p_acc_m &&
+           a->t_acc_m      == b->t_acc_m;
+}
+static const char *nav5_dyn_name(uint8_t v)
+{
+    switch (v) {
+    case 0: return "portable";
+    case 2: return "stationary";
+    case 3: return "pedestrian";
+    case 4: return "automotive";
+    case 5: return "sea";
+    case 6: return "airborne <1g";
+    case 7: return "airborne <2g";
+    case 8: return "airborne <4g";
+    case 9: return "wrist";
+    default: return NULL;
+    }
+}
+
+static const char *nav5_fix_name(uint8_t v)
+{
+    switch (v) {
+    case 1: return "2D only";
+    case 2: return "3D only";
+    case 3: return "automatic 2D/3D";
+    default: return NULL;
+    }
+}
+
+static void nav5_fmt_named(char *buf, size_t cap, uint8_t v,
+                           const char *(*name_fn)(uint8_t))
+{
+    const char *name = name_fn(v);
+    if (name) snprintf(buf, cap, "%s", name);
+    else      snprintf(buf, cap, "value %u", (unsigned)v);
+}
+
+static void nav5_fmt_u32(char *buf, size_t cap, uint32_t v, const char *unit)
+{
+    if (unit && unit[0]) snprintf(buf, cap, "%lu %s", (unsigned long)v, unit);
+    else                 snprintf(buf, cap, "%lu", (unsigned long)v);
+}
+
+static void nav5_fmt_i32(char *buf, size_t cap, int32_t v, const char *unit)
+{
+    if (unit && unit[0]) snprintf(buf, cap, "%ld %s", (long)v, unit);
+    else                 snprintf(buf, cap, "%ld", (long)v);
+}
+
+static void nav5_fmt_tenths(char *buf, size_t cap, uint16_t v)
+{
+    snprintf(buf, cap, "%u.%u", (unsigned)(v / 10u), (unsigned)(v % 10u));
+}
+
+
+
+static void nav5_log_result(const char *label,
+                            const char *before, bool had_before, bool before_ok,
+                            const char *wanted,
+                            const char *after, bool have_after, bool after_ok)
+{
+    if (had_before && before_ok) {
+        if (have_after && after_ok) {
+            gpsdo_logf(GPSDO_LOG_INFO, "GPS", "%s: %s - already set.",
+                       label, wanted);
+        } else if (have_after) {
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "%s: was %s - FAILED (now %s).",
+                       label, wanted, after);
+        } else {
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "%s: was already %s - FAILED (read-back unavailable).",
+                       label, wanted);
+        }
+        return;
+    }
+
+    if (!have_after) {
+        if (had_before) {
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "%s: set from %s to %s - FAILED (read-back unavailable).",
+                       label, before, wanted);
+        } else {
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "%s: wanted %s - FAILED (read-back unavailable).",
+                       label, wanted);
+        }
+        return;
+    }
+
+    if (after_ok) {
+        if (had_before) {
+            gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                       "%s: set from %s to %s - OK.",
+                       label, before, wanted);
+        } else {
+            gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                       "%s: %s - verified.", label, wanted);
+        }
+    } else {
+        if (had_before) {
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "%s: set from %s to %s - FAILED (still %s).",
+                       label, before, wanted, after);
+        } else {
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "%s: wanted %s - FAILED (read back %s).",
+                       label, wanted, after);
+        }
+    }
+}
+
+static void nav5_log_comparison(const nav5_config_t *before, bool had_before,
+                                const nav5_config_t *wanted,
+                                const nav5_config_t *after, bool have_after)
+{
+    char b[48], w[48], a[48];
+
+#define NAV5_LOG_U32(label, field, unit) do { \
+        nav5_fmt_u32(b, sizeof(b), had_before ? (uint32_t)before->field : 0u, unit); \
+        nav5_fmt_u32(w, sizeof(w), (uint32_t)wanted->field, unit); \
+        nav5_fmt_u32(a, sizeof(a), have_after ? (uint32_t)after->field : 0u, unit); \
+        nav5_log_result(label, b, had_before, had_before && before->field == wanted->field, \
+                        w, a, have_after, have_after && after->field == wanted->field); \
+    } while (0)
+
+    nav5_fmt_named(b, sizeof(b), had_before ? before->dyn_model : 0, nav5_dyn_name);
+    nav5_fmt_named(w, sizeof(w), wanted->dyn_model, nav5_dyn_name);
+    nav5_fmt_named(a, sizeof(a), have_after ? after->dyn_model : 0, nav5_dyn_name);
+    nav5_log_result("Dynamic model", b, had_before,
+                    had_before && before->dyn_model == wanted->dyn_model,
+                    w, a, have_after,
+                    have_after && after->dyn_model == wanted->dyn_model);
+
+    nav5_fmt_named(b, sizeof(b), had_before ? before->fix_mode : 0, nav5_fix_name);
+    nav5_fmt_named(w, sizeof(w), wanted->fix_mode, nav5_fix_name);
+    nav5_fmt_named(a, sizeof(a), have_after ? after->fix_mode : 0, nav5_fix_name);
+    nav5_log_result("Fix mode", b, had_before,
+                    had_before && before->fix_mode == wanted->fix_mode,
+                    w, a, have_after,
+                    have_after && after->fix_mode == wanted->fix_mode);
+
+    nav5_fmt_i32(b, sizeof(b), had_before ? before->min_elev_deg : 0, "deg");
+    nav5_fmt_i32(w, sizeof(w), wanted->min_elev_deg, "deg");
+    nav5_fmt_i32(a, sizeof(a), have_after ? after->min_elev_deg : 0, "deg");
+    nav5_log_result("Minimum elevation", b, had_before,
+                    had_before && before->min_elev_deg == wanted->min_elev_deg,
+                    w, a, have_after,
+                    have_after && after->min_elev_deg == wanted->min_elev_deg);
+
+    nav5_fmt_tenths(b, sizeof(b), had_before ? before->p_dop_x10 : 0);
+    nav5_fmt_tenths(w, sizeof(w), wanted->p_dop_x10);
+    nav5_fmt_tenths(a, sizeof(a), have_after ? after->p_dop_x10 : 0);
+    nav5_log_result("Position DOP limit", b, had_before,
+                    had_before && before->p_dop_x10 == wanted->p_dop_x10,
+                    w, a, have_after,
+                    have_after && after->p_dop_x10 == wanted->p_dop_x10);
+
+    nav5_fmt_tenths(b, sizeof(b), had_before ? before->t_dop_x10 : 0);
+    nav5_fmt_tenths(w, sizeof(w), wanted->t_dop_x10);
+    nav5_fmt_tenths(a, sizeof(a), have_after ? after->t_dop_x10 : 0);
+    nav5_log_result("Time DOP limit", b, had_before,
+                    had_before && before->t_dop_x10 == wanted->t_dop_x10,
+                    w, a, have_after,
+                    have_after && after->t_dop_x10 == wanted->t_dop_x10);
+
+    NAV5_LOG_U32("Position accuracy limit", p_acc_m, "m");
+    NAV5_LOG_U32("Time accuracy limit", t_acc_m, "m");
+
+#undef NAV5_LOG_U32
+}
+/*
+ * ubx_config — establish and verify UBX-CFG-NAV5 runtime configuration.
  *
- * Strategy:
- *   Attempt 1: standard CFG-NAV5 (full mask 0xFFFF), 1500 ms timeout.
- *   On NAK:    retry with dynModel-only mask (0x0001) — handles stripped fw.
- *   On timeout: try once more with minimal mask, 1500 ms.
- *   After that:  give up gracefully (non-fatal — GPSDO works without this).
- *
- * The GY-NEO6MV2 APM/FC firmware variant silently drops CFG-NAV5 even
- * when UBX communication is verified working (CFG-MSG ACKs fine). This
- * is a known firmware restriction. The GPSDO operates correctly without
- * stationary mode; OCXO discipline and 1PPS are unaffected.
+ * The initial poll is read-only. If every requested value is already present,
+ * nothing is written. Otherwise the full NAV5 configuration is attempted and
+ * then read back. If the stationary dynamic model still did not take, retry
+ * with the dynModel-only mask used by stripped/locked receiver firmware.
  */
 static bool ubx_config(void)
 {
-    /* UBX-CFG-NAV5 stationary mode — 44-byte frame, CK_A=0x12 CK_B=0x54
-     *
-     * Previous frame was CORRUPTED: payload was 38 bytes instead of 36.
-     * Two extra bytes (0x10,0x27,0x00,0x00) appeared after dgpsTimeOut —
-     * a duplicate of the fixedAltVar field that was mistakenly included
-     * as "reserved". The module performs checksum verification FIRST; a
-     * checksum mismatch causes silent discard with NO ACK and NO NAK,
-     * which is why all 3 attempts timed out.
-     *
-     * CFG-NAV5 v0 payload fields per u-blox protocol spec 7.01 p.106:
-     *   [0-1]   mask              0xFFFF  (apply all fields)
-     *   [2]     dynModel          2       (stationary)
-     *   [3]     fixMode           3       (auto 2D/3D)
-     *   [4-7]   fixedAlt          0
-     *   [8-11]  fixedAltVar       10000   (1.0 m²)
-     *   [12]    minElev           5 deg
-     *   [13]    drLimit           0       (reserved, must be 0)
-     *   [14-15] pDop              250     (25.0)
-     *   [16-17] tDop              250     (25.0)
-     *   [18-19] pAcc              100 m
-     *   [20-21] tAcc              300 m
-     *   [22]    staticHoldThresh  0
-     *   [23]    dgpsTimeOut       0
-     *   [24]    cnoThreshNumSVs   0       ← was MISSING (caused 2-byte overrun)
-     *   [25]    cnoThresh         0       ← was MISSING
-     *   [26-27] reserved2         0
-     *   [28-29] staticHoldMaxDist 0
-     *   [30]    utcStandard       0
-     *   [31]    reserved3         0
-     *   [32-35] reserved4         0
-     * Total payload: 36 bytes  Header+length: 6  Checksum: 2  Frame: 44 bytes
-     *
-     * Checksum computed by ubx_cksum() over bytes [2..41] (class through
-     * last payload byte), verified by independent Python calculation.
-     */
-    static const uint8_t setNav[44] = {
+    /* Only apply settings this GPSDO deliberately depends on.
+     * CFG-NAV5 mask 0x0037 = dyn | minEl | posFixMode | posMask | timeMask.
+     * Everything else remains receiver-owned and is not treated as a failure. */
+    uint8_t setNav[44] = {
         0xB5, 0x62,                         /* UBX sync chars               */
         0x06, 0x24,                         /* class CFG, id NAV5           */
         0x24, 0x00,                         /* payload length = 36          */
-        0xFF, 0xFF,                         /* mask: apply all fields        */
-        0x02,                               /* dynModel = 2 (stationary)     */
-        0x03,                               /* fixMode  = 3 (auto 2D/3D)    */
-        0x00, 0x00, 0x00, 0x00,             /* fixedAlt = 0                 */
-        0x10, 0x27, 0x00, 0x00,             /* fixedAltVar = 10000          */
+        0x37, 0x00,                         /* mask: relevant fields only   */
+        0x02,                               /* dynModel = stationary        */
+        0x03,                               /* fixMode = auto 2D/3D         */
+        0x00, 0x00, 0x00, 0x00,             /* fixedAlt = 0 cm (2D-only)    */
+        0x10, 0x27, 0x00, 0x00,             /* fixedAltVar = 1 m^2           */
         0x05,                               /* minElev = 5 deg              */
-        0x00,                               /* drLimit = 0 (reserved)       */
-        0xFA, 0x00,                         /* pDop = 250 (25.0)            */
-        0xFA, 0x00,                         /* tDop = 250 (25.0)            */
+        0x00,                               /* drLimit: reserved            */
+        0xFA, 0x00,                         /* pDop = 25.0                  */
+        0xFA, 0x00,                         /* tDop = 25.0                  */
         0x64, 0x00,                         /* pAcc = 100 m                 */
         0x2C, 0x01,                         /* tAcc = 300 m                 */
-        0x00,                               /* staticHoldThresh = 0 cm/s    */
-        0x00,                               /* dgpsTimeOut = 0 s            */
-        0x00, 0x00,                         /* cnoThreshNumSVs=0, cnoThresh=0 */
-        0x00, 0x00,                         /* reserved2                    */
-        0x00, 0x00,                         /* staticHoldMaxDist = 0 m      */
-        0x00,                               /* utcStandard = 0              */
-        0x00,                               /* reserved3                    */
-        0x00, 0x00, 0x00, 0x00,             /* reserved4                    */
-        0x12, 0x54                          /* CK_A, CK_B (verified)        */
+        0x00,                               /* static hold: not applied     */
+        0x00,                               /* DGNSS timeout: not applied   */
+        0x00, 0x00,                         /* C/N0 threshold: not applied  */
+        0x00, 0x00,                         /* reserved                     */
+        0x00, 0x00,                         /* static-hold distance: ignored*/
+        0x00,                               /* UTC standard: not applied    */
+        0x00,                               /* reserved                     */
+        0x00, 0x00, 0x00, 0x00,             /* reserved                     */
+        0x00, 0x00                          /* checksum filled below        */
     };
+    ubx_cksum(setNav, sizeof(setNav));
 
-    send_ubx(setNav, sizeof(setNav));
-    int8_t r = get_ubx_ack(setNav, 1500);
+    nav5_config_t wanted = {};
+    if (!nav5_parse(setNav + 6, 36, &wanted)) {
+        gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                        "Internal NAV5 configuration could not be decoded.");
+        return false;
+    }
 
-    if (r == +1) {
-        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                        "Stationary-mode configuration accepted.");
+    nav5_config_t before = {};
+    bool had_before = ubx_poll_nav5(&before);
+
+    if (had_before && nav5_matches(&before, &wanted)) {
+        nav5_log_comparison(&before, true, &wanted, &before, true);
         return true;
     }
 
-    if (r == -1 || r == 0) {
-        const char *why = (r == -1) ? "NAK" : "timeout";
-        gpsdo_logf(GPSDO_LOG_WARN, "GPS",
-                   "Stationary-mode configuration failed (%s); "
-                   "retrying with reduced settings.", why);
+    /* Read-back, not ACK, is authoritative for NAV5. Suppress a raw NAK here:
+     * if the receiver already ends up with the requested values there is no
+     * operator-facing problem to warn about. */
+    send_ubx(setNav, sizeof(setNav));
+    (void)get_ubx_ack(setNav, 1500, false);
 
-        /* Minimal mask: apply dynModel field only */
+    nav5_config_t after = {};
+    bool have_after = ubx_poll_nav5(&after);
+
+    if (have_after && nav5_matches(&after, &wanted)) {
+        nav5_log_comparison(&before, had_before, &wanted, &after, true);
+        return true;
+    }
+
+    /* Preserve the compatibility fallback for the one setting that matters
+     * most to a stationary GPSDO. */
+    bool need_dyn_retry = !have_after || after.dyn_model != wanted.dyn_model;
+    if (need_dyn_retry) {
         uint8_t setNavMin[sizeof(setNav)];
         memcpy(setNavMin, setNav, sizeof(setNav));
-        setNavMin[6] = 0x01; setNavMin[7] = 0x00;
+        setNavMin[6] = 0x01;
+        setNavMin[7] = 0x00;                 /* mask: dynModel only */
         ubx_cksum(setNavMin, sizeof(setNavMin));
         flush_rx(50);
         send_ubx(setNavMin, sizeof(setNavMin));
-        int8_t r2 = get_ubx_ack(setNavMin, 1500);
-        if (r2 == +1) {
-            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                            "Reduced stationary-mode configuration accepted.");
-            return true;
+        (void)get_ubx_ack(setNavMin, 1500, false);
+
+        nav5_config_t final_cfg = {};
+        if (ubx_poll_nav5(&final_cfg)) {
+            after = final_cfg;
+            have_after = true;
         }
-        gpsdo_logf(GPSDO_LOG_WARN, "GPS",
-                   "Reduced stationary-mode configuration also failed (%s).",
-                   r2 == -1 ? "rejected" : "no response");
     }
 
-    gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
-                    "Stationary mode could not be configured; position filtering may be less stable");
-    return false;
+    if (!have_after) {
+        gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
+                        "Navigation configuration could not be verified by read-back.");
+        return false;
+    }
+
+    nav5_log_comparison(&before, had_before, &wanted, &after, true);
+    return nav5_matches(&after, &wanted);
 }
 #endif /* UBX_CONFIG */
 
@@ -1328,15 +1832,10 @@ static uint32_t detect_gps_baud(void)
          * MON-VER is best-effort identification; failure does not undo
          * the valid NMEA detection.
          */
-        if (ubx_poll_mon_ver()) {
-            if (s_gnss_info.model[0]) {
-                gpsdo_logf(GPSDO_LOG_INFO, "GPS",
-                        "Receiver: %s.", s_gnss_info.model);
-            } else {
-                gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                                "UBX receiver detected.");
-            }
-        }
+        /* Best-effort identity poll. Keep detection quiet here; the
+         * detailed identity block later in initialization is the single
+         * user-facing receiver result. */
+        (void)ubx_poll_mon_ver();
         return nmea;
     }
 
@@ -1354,18 +1853,9 @@ static uint32_t detect_gps_baud(void)
 
         if (ubx_poll_mon_ver()) {
             s_gnss_info.baud = baud;
-
-            if (s_gnss_info.model[0]) {
-                gpsdo_logf(GPSDO_LOG_INFO, "GPS",
-                        "Receiver: %s at %lu baud.",
-                        s_gnss_info.model,
-                        (unsigned long)baud);
-            } else {
-                gpsdo_logf(GPSDO_LOG_INFO, "GPS",
-                        "UBX receiver detected at %lu baud.",
-                        (unsigned long)baud);
-            }
-
+            gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                       "UBX traffic detected at %lu baud.",
+                       (unsigned long)baud);
             return baud;
         }
 
@@ -1437,7 +1927,15 @@ void gpsdo_gps_init(void)
     /* Ensure Serial1 is open at the confirmed working baud */
     Serial1.end();
     Serial1.begin(working_baud);
-    flush_rx(150);   /* drain NMEA that arrived during port reopen */
+    flush_rx(150);
+
+    /* Read-only identity poll at the confirmed receiver baud. */
+    if (ubx_poll_mon_ver()) {
+        gnss_log_detailed_identity();
+    } else {
+        gpsdo_log_event(GPSDO_LOG_WARN,"GPS",
+                        "Receiver speaks UBX, but MON-VER identification did not reply.");
+    }
 
 #ifdef GPSDO_FAKE_UBLOX
     /* Chinese u-blox clones (navigation-grade M8N copies and friends)
@@ -1516,9 +2014,18 @@ void gpsdo_gps_init(void)
             uint32_t d0 = 0, a0 = 0;
             bool v0 = false, act0 = false;
 
-            bool got = ubx_poll_svin(&d0, &a0, &v0, &act0);
-            if (!got)
-                got = ubx_poll_svin_nav(&d0, &a0, &v0, &act0);
+            bool got = false;
+            for (uint8_t attempt = 0; attempt < 2 && !got; ++attempt) {
+                got = ubx_poll_svin(&d0, &a0, &v0, &act0);
+                if (!got)
+                    got = ubx_poll_svin_nav(&d0, &a0, &v0, &act0);
+
+                /* A busy receiver can miss one status poll immediately after
+                 * configuration. Do not interpret a single miss as "no survey
+                 * is running" and then unnecessarily re-issue Time Mode. */
+                if (!got && attempt == 0)
+                    delay(100);
+            }
 
             if (got && v0 && !act0) {
                 timing_state_known = true;
@@ -1553,9 +2060,6 @@ void gpsdo_gps_init(void)
 
         if (!timing_state_known) {
             if (ubx_start_survey_in()) {
-                gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                                "Timing: survey-in started.");
-
                 g_svin_active  = true;
                 g_svin_pending = true;
                 g_svin_dur     = 0;
@@ -1601,8 +2105,8 @@ void gpsdo_gps_init(void)
 
                 } else {
                     gpsdo_log_event(
-                        GPSDO_LOG_WARN, "GPS",
-                        "Timing: survey-in could not be started or confirmed.");
+                        GPSDO_LOG_INFO, "GPS",
+                        "Timing: survey-in unavailable; timing will use the live navigation position.");
 
                     g_svin_active  = false;
                     g_svin_pending = false;
@@ -1617,9 +2121,6 @@ void gpsdo_gps_init(void)
     /* ---- Step 3: optional upgrade to 38400 ---- */
 #ifdef GPSDO_PREFER_38400
     if (working_baud != 38400) {
-        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                        "Trying 38400 baud for faster receiver communication...");
-
         /* Suppress VTG to reduce traffic during switch */
         Serial1.print("$PUBX,40,VTG,0,0,0,0,0,0*5E\r\n");
         Serial1.flush();
@@ -1652,8 +2153,9 @@ void gpsdo_gps_init(void)
         flush_rx(50);
 
         if (switched) {
-            gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                            "Receiver serial speed is now 38400 baud.");
+            gpsdo_logf(GPSDO_LOG_INFO, "GPS",
+                       "Receiver serial speed changed from %lu to 38400 baud.",
+                       (unsigned long)working_baud);
             /* If ubx_config failed at the original baud, retry at 38400 */
             if (!cfg_ok) {
                 gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
@@ -1662,8 +2164,9 @@ void gpsdo_gps_init(void)
             }
         } else {
             /* Switch did not take — fall back to working_baud */
-            gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
-                            "Receiver did not switch to 38400 baud; keeping the previous serial speed.");
+            gpsdo_logf(GPSDO_LOG_WARN, "GPS",
+                       "Receiver serial speed remains at %lu baud; change to 38400 was not accepted.",
+                       (unsigned long)working_baud);
             Serial1.end();
             Serial1.begin(working_baud);
             flush_rx(100);
@@ -1682,16 +2185,85 @@ void gpsdo_gps_init(void)
                (unsigned long)working_baud);
 #endif /* GPSDO_UBX_CONFIG */
 
-    /* Enable UBX-TIM-TP (0x0D 0x01) so we receive per-pulse qErr for the
-     * sawtooth correction. Harmless if unused; the sniffer only acts on it
-     * when SAW is on. Works on 6T/M8T/F9T (same message id). */
-    if (ubx_send_cfg_msg(0x0D, 0x01, 1))
-        gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
-                        "Timing: sawtooth correction enabled (TIM-TP).");
-    else
-        gpsdo_log_event(GPSDO_LOG_WARN, "GPS",
-                        "Timing: sawtooth correction could not be enabled; "
-                        "receiver may not support TIM-TP.");
+    /*
+     * TIM-TP carries qErr for the firmware's sawtooth correction.
+     *
+     * Do not use an early TIM-TP poll as a capability test: a genuine timing
+     * receiver may support TIM-TP but have no sample ready yet. First inspect
+     * the configured UART1 output rate. If output is enabled, wait briefly for
+     * a real sample. If output is disabled, enable it and verify the setting.
+     */
+    {
+        uint8_t tim_tp_rate = 0;
+        bool rate_known =
+            ubx_poll_cfg_msg_uart1_rate(0x0D, 0x01, &tim_tp_rate);
+
+        int32_t qerr_ps = 0;
+        bool sample_seen = false;
+
+        if (rate_known && tim_tp_rate > 0) {
+            sample_seen = gnss_wait_tim_tp_qerr(&qerr_ps, 1500);
+            if (!sample_seen)
+                sample_seen = gnss_poll_tim_tp_qerr(&qerr_ps);
+
+            if (sample_seen) {
+                gpsdo_logf(
+                    GPSDO_LOG_INFO, "GPS",
+                    "Timing: TIM-TP periodic output already available (qErr sample %ld ps).",
+                    (long)qerr_ps);
+            } else {
+                gpsdo_log_event(
+                    GPSDO_LOG_INFO, "GPS",
+                    "Timing: TIM-TP periodic output is enabled; qErr sample not available yet.");
+            }
+        } else {
+            /*
+             * Some compatible receivers do not answer CFG-MSG read-back.
+             * Before changing anything, check whether TIM-TP is already
+             * streaming anyway.
+             */
+            if (!rate_known)
+                sample_seen = gnss_wait_tim_tp_qerr(&qerr_ps, 1500);
+
+            if (sample_seen) {
+                gpsdo_logf(
+                    GPSDO_LOG_INFO, "GPS",
+                    "Timing: TIM-TP periodic output already available (qErr sample %ld ps).",
+                    (long)qerr_ps);
+            } else if (!ubx_send_cfg_msg(0x0D, 0x01, 1)) {
+                gpsdo_log_event(
+                    GPSDO_LOG_WARN, "GPS",
+                    "Timing: TIM-TP periodic output could not be enabled; qErr correction will not be used.");
+            } else {
+                uint8_t verify_rate = 0;
+                bool rate_verified =
+                    ubx_poll_cfg_msg_uart1_rate(0x0D, 0x01, &verify_rate) &&
+                    verify_rate > 0;
+
+                int32_t verify_qerr_ps = 0;
+                bool sample_verified =
+                    gnss_wait_tim_tp_qerr(&verify_qerr_ps, 1500);
+                if (!sample_verified)
+                    sample_verified =
+                        gnss_poll_tim_tp_qerr(&verify_qerr_ps);
+
+                if (sample_verified) {
+                    gpsdo_logf(
+                        GPSDO_LOG_INFO, "GPS",
+                        "Timing: TIM-TP periodic output enabled and verified (qErr sample %ld ps).",
+                        (long)verify_qerr_ps);
+                } else if (rate_verified) {
+                    gpsdo_log_event(
+                        GPSDO_LOG_INFO, "GPS",
+                        "Timing: TIM-TP periodic output enabled; qErr sample not available yet.");
+                } else {
+                    gpsdo_log_event(
+                        GPSDO_LOG_WARN, "GPS",
+                        "Timing: TIM-TP output change was accepted, but periodic output could not be verified.");
+                }
+            }
+        }
+    }
 
     gpsdo_log_event(GPSDO_LOG_INFO, "GPS",
                     "Initialization complete.");
