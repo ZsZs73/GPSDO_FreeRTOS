@@ -3146,16 +3146,22 @@ void vDisplayTask(void *pvParameters)
      * auto-holdover alarm LED blink. */
     bool     fast_led_active = false;
 
+    /* Telemetry has its own simple 1 Hz MCU-clock cadence. */
+    uint32_t last_report_ms = millis();
+
     for (;;)
     {
-        /* Wait for PPS notification from FreqRelayTask, or fall through
-         * after a timeout so the display doesn't freeze without GPS.
-         * During LED spinner animations we wake every 150 ms for smooth
-         * updates. During auto-holdover we wake every 100 ms so the
-         * 200 ms alarm LED blink can be timed accurately. Otherwise the
-         * display task keeps its normal slow 1100 ms cadence. */
+        /* Display updates may still be woken early by task notifications or
+         * animations. Never sleep past the next 1 Hz telemetry tick. */
         bool anim_active = g_warmup_active || g_svin_active || g_calib_active;
         uint32_t wake_ms = fast_led_active ? 100 : (anim_active ? 150 : 1100);
+
+        uint32_t report_elapsed_ms = millis() - last_report_ms;
+        uint32_t report_wait_ms =
+            (report_elapsed_ms >= 1000u) ? 1u : (1000u - report_elapsed_ms);
+        if (report_wait_ms < wake_ms)
+            wake_ms = report_wait_ms;
+
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wake_ms));
 
         /* ---- Snapshot shared state ---- */
@@ -3252,17 +3258,13 @@ void vDisplayTask(void *pvParameters)
 #else
         bool tunnel_mute = false;
 #endif
-        if (!g_report_paused && !tunnel_mute) {
-            /* Emit the serial report ONCE PER PPS. vDisplayTask is notified
-             * from two ~1 Hz sources — the frequency relay (per PPS) and the
-             * GPS parser (per time sentence) — so with a fix it wakes twice a
-             * second and used to print two report lines per second (spotted by
-             * Dan Wiering in RD mode). The display refresh below still runs on
-             * every wake for smoothness; only the serial line is gated, on a
-             * change of the PPS counter. */
-            static uint32_t s_last_report_pps = 0xFFFFFFFFu;
-            if (snap_f.ppscount != s_last_report_pps) {
-                s_last_report_pps = snap_f.ppscount;
+        /* Telemetry is paced only by the MCU clock: one report per second.
+         * PPS, GPS state and holdover affect the data, never the report cadence. */
+        uint32_t report_now_ms = millis();
+        if ((report_now_ms - last_report_ms) >= 1000u) {
+            last_report_ms = report_now_ms;
+
+            if (!g_report_paused && !tunnel_mute) {
                 if (bits & EVT_REPORT_TAB)
                     print_tab_report  (&snap_g, &snap_f, &snap_c, &snap_u);
                 else
