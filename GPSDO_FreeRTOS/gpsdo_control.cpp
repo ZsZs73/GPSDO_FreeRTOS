@@ -1153,7 +1153,7 @@ static void do_ltic_calibrate(void)
         }
     }
     if (falling)
-        OUT_SERIAL.println("LC: falling transit (interval shrinks as frequency rises) — check LPOL sign");
+        OUT_SERIAL.println("LC: falling detector transit.");
     double range_ns = 0.0, nsv = 0.0, zero_off = (double)vlow + 0.5 * span;
     bool transit_ok = (t90 > t10) && (t90 - t10) >= 5;
     if (transit_ok && fabs(phase_rate) > 0.1)
@@ -1321,8 +1321,31 @@ static void do_ltic_calibrate(void)
         bool span_sane = span > 0.30 && span <= 3.4;   /* ramp: expect ~1.5-3 V */
         bool nsv_sane  = nsv > 20.0 && nsv < 5000.0;
         if (span_sane && transit_ok && nsv_sane && rate_measured) {
+            /* LC measures both signs independently:
+             *   phase_rate : dPhase/dt from the frequency measurement
+             *   falling    : sign of dV/dt from the detector transit
+             *
+             * sign(dPhase/dV) is therefore the detector polarity.  Only a
+             * fully passing LC may replace a previously known polarity. */
+            const int8_t detected_polarity =
+                ((phase_rate < 0.0) != falling) ? -1 : +1;
+
+            g_ltic.polarity = detected_polarity;
+
+            OUT_SERIAL.print("LC: polarity ");
+            OUT_SERIAL.print((int)g_ltic.polarity);
+            OUT_SERIAL.println(" detected.");
+            /* REC_LIVE owns the changing LC/live state, but polarity is
+             * still a REC_SETTINGS field in the current v7 layout. Save both
+             * until v8 moves hardware calibration into REC_HW_CAL. */
             live_store_request_save();
-            OUT_SERIAL.println("LC: PASSED — clean ramp transit at a measured rate; auto-saved to flash ring.");
+            const bool ltic_settings_saved =
+                settings_save_partial(SET_LTIC);
+
+            if (ltic_settings_saved)
+                OUT_SERIAL.println("LC: PASSED — detector calibration and polarity auto-saved to flash ring.");
+            else
+                OUT_SERIAL.println("LC: PASSED — detector calibrated, but polarity save FAILED; run 'ES LTIC'.");
         } else {
             OUT_SERIAL.print("LC: WEAK result — ");
             if (!span_sane)     OUT_SERIAL.print("voltage span too small; ");
