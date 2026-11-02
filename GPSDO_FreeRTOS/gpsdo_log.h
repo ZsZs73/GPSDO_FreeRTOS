@@ -50,6 +50,12 @@ void gpsdo_log_event(gpsdo_log_level_t level,
  */
 /* Human-facing log message. The LOG1/timestamp/level/subsystem envelope stays
  * structured; fmt is normal operator-readable text. */
+/* Supply a trusted UTC observation to the logger.
+ * Once set, LOG1 timestamps free-run from millis() between GPS updates and
+ * remain available if GPS position or the NMEA stream is later lost. */
+void gpsdo_log_set_utc(uint16_t year, uint8_t month, uint8_t day,
+                       uint8_t hour, uint8_t minute, uint8_t second);
+
 void gpsdo_logf(gpsdo_log_level_t level,
                 const char *subsystem,
                 const char *fmt, ...)

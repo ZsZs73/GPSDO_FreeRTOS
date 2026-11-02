@@ -1559,6 +1559,19 @@ void vGpsTask(void *pvParameters)
                 xSemaphoreGive(xGpsMutex);
             }
 
+            /* Feed the central event logger from the receiver's trusted UTC.
+             * The logger maintains this time from millis() between updates, so
+             * LOG1 timestamps survive position loss and complete NMEA loss. */
+            if (time_fresh && gps.time.isValid() && gps.date.isValid()) {
+                gpsdo_log_set_utc(
+                    (uint16_t)gps.date.year(),
+                    (uint8_t)gps.date.month(),
+                    (uint8_t)gps.date.day(),
+                    (uint8_t)gps.time.hour(),
+                    (uint8_t)gps.time.minute(),
+                    (uint8_t)gps.time.second());
+            }
+
             /*
              * Notify DisplayTask at most once per second.
              * Without this guard, multiple NMEA sentences decoded in one
