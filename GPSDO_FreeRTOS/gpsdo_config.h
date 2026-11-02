@@ -531,11 +531,10 @@ extern "C" {
 #define CIRCBUF_SIZE     20000u
 
 /* ── Timing ──────────────────────────────────────────────────────────── */
+#define OCXO_WARMUP_SECS      300u
 #ifdef GPSDO_FASTBOOT
-  #define OCXO_WARMUP_SECS     90u
   #define OCXO_CALIB_SECS      15u
 #else
-  #define OCXO_WARMUP_SECS    300u
   #define OCXO_CALIB_SECS      60u
 #endif
 #define TUNNEL_TIMEOUT_SECS 300u

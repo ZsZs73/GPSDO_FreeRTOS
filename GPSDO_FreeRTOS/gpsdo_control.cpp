@@ -22,6 +22,7 @@
 #include "gpsdo_dac.h"
 #include "gpsdo_health.h"
 #include "gpsdo_state.h"
+#include "gpsdo_log.h"
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
 #include "gpsdo_algorithms.h"
@@ -1361,51 +1362,100 @@ static void do_ltic_calibrate(void)
 /* ---- OCXO warmup ------------------------------------------------------ */
 static void do_warmup(void)
 {
-    OUT_SERIAL.print("OCXO warming up, "); OUT_SERIAL.print(OCXO_WARMUP_SECS); OUT_SERIAL.println("s");
-    g_warmup_active = true;
-    /* vTaskDelayUntil (not vTaskDelay) so each tick is a true 1 s apart: the
-     * ADC sampling below plus any preemption would otherwise be ADDED to the
-     * delay, and the countdown would run slower than the clock — 300 displayed
-     * seconds taking noticeably longer than 300 real ones. */
-    TickType_t wake = xTaskGetTickCount();
-    for (uint16_t i = OCXO_WARMUP_SECS; i > 0; i--) {
-        g_warmup_remaining = i;
-        /* Keep the analogue readings live while we wait. Warmup runs BEFORE the
-         * control task's main loop, which is where Vctl/Vcc/Vdd are normally
-         * sampled — so without this the displays showed 0.000 V for the whole
-         * warmup (the ADC averages had never been filled). Same pattern as
-         * wait_secs_pwm() uses during calibration. */
-        vTaskSuspendAll();
-        int16_t wu_vctl = movavg_update(&s_avg_vctl,
-                                read_vctl_adc_settled());
+    /* OCXO warmup pre-check.
+     * ControlTask starts at a higher priority than SensorTask, so give the
+     * sensor task a brief chance to publish its first temperature before
+     * deciding that the oscillator is cold. Usually this takes one yield;
+     * one second is only the safety ceiling if the reading is unavailable. */
+    extern float g_ocxo_temp;
+    const float OCXO_WARM_TEMP_C = 51.0f;
+
+    for (uint8_t n = 0; n < 20u && g_ocxo_temp == 0.0f; n++)
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+    bool warmup_ended_hot = (g_ocxo_temp >= OCXO_WARM_TEMP_C);
+
+    if (!warmup_ended_hot) {
+        gpsdo_logf(GPSDO_LOG_INFO, "OCXO",
+                   "Warming up; maximum %us.",
+                   (unsigned)OCXO_WARMUP_SECS);
+        g_warmup_active = true;
+
+        /* vTaskDelayUntil (not vTaskDelay) so each tick is a true 1 s apart: the
+         * ADC sampling below plus any preemption would otherwise be ADDED to the
+         * delay, and the countdown would run slower than the clock — 300 displayed
+         * seconds taking noticeably longer than 300 real ones. */
+        TickType_t wake = xTaskGetTickCount();
+
+        for (uint16_t i = OCXO_WARMUP_SECS; i > 0; i--) {
+            g_warmup_remaining = i;
+
+            /* Temperature is the authority. A warm reboot should not
+             * force an already-hot 53 C oscillator through the fixed
+             * startup delay again. Zero/unavailable temperature simply
+             * leaves the original countdown as the safety fallback. */
+            if (g_ocxo_temp >= OCXO_WARM_TEMP_C) {
+                warmup_ended_hot = true;
+                break;
+            }
+
+            /* Keep the analogue readings live while we wait. Warmup runs BEFORE the
+             * control task's main loop, which is where Vctl/Vcc/Vdd are normally
+             * sampled — so without this the displays showed 0.000 V for the whole
+             * warmup (the ADC averages had never been filled). Same pattern as
+             * wait_secs_pwm() uses during calibration. */
+            vTaskSuspendAll();
+            int16_t wu_vctl = movavg_update(&s_avg_vctl,
+                                            read_vctl_adc_settled());
 #ifdef GPSDO_VCC
-        int16_t wu_vcc = movavg_update(&s_avg_vcc,
-                                       (int16_t)analogRead(PIN_VCC_DIV2));
+            int16_t wu_vcc = movavg_update(&s_avg_vcc,
+                                           (int16_t)analogRead(PIN_VCC_DIV2));
 #endif
 #ifdef GPSDO_VDD
-        int16_t wu_vdd  = movavg_update(&s_avg_vdd,
-                              (int16_t)analogRead(AVREF));
+            int16_t wu_vdd = movavg_update(&s_avg_vdd,
+                                           (int16_t)analogRead(AVREF));
 #endif
-        xTaskResumeAll();
-        if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            gCtrl.avg_vctl_adc = wu_vctl;
+            xTaskResumeAll();
+
+            if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                gCtrl.avg_vctl_adc = wu_vctl;
 #ifdef GPSDO_VCC
-            gCtrl.avg_vcc_adc  = wu_vcc;
+                gCtrl.avg_vcc_adc = wu_vcc;
 #endif
 #ifdef GPSDO_VDD
-            gCtrl.avg_vdd_adc  = wu_vdd;
+                gCtrl.avg_vdd_adc = wu_vdd;
 #endif
-            xSemaphoreGive(xCtrlMutex);
-        }
-        vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
-        if ((i % 30) == 0) {
-            OUT_SERIAL.print(i); OUT_SERIAL.println("s remaining");
+                xSemaphoreGive(xCtrlMutex);
+            }
+
+            vTaskDelayUntil(&wake, pdMS_TO_TICKS(1000));
+            if ((i % 30) == 0) {
+                gpsdo_logf(GPSDO_LOG_INFO, "OCXO",
+                           "%us remaining.", (unsigned)i);
+            }
         }
     }
+
     g_warmup_remaining = 0;
     g_warmup_active = false;
     xEventGroupSetBits(xSysEvents, EVT_OCXO_WARM);
-    OUT_SERIAL.println("OCXO warmup done");
+
+    if (warmup_ended_hot) {
+        // Avoid %f here: the embedded printf path may be built without
+        // floating-point formatting support. Log integer tenths instead.
+        int temp_tenths = (int)(g_ocxo_temp * 10.0f +
+                                (g_ocxo_temp >= 0.0f ? 0.5f : -0.5f));
+        int temp_whole = temp_tenths / 10;
+        unsigned temp_frac = (unsigned)(
+            temp_tenths < 0 ? -(temp_tenths % 10) : (temp_tenths % 10));
+
+        gpsdo_logf(GPSDO_LOG_INFO, "OCXO",
+                   "Warm at %d.%uC; warmup complete.",
+                   temp_whole, temp_frac);
+    } else {
+        gpsdo_log_event(GPSDO_LOG_INFO, "OCXO",
+                        "Warmup complete after maximum delay.");
+    }
 }
 
 /* ---- Control task ----------------------------------------------------- */
