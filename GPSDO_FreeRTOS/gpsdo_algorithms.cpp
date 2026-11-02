@@ -29,6 +29,7 @@
 #include "gpsdo_dac.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_flash_ring.h"
+#include "gpsdo_plant_cal.h"
 #include <string.h>
 #include <math.h>
 
@@ -201,7 +202,7 @@ static float lrn_update_ef(double e_freq, double phase_ns, double dt, bool locke
         double mean_ef = ef_win / win_t;          /* Hz, residual after ff  */
         g_lrn_slope_ns_s = (float)(mean_ef * 1.0e9 / (double)BASE_FREQ); /* ns/s */
         if (fabs(mean_ef) > 2.0e-4) {             /* 0.2 mHz deadband       */
-            double lsbhz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 3000.0;
+            double lsbhz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
             /* u = -(…): positive e_freq (freq high) must LOWER pwm, so the
              * feed-forward carries -e_freq. Move a fraction of the residual. */
             double corr = -mean_ef * lsbhz;
@@ -578,7 +579,7 @@ static void ltic_arm_picdiv(void)
 
 /* ---- LTIC auto-tuning ----------------------------------------------------
  * Derive every loop coefficient from the two MEASURED hardware constants:
- *   K   (Hz per PWM LSB, from CT — recovered via g_pid[7].Kp = 0.40/K)
+ *   K   (Hz per PWM LSB, from CT — from the shared CT plant calibration)
  *   nsv (ns per volt) and range_ns (from LC)
  * so no per-board hand tuning (AQP/DPP/...) is ever required. Called after a
  * successful LC and on entry to algorithm 10. Design rules:
@@ -589,7 +590,7 @@ static void ltic_arm_picdiv(void)
  */
 void ltic_autotune(void)
 {
-    double lsb_per_hz = (g_pid[7].Kp > 100.0) ? (g_pid[7].Kp / 0.40) : 3000.0;
+    double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
 
     /* RECOMPUTE ONLY WHEN THE INPUTS CHANGED.
      *
@@ -1307,8 +1308,8 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
                          * attempt, and knowing the slope is what removes it. */
                         double mean = mb;
                         if (fabs(slope) > LTIC_LOCK_SIGMA_K * sem_slope) {
-                            double lsb_per_ns = (g_pid[7].Kp > 100.0)
-                                              ? ((double)g_pid[7].Kp / 0.40 / 100.0) : 25.0;
+                            double lsb_per_ns = (plant_cal_valid())
+                                              ? plant_cal_lsb_per_hz()/ 100.0 : 25.0;
                             /* Damped 0.5 — Alan's k. One pair is a single
                              * measurement; half strength converges in two
                              * corrections where full strength stakes it all on one.
@@ -1362,7 +1363,7 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
             }
             if (state == LTIC_LOCK) {
                 /* hard cap per step: ≈4 mHz regardless of unit (from measured K) */
-                double lsbhz = (g_pid[7].Kp > 100.0) ? (g_pid[7].Kp / 0.40) : 3000.0;
+                double lsbhz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
                 double cap = lsbhz * 0.004;
                 if (cap < 3.0) cap = 3.0;
                 /* ...but never below what the loop has just MEASURED it needs.
@@ -1795,14 +1796,8 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
     double polarity = (g_ltic.polarity == -1) ? -1.0 : 1.0;
 
     /* Effective frequency-branch scale. g_lars.gain == 0 means "auto": derive it
-     * from the CT calibration, exactly as algo 10 does. CT measures K (Hz per PWM
-     * LSB) and stores it as g_pid[7].Kp = 0.40/K, so lsb_per_hz = g_pid[7].Kp/0.40
-     * is LSB of PWM per Hz of frequency error — which is precisely what the
-     * frequency branch needs to convert e_freq into a PWM correction, with no
-     * hand-tuning and no board-specific constant. If the user has set a non-zero
-     * gain with LG, that takes priority and is used with the fixed 6553.6 scale
-     * as before. A light 0.5 factor on the auto path keeps the proportional term
-     * from being too hot on boards with a large lsb_per_hz. */
+     * from the CT calibration, exactly as algo 10 does. CT measures K in Hz per
+     * PWM LSB, so plant_cal_lsb_per_hz() gives the LSB/Hz scale needed here. */
     float freq_scale;      /* LSB per Hz  — used by the acquisition branch */
     float phase_gain;      /* LSB per ns  — used by the phase branch        */
     if (g_lars.gain > 0.0f) {
@@ -1810,8 +1805,8 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
         phase_gain  = g_lars.gain;
         g_lars_gain_auto = false;
     } else {
-        double lsb_per_hz = (g_pid[7].Kp > 100.0)
-                          ? ((double)g_pid[7].Kp / 0.40)  /* from CT          */
+        double lsb_per_hz = (plant_cal_valid())
+                          ? plant_cal_lsb_per_hz()  /* from CT          */
                           : 3000.0;                       /* fallback if no CT */
         freq_scale = (float)(0.5 * lsb_per_hz);
 
@@ -2786,7 +2781,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
          * 36% and level 0.3 for the loop as it stands. */
         /* fll_holdoff: hoisted to the top of this function so the restart block can
          * clear it; the storage and the initialiser are unchanged. */
-        double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
+        double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 0.0;
         if (fll_holdoff > 0u) {
             fll_holdoff--;
         } else if (lsb_per_hz > 0.0 && ppscount > 60u &&
@@ -3254,7 +3249,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
          * possible. This only makes sure the operator hears about it. */
         {
             static float s_warned_mg = -1.0f;
-            double der = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40 / 100.0) : 0.0;
+            double der = (plant_cal_valid()) ? plant_cal_lsb_per_hz()/ 100.0 : 0.0;
             if (der > 0.0 && g_mlacc_gain != s_warned_mg &&
                 (lsb_per_ns > 4.0 * der || lsb_per_ns * 4.0 < der)) {
                 s_warned_mg = g_mlacc_gain;
@@ -3267,7 +3262,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
             }
         }
     } else {
-        double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
+        double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 0.0;
         if (lsb_per_hz <= 0.0) {
             s_mla_locked = false;
             set_trend("NoCT");
@@ -4124,7 +4119,7 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
     }
     /* Scale, from CT. lsb_per_ns is the counts that null one nanosecond of
      * phase in one second, so its reciprocal is the ns/s one count buys. */
-    double lsb_per_hz = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 0.0;
+    double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 0.0;
     if (lsb_per_hz <= 0.0) { s_kf_locked = false; set_trend("NoCT"); return pwm; }
     double lsb_per_ns = lsb_per_hz / 100.0;
 

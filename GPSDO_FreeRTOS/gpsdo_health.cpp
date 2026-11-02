@@ -14,6 +14,7 @@
 #include "gpsdo_algorithms.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
+#include "gpsdo_plant_cal.h"
 
 /* Weights, in CORRECTIONS rather than seconds. A decade apart, so the four
  * windows cover four orders of magnitude without overlapping usefully.
@@ -151,12 +152,11 @@ void health_note_output(uint16_t pwm)
 
 void health_get(health_stats_t *out)
 {
-    /* CT stores the slope as g_pid[7].Kp = 0.40/K, so K is recovered from it.
-     * Without CT there is no way to turn LSB into hertz, and the caller is told
-     * so rather than being handed a number derived from a guess. */
-    double kp = (double)g_pid[7].Kp;
-    out->have_k       = (kp > 100.0);
-    out->k_hz_per_lsb = out->have_k ? (0.40 / kp) : 0.0;
+    /* CT owns the measured OCXO slope directly. Without CT there is no
+     * calibrated conversion between control LSB and hertz. */
+    out->have_k       = plant_cal_valid();
+    out->k_hz_per_lsb = plant_cal_k_hz_per_lsb();
+
     out->updates = s_n;
     out->gated   = s_gated;
     out->counting = counting_now();
@@ -168,7 +168,6 @@ void health_get(health_stats_t *out)
     out->secs_per_corr = s_dt;
     out->peak    = s_peak;
 }
-
 /* ---------------------------------------------------------------------- */
 /* CPU load. Not measured here any more — it falls out of the per-task
  * accounting below as 100% minus the idle task's share, which is exact where

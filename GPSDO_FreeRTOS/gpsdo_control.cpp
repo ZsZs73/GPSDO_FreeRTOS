@@ -25,6 +25,7 @@
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
 #include "gpsdo_algorithms.h"
+#include "gpsdo_plant_cal.h"
 #include "gpsdo_span.h"
 #include "gpsdo_adc.h"
 #include <Arduino.h>
@@ -596,7 +597,7 @@ static void do_calibrate_tune(void)
      * measures gentle plants with a real signal instead of a scatter — the
      * two things this floor used to have to do alone. Upper 2e-3 kept for
      * wide/non-linear parts. */
-    if (K < 1e-5 || K > 2e-3) {
+    if (K < PLANT_K_MIN_HZ_PER_LSB || K > PLANT_K_MAX_HZ_PER_LSB) {
         OUT_SERIAL.print("CT: ERROR K out of range (");
         OUT_SERIAL.print(K * 1000.0, 4);
         OUT_SERIAL.println(" mHz/LSB) — check GPS fix / EFC span. Params unchanged.");
@@ -611,6 +612,12 @@ static void do_calibrate_tune(void)
      * In algo_coeffs_from_k() now, because a move of the span jumper has to
      * derive the same set from a stored K. The two locals are for the report
      * below, which is unchanged. */
+    /* CT owns this hardware fact; legacy coefficients are derived from it below. */
+    if (!plant_cal_set_k(K)) {
+        OUT_SERIAL.println("CT: ERROR measured plant slope is invalid.");
+        ct_fail();
+        return;
+    }
     algo_coeffs_from_k(K);
     double kp_pll = 0.40 / K;
     double kp_fll = 0.35 / K;
@@ -667,12 +674,19 @@ static void do_calibrate_tune(void)
      * it to a power cut because nobody typed ES is a poor trade. Only the PID
      * group is written, so live loop tuning the operator may be experimenting
      * with elsewhere is left alone. */
-    if (settings_save_partial(SET_PID)) {
-    health_reset();   /* the step after calibration is a jump, not a correction */
-        OUT_SERIAL.println("CT: done — coefficients auto-saved to flash ring.");
-    } else {
-        OUT_SERIAL.println("CT: done, but the auto-save FAILED — run 'ES PID' manually.");
-    }
+    const bool plant_saved = plant_cal_save();
+    live_store_request_save();  /* CT's new operating PWM is live state. */
+
+    /* Temporary bridge: remove with algorithms 3-10. */
+    const bool legacy_pid_saved = settings_save_partial(SET_PID);
+
+    health_reset();   /* calibration step is not a loop correction */
+    if (plant_saved)
+        OUT_SERIAL.println("CT: done - plant calibration saved.");
+    else
+        OUT_SERIAL.println("CT: done, but plant calibration save FAILED.");
+    if (!legacy_pid_saved)
+        OUT_SERIAL.println("CT: legacy PID save failed.");
     /* And the span record: this K belongs to the position the jumper is in.
      * No-op on a build without span sensing, so CT there is exactly as it was. */
     span_ct_done(K, new_pwm);
@@ -764,7 +778,7 @@ static void do_ltic_calibrate(void)
      * saturation arrives before 10 fit points, halve the offset, re-arm and
      * retry once. */
     uint16_t ramp_pwm = saved_pwm;
-    double lsbhz0 = (g_pid[7].Kp > 100.0) ? ((double)g_pid[7].Kp / 0.40) : 3000.0;
+    double lsbhz0 = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
     /* commanded fallback offset: NEGATIVE, matching the sweep direction
      * (interval grows when the OCXO runs below 10 MHz) */
     int32_t cmd_off = (int32_t)(-0.06 * lsbhz0);

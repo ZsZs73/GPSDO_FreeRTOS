@@ -12,6 +12,7 @@
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
+#include "gpsdo_plant_cal.h"
 #include "gpsdo_algorithms.h"
 #include "gpsdo_log.h"
 
@@ -241,6 +242,54 @@ bool gpsdo_algo_selection_is_saved(uint8_t algo)
     return s_saved_algo_valid && s_saved_algo == algo;
 }
 
+static void load_plant_calibration(void)
+{
+    uint8_t version = 0u;
+    plant_cal_status_t st = plant_cal_load_status(&version);
+
+    switch (st) {
+    case PLANT_CAL_OK:
+        gpsdo_log_event(
+            GPSDO_LOG_INFO, "CONFIG",
+            "OCXO plant calibration loaded from flash.");
+        break;
+
+    case PLANT_CAL_RECOVERED:
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "CONFIG",
+            "Latest saved OCXO plant calibration is corrupt; "
+            "recovered the previous valid calibration.");
+        break;
+
+    case PLANT_CAL_MISSING:
+        gpsdo_log_event(
+            GPSDO_LOG_INFO, "CONFIG",
+            "No saved OCXO plant calibration found; run CT.");
+        break;
+
+    case PLANT_CAL_VERSION:
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "CONFIG",
+            "Saved OCXO plant calibration is incompatible; run CT.");
+        break;
+
+    case PLANT_CAL_CHECKSUM:
+    case PLANT_CAL_SIZE:
+    case PLANT_CAL_INVALID_K:
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "CONFIG",
+            "Saved OCXO plant calibration is invalid; run CT.");
+        break;
+
+    case PLANT_CAL_STORAGE:
+    default:
+        gpsdo_log_event(
+            GPSDO_LOG_WARN, "CONFIG",
+            "OCXO plant calibration could not be loaded from flash; run CT.");
+        break;
+    }
+}
+
 void gpsdo_config_load(void)
 {
     /* Common compile-time defaults. Valid saved state overwrites these. */
@@ -249,6 +298,9 @@ void gpsdo_config_load(void)
     g_time_offset_min = 0;
 
     (void)flash_ring_begin();
+
+    /* CT calibration is its own persistence domain. */
+    load_plant_calibration();
 
     uint8_t settings_version = 0u;
     settings_load_status_t settings =

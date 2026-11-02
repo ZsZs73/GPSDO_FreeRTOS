@@ -13,6 +13,7 @@
 #include "gpsdo_state.h"
 #include "gpsdo_span.h"
 #include "gpsdo_algorithms.h"
+#include "gpsdo_plant_cal.h"
 #include "gpsdo_dac.h"
 #include "gpsdo_health.h"
 #include "gpsdo_settings_store.h"
@@ -236,6 +237,7 @@ static bool span_pair_valid(void)
 /* The live coefficients follow the span. Called with a span that HAS a K. */
 static void span_apply_k(uint8_t s)
 {
+    plant_cal_set_k((double)s_st.k[s]);
     algo_coeffs_from_k((double)s_st.k[s]);
 #ifdef GPSDO_LTIC
     ltic_autotune();       /* recomputes only when K actually moved */
@@ -501,8 +503,8 @@ void span_begin(void)
          * with none is running on compile-time defaults, which are nobody's
          * measurement and must not become a span's calibration. */
         s_active = now;
-        if (g_persist_valid && g_pid[7].Kp > 100.0) {
-            s_st.k[now] = (float)(0.40 / g_pid[7].Kp);
+        if (g_persist_valid && plant_cal_valid()) {
+            s_st.k[now] = (float)plant_cal_k_hz_per_lsb();
             OUT_SERIAL.print("SPAN: first run with span sensing - the existing CT calibration is ");
             OUT_SERIAL.println(span_name(now));
         }
