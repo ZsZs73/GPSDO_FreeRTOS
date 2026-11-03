@@ -73,8 +73,6 @@ extern SemaphoreHandle_t xTwoHzSemaphore;
 
 #include "gpsdo_gps.h"
 
-#include "gpsdo_span.h"
-
 /* ---- pinModeAF helper ------------------------------------------------- */
 static void pinModeAF(int ulPin, uint32_t Alternate)
 {
@@ -331,16 +329,10 @@ void setup()
      * ------------------------------------------------------------------ */
     gpsdo_config_load();
 
-    /* Span jumper on PB14: which calibration this board is running on, and —
-     * if the jumper was moved while it was off — the recalled code remapped
-     * into the span it is now in. This must remain after configuration load
-     * and before the final PWM write. */
-    span_begin();
-
-    /* Apply the final PWM after stored state and SPAN remapping. */
+    /* Apply the restored control output. */
     gpsdo_dac_write16(gCtrl.pwm_output);
 
-    /* Log the final active configuration after SPAN remapping. */
+    /* Log the final active configuration. */
     gpsdo_config_log_active();
 
     /* ---- Hardware POST ---- */

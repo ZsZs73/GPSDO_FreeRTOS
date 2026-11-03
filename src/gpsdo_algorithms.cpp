@@ -355,14 +355,11 @@ double g_blend_crossover = 0.024;   /* Hz — sigmoid centre */
 double g_blend_scale     = 0.012;   /* Hz — sigmoid width  */
 double g_nn_max_step     = 175.0;   /* LSB — max PWM delta  */
 
-/* The coefficient set CT derives from K, exactly as it always has — moved here
- * from do_calibrate_tune() so that the span jumper (gpsdo_span.cpp), which has
- * to produce the same set from a STORED K, calls the same lines rather than a
- * copy of them. The formulas are the ones documented above.
+/* The coefficient set CT derives from K. Keeping these formulas in one helper
+ * makes the calibration path explicit and avoids duplicating the tuning rules.
  *
- * Ki and Kd of the PLL algorithms (4, 5, 7) are fixed and do NOT follow K. That
- * is CT's long-standing choice for those three, not something decided here: a
- * span move gives exactly what CT in that span would give, no more. */
+ * Ki and Kd of the PLL algorithms (4, 5, 7) are fixed and do NOT follow K.
+ * That is CT's long-standing choice for those three. */
 void algo_coeffs_from_k(double K)
 {
     if (!(K > 0.0)) return;
@@ -6265,8 +6262,7 @@ static inline double nn_tanh(double x) { return tanh(x); }
 /* Learned oscillator tempco [LSB/°C] — from the PWM↔temperature regressor
  * below; 0 until enough variance is seen. Exposed for telemetry. */
 float g_nn_tempco = 0.0f;
-/* |tempco| clamp [LSB/degC]. File scope because algo_rescale_lsb() has to
- * honour the same bound when a span move rescales the learned value. */
+/* |tempco| clamp [LSB/degC] for algorithm 9 thermal learning. */
 #define NN_TCO_MAX  60.0
 
 /* ACQ centring drive (algo 10), tunable live with `ACG <gain> [cap]`.
@@ -6491,34 +6487,4 @@ int16_t nn_thermal_holdover_step(void)
     int16_t out = (int16_t)s_ho_frac;         /* emit whole LSBs only    */
     s_ho_frac  -= (double)out;
     return out;
-}
-
-/* ======================================================================
- * algo_rescale_lsb — learned LSB-denominated state across a span move
- *
- * r = K_old / K_new: the same physical correction is r times as many codes in
- * the new span. Two things are learned in codes and survive a loop restart, so
- * a restart alone would carry them across in the wrong units:
- *
- *   g_lrn_drift  the LRN feed-forward (clamped to the same LRN_DRIFT_MAX the
- *                learner itself honours)
- *   g_nn_tempco  algorithm 9's PWM-against-temperature slope (NN_TCO_MAX)
- *
- * Everything else a loop keeps in codes — integrators, filter memories, the
- * Kalman state — is cleared by the restart and rebuilt from the live code, and
- * every gain derived from K is read from g_pid[7] at run time or recomputed by
- * algo_coeffs_from_k() / ltic_autotune(). The I_LIMIT clamps are bounds, not
- * state, and CT has never scaled them either.
- * ====================================================================== */
-void algo_rescale_lsb(double r)
-{
-    if (!(r > 0.0) || !isfinite(r)) return;
-    double d = (double)g_lrn_drift * r;
-    if (d >  (double)LRN_DRIFT_MAX) d =  (double)LRN_DRIFT_MAX;
-    if (d < -(double)LRN_DRIFT_MAX) d = -(double)LRN_DRIFT_MAX;
-    g_lrn_drift = (float)d;
-    double t = (double)g_nn_tempco * r;
-    if (t >  NN_TCO_MAX) t =  NN_TCO_MAX;
-    if (t < -NN_TCO_MAX) t = -NN_TCO_MAX;
-    g_nn_tempco = (float)t;
 }

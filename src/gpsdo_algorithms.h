@@ -46,24 +46,16 @@ extern double g_blend_scale;       /* Hz — sigmoid width,  default 0.01       
 /* Algo 9 (NN) output scaling */
 extern double g_nn_max_step;       /* LSB — max PWM delta per step, default 200 */
 
-/* ---- everything that follows from K, in one place ------------------------
+/* ---- calibration-derived coefficients and loop restart -------------------
  *
  * K is CT's measured slope, hertz per 16-bit LSB. algo_coeffs_from_k() writes
  * the coefficient set CT derives from it (PLL Kp = 0.40/K, FLL Kp = 0.35/K and
- * so on — see RUNTIME-TUNABLE PARAMETERS in gpsdo_algorithms.cpp); it is what
- * CT runs, and what a move of the span jumper runs with the stored K of the
- * position it moved to (gpsdo_span.cpp), so the two cannot drift apart.
- *
- * algo_rescale_lsb(r) converts the LEARNED state that is denominated in LSB
- * and survives a loop restart — the LRN feed-forward and algorithm 9's tempco
- * — by r = K_old/K_new, so the same physical correction is kept in the new
- * span's units. Manual gains are not touched: they are the operator's.
+ * so on — see RUNTIME-TUNABLE PARAMETERS in gpsdo_algorithms.cpp).
  *
  * algo_request_restart() is what the dispatcher does on an algorithm change:
  * every loop clears its own state on its next call and no loop keeps a lock
  * verdict it did not earn. */
 void algo_coeffs_from_k(double k_hz_per_lsb);
-void algo_rescale_lsb(double ratio);
 void algo_request_restart(void);
 
 /* ---- Algorithm 10: LTIC three-stage PLL (ACQ → DPLL → LOCK) ----------

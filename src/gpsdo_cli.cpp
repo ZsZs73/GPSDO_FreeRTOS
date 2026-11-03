@@ -34,7 +34,6 @@
 #include "gpsdo_settings_store.h"
 #include "gpsdo_config_load.h"
 #include "gpsdo_ubx_timtp.h"
-#include "gpsdo_span.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -255,7 +254,6 @@ static void print_help(void)
     cli_putln("  SP <n>      Set PWM DAC directly (1-65535)");
     cli_putln("  DAC [PWM|DITH]  output path (no arg = report + Vctl check)");
     cli_putln("  AV [x]      ADC divide ratio for 'measured' (1.00 = direct)");
-    cli_putln("  SPAN [CLR FULL|REDUCED]  EFC span jumper (PB14): K per position");
 #if defined(GPSDO_TFT_BL_PWM)
     cli_putln("  BL [%]      TFT backlight 30-100% (auto-saved; 100 = no switching)");
 #endif
@@ -678,10 +676,6 @@ static void dispatch(char *line)
             cli_putln("        resolution cannot be stated in Hz");
         }
 
-        /* Which span the plant above belongs to. Two jumper positions, two
-         * plants, and the figures above are only as right as this line. */
-        span_report(cli_putln);
-
         if (gpsdo_dac_fine_available()) {
             cli_putln("  fine: ACTIVE - sub-LSB corrections are applied, not");
             cli_putln("        truncated. Coarse writes (CT, LC, SP, holdover,");
@@ -725,37 +719,6 @@ if (cli_ieq(verb, "AV")) {
     cli_autosaved(SET_ALGO, "AV: ADC divide ratio");
     return;
 }
-
-    /* ---- SPAN: the EFC span jumper on PB14 ----
-     *
-     * Nothing to TELL the firmware here: the jumper's second pole
-     * is wired to PB14 and the firmware reads it. What this shows is the other
-     * half — the calibration each position carries — and CLR is the one
-     * correction a person may need: forgetting a position that was calibrated
-     * in the wrong place. The usual case is a board calibrated before PB14 was
-     * wired, whose only CT was filed under FULL while the jumper actually sat
-     * on REDUCED. CT in the other position catches that by itself (see
-     * SPAN_SAME_PLANT in gpsdo_span.cpp); CLR is for when you already know. */
-    if (cli_ieq(verb, "SPAN")) {
-        if (arg == NULL) { span_report(cli_putln); return; }
-        char *p2 = arg;
-        while (*p2 && *p2 != ' ') p2++;
-        while (*p2 == ' ') *p2++ = '\0';
-        if (!cli_ieq(arg, "CLR") || *p2 == '\0') {
-            cli_reject("SPAN: no argument = report, or SPAN CLR FULL|REDUCED");
-            return;
-        }
-        uint8_t which;
-        if      (cli_ieq(p2, "FULL")    || cli_ieq(p2, "0")) which = SPAN_FULL;
-        else if (cli_ieq(p2, "REDUCED") || cli_ieq(p2, "1")) which = SPAN_REDUCED;
-        else { cli_reject("SPAN CLR: FULL or REDUCED"); return; }
-        span_clear(which);
-        cli_puts("SPAN: calibration for "); cli_puts(span_name(which));
-        cli_putln(" forgotten (and the code pair). Saved.");
-        if (which == span_active())
-            cli_putln("SPAN: this is the position the jumper is in - the live loop is unchanged; run CT to re-measure it.");
-        return;
-    }
 
 #if defined(GPSDO_TFT_BL_PWM)
     /* ---- BL: TFT backlight brightness ----

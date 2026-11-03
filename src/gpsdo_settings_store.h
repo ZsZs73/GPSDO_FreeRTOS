@@ -26,9 +26,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Bump when the on-flash layout of SettingsBlock_t changes. A mismatch with
- * the stored value triggers a fall-back to defaults on recall. */
-#define SETTINGS_VER  7u   /* v7: remove obsolete external-DAC/reference settings */
+/* Fork development settings format.
+ * Keep this value stable during development; payload size mismatch rejects
+ * stale records after layout changes. Bump when release compatibility matters. */
+#define SETTINGS_VER  100u  /* fork development format; no migration compatibility */
 
 /* The flat on-flash block. Total size must stay <= FR_PAYLOAD (504 B).
  * Stored using the native STM32 struct layout; SETTINGS_VER and payload size
@@ -107,11 +108,6 @@ typedef struct {
     int32_t  a12_lim[11];    /* g_mlacc_lim[], phase limits in ns          */
     /* ADC divider scale used for Vctl measurement. */
     uint16_t adc_vdiv_h;     /* g_adc_vdiv ×100 (AV), 0 = 1.00×             */
-    /* Span sensing on PB14.
-     * Zero values mean the span state or calibration has not been recorded yet. */
-    uint8_t  span_last;      /* span in force when saved, + 1; 0 = unset      */
-    float    span_k[2];      /* CT's K in each span, Hz/LSB; 0 = none         */
-    uint16_t span_pair[2];   /* one code per span, same EFC volts; 0 = none   */
 } SettingsBlock_t;
 
 /* Which group of fields a partial save should update. Used by `ES <object>`. */
@@ -125,8 +121,6 @@ typedef enum {
     SET_ALGO   = 5,   /* pwm, algo, dac_path, AV scale                    */
     SET_ALGO12 = 7,   /* algo-12 gain, run level, per-level limits         */
     SET_PO     = 6,    /* press_off, alt_off                              */
-    SET_SPAN   = 8,   /* span record + everything a span move re-derives: */
-                      /* the PID group, the LTIC loop gains, and pwm       */
 } settings_partial_t;
 
 typedef enum {

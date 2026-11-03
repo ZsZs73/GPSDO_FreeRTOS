@@ -225,25 +225,6 @@ extern "C" {
 #define GPSDO_PWM_DITHER
 #define GPSDO_PWM_DITHER_BITS  13   /* 12 = 24.4 kHz/16 KB, 13 = 12.2 kHz/8 KB */
 
-/* ---- EFC span jumper on PB14 -------------------------------------------
- * A board with the EFC level shifter runs its oscillator over the full control
- * span or a reduced one, and the two have different plants — CT's K moved
- * 5.0-5.7x between them on Dan Wiering's prototype. With a second pole of the
- * span jumper wired to PB14, the firmware keeps one CT calibration per
- * position and switches between them when the jumper moves, remapping the
- * control code so the EFC pin keeps its voltage. See gpsdo_span.h.
- *
- * Jumper fitted = PB14 to ground = REDUCED. Open, or nothing wired = FULL,
- * which is the position that always works: a board without the wire reads
- * FULL on the internal pull-up and keeps its one calibration as before. That
- * is why this is on by default — it costs a pull-up on a pin nothing else
- * uses.
- *
- * Comment out only if PB14 is wired to something else on your board. The
- * stored calibrations are carried through every save either way. */
-#define GPSDO_SPAN_SENSE
-#define PIN_SPAN_SENSE  PB14
-
 /* Historical bring-up aid; OFF by default per the v1.06 policy. */
 /* #define GPSDO_GEN_2kHz_PB5 */
 

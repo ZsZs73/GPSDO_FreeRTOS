@@ -27,7 +27,6 @@
 #include "gpsdo_settings_store.h"
 #include "gpsdo_algorithms.h"
 #include "gpsdo_plant_cal.h"
-#include "gpsdo_span.h"
 #include "gpsdo_adc.h"
 #include <Arduino.h>
 #include <string.h>
@@ -479,31 +478,9 @@ static void do_calibrate_tune(void)
      * be satisfied: they collide only past 65535 - 2*CT_RAIL_GUARD = 63 535. */
     const int32_t CT_RAIL_GUARD   = 1000;   /* LSB kept clear at BOTH ends */
 
-    /* The span jumper has just moved and the move is still being debounced:
-     * the active span is about to change under this measurement. Let the
-     * control loop finish the switch first — the event bit stays set, so CT
-     * runs on the next pass, in the right span, rather than running for
-     * minutes and then being thrown away by the check below. */
-    {
-        static bool s_said = false;          /* once per wait, not per pass */
-        if (span_pin_moved_since(span_active())) {
-            if (!s_said) {
-                OUT_SERIAL.println("CT: the span jumper has just moved - waiting for the switch");
-                s_said = true;
-            }
-            return;
-        }
-        s_said = false;
-    }
-
     OUT_SERIAL.println("CT: calibrate + auto-tune started (3 points)");
     g_calib_active = true;
     g_calib_kind   = CALIB_CT;
-    /* The span the measurement belongs to. The control task does not poll the
-     * jumper while CT runs, so a move during it is only noticed afterwards —
-     * which is fine for the switch and fatal for the fit: three points taken
-     * across two plants is a slope of neither. Checked after each pass. */
-    const uint8_t ct_span = span_active();
     /* CT was the one procedure that never seeded this, so the status bar sat
      * at "Tune 0s" for the whole run while C and LC counted down properly.
      * Three PWM points, each settling for OCXO_CALIB_SECS, plus a few seconds
@@ -527,12 +504,6 @@ static void do_calibrate_tune(void)
         OUT_SERIAL.print("CT: ERROR K out of range (");
         OUT_SERIAL.print(K * 1000.0, 4);
         OUT_SERIAL.println(" mHz/LSB) — check GPS fix. Params unchanged.");
-        ct_fail();
-        return;
-    }
-
-    if (span_pin_moved_since(ct_span)) {
-        OUT_SERIAL.println("CT: the span jumper moved during the measurement - discarded, params unchanged");
         ct_fail();
         return;
     }
@@ -581,27 +552,17 @@ static void do_calibrate_tune(void)
     }
     uint16_t new_pwm = (uint16_t)v;
 
-    if (span_pin_moved_since(ct_span)) {
-        OUT_SERIAL.println("CT: the span jumper moved during the measurement - discarded, params unchanged");
-        ct_fail();
-        return;
-    }
-
     /* FINAL sanity gate, on the K that will actually tune the loop. The
-     * lower bound must accommodate NARROW-span EFC oscillators, which are
-     * DESIRABLE — a smaller Hz/LSB means finer tuning resolution and is one
-     * route to E-12 stability. Dan Wiering's build measured 0.048 mHz/LSB
-     * (K = 4.8e-5) with a ~1.05 V EFC span, well below the old 0.1 mHz/LSB
-     * floor, and was wrongly rejected. Floor at 1e-5 (0.01 mHz/LSB ≈ 0.65 Hz
-     * full span): defensible NOW because the coarse gate above catches the
-     * no-signal garbage before any K is believed, and the second pass
-     * measures gentle plants with a real signal instead of a scatter — the
-     * two things this floor used to have to do alone. Upper 2e-3 kept for
-     * wide/non-linear parts. */
+     * lower bound must accommodate gentle EFC plants: a smaller Hz/LSB means
+     * finer tuning resolution and is one route to E-12 stability. The coarse
+     * gate above rejects no-signal garbage before any K is believed, while the
+     * second pass gives low-K plants enough measurement swing for a reliable
+     * fit. Upper 2e-3 remains a guard against implausibly wide/non-linear
+     * plants. */
     if (K < PLANT_K_MIN_HZ_PER_LSB || K > PLANT_K_MAX_HZ_PER_LSB) {
         OUT_SERIAL.print("CT: ERROR K out of range (");
         OUT_SERIAL.print(K * 1000.0, 4);
-        OUT_SERIAL.println(" mHz/LSB) — check GPS fix / EFC span. Params unchanged.");
+        OUT_SERIAL.println(" mHz/LSB) — check GPS fix / EFC range. Params unchanged.");
         ct_fail();
         return;
     }
@@ -610,9 +571,8 @@ static void do_calibrate_tune(void)
     OUT_SERIAL.print(" mHz/LSB  PWM(10MHz)="); OUT_SERIAL.println(new_pwm);
 
     /* ---- derive coefficients from K ----
-     * In algo_coeffs_from_k() now, because a move of the span jumper has to
-     * derive the same set from a stored K. The two locals are for the report
-     * below, which is unchanged. */
+     * Keep the derivation centralized in algo_coeffs_from_k(); the two locals
+     * below are only for the unchanged operator report. */
     /* CT owns this hardware fact; legacy coefficients are derived from it below. */
     if (!plant_cal_set_k(K)) {
         OUT_SERIAL.println("CT: ERROR measured plant slope is invalid.");
@@ -648,22 +608,10 @@ static void do_calibrate_tune(void)
     }
     /* RESTART THE LOOP, EVERY TIME. CT has just put a new code on the pin,
      * and every loop keeps its own copy of where the pin should be —
-     * algorithm 11's integrator, algorithm 10's absolute target — which
-     * still holds the code from before the sweep. Left alone, the loop's
-     * first steps after CT's 100 s flush steer back toward that old code and
-     * undo the centring. spansim measured it with a CT that succeeds while
-     * the loop has been running (the mislabel scenario, third attempt):
-     * without this, twenty minutes on the code sat 42 LSB off CT's null at
-     * 1.0e-10, and the span pair learned from there put the next jumper move
-     * 1.1e-10 off; with it, 1.2e-11 and 3.7e-12. In a build without span
-     * sensing, a CT right after the jumper moved went back toward the old
-     * code, 3.1e-8 off at worst; with the restart, 5.0e-9. The restart is the
-     * one an algorithm change does, and it re-seeds every loop from the live
-     * code, which is CT's null.
-     *
-     * Here, not in span_ct_done() where build 55 first put it: nothing about
-     * this depends on the span jumper, and there a build without
-     * GPSDO_SPAN_SENSE compiled it away and kept the defect. */
+     * algorithm 11's integrator, algorithm 10's absolute target — which still
+     * holds the code from before the sweep. Re-seeding from CT's new null keeps
+     * the first post-calibration corrections from steering back toward stale
+     * pre-calibration state. */
     algo_request_restart();
 
     xEventGroupClearBits(xSysEvents, EVT_NEED_TUNE);
@@ -688,9 +636,6 @@ static void do_calibrate_tune(void)
         OUT_SERIAL.println("CT: done, but plant calibration save FAILED.");
     if (!legacy_pid_saved)
         OUT_SERIAL.println("CT: legacy PID save failed.");
-    /* And the span record: this K belongs to the position the jumper is in.
-     * No-op on a build without span sensing, so CT there is exactly as it was. */
-    span_ct_done(K, new_pwm);
 }
 
 #ifdef GPSDO_LTIC
@@ -1703,13 +1648,6 @@ void vControlTask(void *pvParameters)
                     g_time_offset_min = tz_resolve(lat, lon, gd, gmo, gy, gh, gmi);
             }
         }
-
-        /* ---- span jumper (PB14) ----
-         * Before the loop step, on this task, so a move is remapped between two
-         * corrections and never under one. Polled whether or not the loop is
-         * running this second: a move in holdover still has to keep the voltage
-         * on the EFC pin where it was. */
-        span_poll();
 
         /* ---- Frequency averaging ---- */
         {

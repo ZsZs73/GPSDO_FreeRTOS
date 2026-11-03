@@ -22,7 +22,6 @@
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
 #include "gpsdo_ubx_timtp.h"      /* g_qerr_enable (SAW master switch) */
-#include "gpsdo_span.h"           /* the span record (PB14)            */
 #include <math.h>
 #include <string.h>
 
@@ -41,8 +40,7 @@ extern bool  g_show_local_time;
 /* ---- field groups shared by more than one save ----
  *
  * Each is written from ONE place so that a group saved by two different
- * partials cannot drift apart: SET_PID and SET_SPAN both carry the PID group,
- * SET_LTIC and SET_SPAN both carry the LTIC loop gains. */
+ * partials cannot drift apart across full and partial saves. */
 
 static void put_pid_group(SettingsBlock_t *s)
 {
@@ -74,17 +72,6 @@ static void put_ltic_gains(SettingsBlock_t *s)
     s->ltic_acq_ki  = (float)g_ltic.acq.Ki;
     s->ltic_acq_kd  = (float)g_ltic.acq.Kd;
     s->ltic_acq_il  = (float)g_ltic.acq.I_LIMIT;
-}
-
-static void put_span(SettingsBlock_t *s)
-{
-    span_store_t st;
-    span_store_get(&st);
-    s->span_last    = st.last;
-    s->span_k[0]    = st.k[0];
-    s->span_k[1]    = st.k[1];
-    s->span_pair[0] = st.pair[0];
-    s->span_pair[1] = st.pair[1];
 }
 
 /* ---- snapshot: runtime -> SettingsBlock_t ---- */
@@ -164,7 +151,6 @@ static void snapshot_full(SettingsBlock_t *s)
     s->tz_manual_min = g_tz_manual_min;
     memcpy(s->tz_str, g_tz_str, sizeof(s->tz_str));
     s->tz_str[sizeof(s->tz_str) - 1] = '\0';
-    put_span(s);
 }
 
 /* ---- apply: SettingsBlock_t -> runtime (with range guards) ---- */
@@ -192,16 +178,6 @@ static void apply_full(const SettingsBlock_t *s)
      * also puts the value on the pin. 0 = unset, so leave the default. */
     if (s->bl_pct >= BL_PCT_MIN && s->bl_pct <= BL_PCT_MAX)
         backlight_set(s->bl_pct);
-    {
-        /* Range checks live with the meaning, in span_store_put(). */
-        span_store_t st;
-        st.last    = s->span_last;
-        st.k[0]    = s->span_k[0];
-        st.k[1]    = s->span_k[1];
-        st.pair[0] = s->span_pair[0];
-        st.pair[1] = s->span_pair[1];
-        span_store_put(&st);
-    }
     /* 0 = unset: leave the default ADC divider scale in force. */
     if (s->adc_vdiv_h >= 100u && s->adc_vdiv_h <= 1000u)
         g_adc_vdiv = (double)s->adc_vdiv_h / 100.0;
@@ -440,17 +416,6 @@ bool settings_save_partial(settings_partial_t which)
     case SET_PO:
         s.press_off = g_pressure_offset;
         s.alt_off   = g_altitude_offset;
-        break;
-
-    case SET_SPAN:
-        /* One write for everything a move of the span jumper changes, so a
-         * power cut cannot leave the span record saying REDUCED next to a PID
-         * block derived for FULL. The code goes with it: it was remapped, and
-         * the live store's copy is only as fresh as its last tick. */
-        put_span(&s);
-        put_pid_group(&s);
-        put_ltic_gains(&s);
-        s.pwm = gCtrl.pwm_output;
         break;
     }
 

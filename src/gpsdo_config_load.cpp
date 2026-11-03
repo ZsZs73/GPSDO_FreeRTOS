@@ -324,7 +324,7 @@ void gpsdo_config_load(void)
 
 void gpsdo_config_log_active(void)
 {
-    /* Called after SPAN remapping, so PWM is the value actually applied. */
+    /* Log the restored PWM that is actually applied. */
     gpsdo_logf(
         GPSDO_LOG_INFO,
         "CONFIG",
