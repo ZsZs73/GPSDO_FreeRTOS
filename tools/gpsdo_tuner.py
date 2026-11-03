@@ -1482,9 +1482,6 @@ class GpsdoTuner(QMainWindow):
                 ("",            "  every Vctl display. With a 10k+10k sense divider,"),
                 ("",            "  use AV 2.00 for the correct Vctl reading."),
                 ("",            "  Auto-saved (ES ALGO)."),
-                ("SPAN",        "EFC span jumper on PB14: show position and calibration."),
-                ("",            "  Open or unwired = FULL; grounded = REDUCED."),
-                ("SPAN CLR <p>","Forget one position's calibration, FULL or REDUCED."),
                 ("AP",          "Arm picDIV (resync the divider to 1PPS)"),
             ]),
             ("Calibration", [

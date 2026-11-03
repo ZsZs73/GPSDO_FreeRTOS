@@ -427,7 +427,7 @@ static void ct_fail(void)
  *   1. Drive PWM to three points (1.5 / 2.0 / 2.5 V), settle, measure f.
  *   2. Least-squares slope → K [Hz/LSB] (the plant gain), plus the PWM
  *      that yields exactly 10 MHz.
- *   2b. If K is gentle (span-reduced EFC, external DAC with a divider),
+ *   2b. If K is gentle (low-sensitivity EFC, external DAC with a divider),
  *      RE-MEASURE over a wider code spread centred on the fitted 10 MHz
  *      code: the fixed pass-1 spread is 20 480 LSB, which at e.g.
  *      20 µHz/LSB swings the oscillator only 0.4 Hz — a small signal for

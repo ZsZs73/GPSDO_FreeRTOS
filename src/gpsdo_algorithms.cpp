@@ -2313,9 +2313,8 @@ bool kf_locked(void)    { return s_kf_locked; }
  * nobody has earned.
  *
  * Called by the dispatcher on an algorithm change — the one place every change
- * goes through, the CLI and a settings recall at boot included — by a move of
- * the span jumper, which changes the units of every integrator at once, and by
- * CT and C, which put a new code on the pin behind every loop's back. */
+ * goes through, the CLI and a settings recall at boot included — and by CT
+ * and C, which put a new code on the pin behind every loop's back. */
 void algo_request_restart(void)
 {
     s_algo_restart = true;

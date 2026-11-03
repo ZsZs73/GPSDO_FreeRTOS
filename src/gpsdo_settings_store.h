@@ -29,7 +29,7 @@
 /* Fork development settings format.
  * Keep this value stable during development; payload size mismatch rejects
  * stale records after layout changes. Bump when release compatibility matters. */
-#define SETTINGS_VER  100u  /* fork development format; no migration compatibility */
+#define SETTINGS_VER  100u
 
 /* The flat on-flash block. Total size must stay <= FR_PAYLOAD (504 B).
  * Stored using the native STM32 struct layout; SETTINGS_VER and payload size
