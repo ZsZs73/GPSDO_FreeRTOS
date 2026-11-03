@@ -12,7 +12,7 @@
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
-#include "gpsdo_plant_cal.h"
+#include "gpsdo_hw_cal.h"
 #include "gpsdo_algorithms.h"
 #include "gpsdo_log.h"
 
@@ -114,6 +114,28 @@ static void log_live_status(live_load_status_t st)
 void gpsdo_algo_config_load(uint8_t algo)
 {
 #ifdef GPSDO_LTIC
+    if (algo == 11u) {
+        if (algo11_store_load())
+            gpsdo_log_event(GPSDO_LOG_INFO, "ALGO",
+                            "Algorithm 11 configuration loaded from flash.");
+        else
+            gpsdo_log_event(GPSDO_LOG_INFO, "ALGO",
+                            "Algorithm 11 has no valid saved configuration; using current defaults.");
+        return;
+    }
+
+    if (algo == 12u) {
+        if (algo12_store_load())
+            gpsdo_log_event(GPSDO_LOG_INFO, "ALGO",
+                            "Algorithm 12 configuration loaded from flash.");
+        else
+            gpsdo_log_event(GPSDO_LOG_INFO, "ALGO",
+                            "Algorithm 12 has no valid saved configuration; using current defaults.");
+        return;
+    }
+#endif
+
+#ifdef GPSDO_LTIC
     if (algo != 13u) return;
 
     uint8_t version = 0u;
@@ -214,6 +236,13 @@ bool gpsdo_algo_config_save(uint8_t algo)
      */
     switch (algo) {
 #ifdef GPSDO_LTIC
+    case 11u:
+        return algo11_store_save();
+    case 12u:
+        return algo12_store_save();
+#endif
+
+#ifdef GPSDO_LTIC
     case 13u:
         return kf_store_save();
 #endif
@@ -242,50 +271,50 @@ bool gpsdo_algo_selection_is_saved(uint8_t algo)
     return s_saved_algo_valid && s_saved_algo == algo;
 }
 
-static void load_plant_calibration(void)
+static void load_hardware_calibration(void)
 {
     uint8_t version = 0u;
-    plant_cal_status_t st = plant_cal_load_status(&version);
+    hw_cal_status_t st = hw_cal_load_status(&version);
 
     switch (st) {
-    case PLANT_CAL_OK:
+    case HW_CAL_OK:
         gpsdo_log_event(
             GPSDO_LOG_INFO, "CONFIG",
-            "OCXO plant calibration loaded from flash.");
+            "Hardware calibration loaded from flash.");
         break;
 
-    case PLANT_CAL_RECOVERED:
+    case HW_CAL_RECOVERED:
         gpsdo_log_event(
             GPSDO_LOG_WARN, "CONFIG",
-            "Latest saved OCXO plant calibration is corrupt; "
+            "Latest saved hardware calibration is corrupt; "
             "recovered the previous valid calibration.");
         break;
 
-    case PLANT_CAL_MISSING:
+    case HW_CAL_MISSING:
         gpsdo_log_event(
             GPSDO_LOG_INFO, "CONFIG",
-            "No saved OCXO plant calibration found; run CT.");
+            "No saved hardware calibration found; run CT and LC.");
         break;
 
-    case PLANT_CAL_VERSION:
+    case HW_CAL_VERSION:
         gpsdo_log_event(
             GPSDO_LOG_WARN, "CONFIG",
-            "Saved OCXO plant calibration is incompatible; run CT.");
+            "Saved hardware calibration is incompatible; run CT and LC.");
         break;
 
-    case PLANT_CAL_CHECKSUM:
-    case PLANT_CAL_SIZE:
-    case PLANT_CAL_INVALID_K:
+    case HW_CAL_CHECKSUM:
+    case HW_CAL_SIZE:
+    case HW_CAL_INVALID:
         gpsdo_log_event(
             GPSDO_LOG_WARN, "CONFIG",
-            "Saved OCXO plant calibration is invalid; run CT.");
+            "Saved hardware calibration is invalid; run CT and LC.");
         break;
 
-    case PLANT_CAL_STORAGE:
+    case HW_CAL_STORAGE:
     default:
         gpsdo_log_event(
             GPSDO_LOG_WARN, "CONFIG",
-            "OCXO plant calibration could not be loaded from flash; run CT.");
+            "Hardware calibration could not be loaded from flash; run CT and LC.");
         break;
     }
 }
@@ -298,9 +327,6 @@ void gpsdo_config_load(void)
     g_time_offset_min = 0;
 
     (void)flash_ring_begin();
-
-    /* CT calibration is its own persistence domain. */
-    load_plant_calibration();
 
     uint8_t settings_version = 0u;
     settings_load_status_t settings =
@@ -317,6 +343,10 @@ void gpsdo_config_load(void)
 
     live_load_status_t live = live_store_begin_status();
     log_live_status(live);
+
+    /* REC_HW_CAL is authoritative. Load it after the temporary legacy
+     * calibration copies in REC_SETTINGS/REC_LIVE so they cannot overwrite it. */
+    load_hardware_calibration();
 
     /* The settings record has now established the selected algorithm. */
     gpsdo_algo_config_load(gCtrl.active_algo);

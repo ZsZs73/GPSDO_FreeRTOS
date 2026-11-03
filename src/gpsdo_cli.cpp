@@ -26,7 +26,7 @@
 #endif
 #include "gpsdo_health.h"
 #include "gpsdo_state.h"
-#include "gpsdo_plant_cal.h"
+#include "gpsdo_hw_cal.h"
 #include <limits.h>
 #include "gpsdo_algorithms.h"
 #include "gpsdo_flash_ring.h"
@@ -631,7 +631,7 @@ static void dispatch(char *line)
         /* The Hz figures need the plant gain, which only CT can supply. Without
          * it the resolution is still real but its meaning in frequency is
          * unknown, and saying so beats printing a number from a default. */
-        double lsb_per_hz = plant_cal_lsb_per_hz();
+        double lsb_per_hz = hw_cal_lsb_per_hz();
         if (lsb_per_hz > 0.0) {
             /* TWO STEPS, AND THEY ARE NOT THE SAME NUMBER.
             *
@@ -801,7 +801,7 @@ if (cli_ieq(verb, "AV")) {
          * 1592.8 before CT and 921.2 after, a factor of 1.7, with nothing to
          * suggest the first was suspect. Warn rather than refuse — a re-run of LC
          * after CT is cheap, and there are legitimate reasons to sweep first. */
-        if (!plant_cal_valid()) {
+        if (!hw_cal_k_valid()) {
             cli_putln("LC: WARNING — no CT calibration yet, so the sweep will use a");
             cli_putln("    generic VCO slope and the result may be off by a large factor.");
             cli_putln("    Run 'CT' first, then 'LC'. Continuing anyway.");
@@ -1857,7 +1857,7 @@ if (cli_ieq(verb, "AV")) {
                  * into MG cost a 2.3 hour limit cycle on 26.08 (2.130 against a
                  * measured 31.3). Beyond a factor of four this is not tuning. */
                 {
-                    double der = plant_cal_lsb_per_hz() / 100.0;
+                    double der = hw_cal_lsb_per_hz() / 100.0;
                     if (v > 0.0 && der > 0.0 && (v > 4.0 * der || v * 4.0 < der)) {
                         snprintf(t, sizeof(t), "  CT measured %.2f LSB/ns", der);
                         cli_putln(t);

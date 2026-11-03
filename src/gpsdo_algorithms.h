@@ -356,6 +356,11 @@ typedef enum {
     KF_CONFIG_INVALID_KC
 } kf_config_status_t;
 
+/* Algorithm-private persistence. Loaded on demand when the algorithm is selected. */
+bool algo11_store_save(void);
+bool algo11_store_load(void);
+bool algo12_store_save(void);
+bool algo12_store_load(void);
 bool kf_store_save(void);
 kf_config_status_t kf_store_load_status(uint8_t *stored_version);
 bool kf_store_load(void);   /* compatibility wrapper */

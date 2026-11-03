@@ -49,10 +49,7 @@ typedef struct {
     float    press_off;      /* g_pressure_offset                          */
     float    alt_off;        /* g_altitude_offset                          */
     uint8_t  svin_en;        /* g_svin_enabled                             */
-    /* LTIC params (algo 10) */
-    float    ltic_nsv;       /* g_ltic.ns_per_volt                         */
-    float    ltic_zero;      /* g_ltic.zero_offset                         */
-    float    ltic_range;     /* g_ltic.range_ns                            */
+    /* LTIC loop/tuning params (hardware calibration lives in REC_HW_CAL) */
     float    ltic_dpll_kp, ltic_dpll_ki, ltic_dpll_kd, ltic_dpll_il;
     float    ltic_lock_kp, ltic_lock_ki, ltic_lock_kd, ltic_lock_il;
     float    ltic_acq_th;    /* g_ltic.acq_threshold_ns                    */
@@ -61,8 +58,6 @@ typedef struct {
     uint8_t  ltic_state;     /* g_ltic.state                               */
     uint8_t  ltic_submode;   /* g_ltic.submode                             */
     float    ltic_acq_kp, ltic_acq_ki, ltic_acq_kd, ltic_acq_il;
-    int8_t   ltic_polarity;  /* g_ltic.polarity                            */
-    float    ltic_centre_v;  /* g_ltic.centre_v                            */
     /* LTIC-Lars params (algo 11) */
     float    lars_gain;      /* g_lars.gain (0 = auto from CT)             */
     float    lars_damping;   /* g_lars.damping                            */
@@ -77,10 +72,8 @@ typedef struct {
     uint16_t fa_win_dpll;    /* g_freq_damp_win_dpll (FAD)                */
     uint16_t fa_win_lock;    /* g_freq_damp_win_lock (FAL)                */
     uint8_t  lt_local;       /* g_show_local_time (LT): 1 = local, 0 = UTC */
-    /* LRN params (fallback only — normally owned by live_store/ring) */
+    /* LRN enable is user configuration; learned values are owned by REC_LIVE. */
     uint8_t  lrn_en;
-    float    lrn_drift;      /* g_lrn_drift                                */
-    float    lrn_damp;       /* g_lrn_damp                                 */
     /* enable flags */
     uint8_t  warmup_en;      /* g_warmup_enable                            */
     uint8_t  splash_en;      /* g_splash_enable                            */

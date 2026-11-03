@@ -1,27 +1,18 @@
 /* ======================================================================
- * gpsdo_live_store.h  —  live-data persistence (LRN + LC + PWM) over the ring
+ * gpsdo_live_store.h  —  learned/runtime persistence over the flash ring
  *
- * Part of GPSDO FreeRTOS v1.07
+ * REC_LIVE owns runtime state which changes during normal operation and is
+ * useful across warm restarts. It does not own user configuration, algorithm
+ * selection, or hardware calibration.
  *
- * Sits between the volatile "live" values (learned drift/damping, LC
- * calibration, last PWM) and the wear-levelled flash ring buffer. It packs
- * them into one 27-byte slot and applies hysteresis so the flash is written
- * only when a value has genuinely settled on a new level:
+ * Current payload (10 bytes, little-endian):
+ *   [0..3]  learned drift    float
+ *   [4..7]  learned damping  float
+ *   [8..9]  last PWM         uint16_t
  *
- *   - drift changed by > 8 LSB  since last save, OR
- *   - damp  changed by > 0.03   since last save,
- *   AND at least 20 min have elapsed since the last save.
- *   - LC calibration change requests an immediate save (rare, user-driven).
- *
- * Payload layout (27 bytes):
- *   [0..3]   lrn_drift    float
- *   [4..7]   lrn_damp     float
- *   [8..11]  ns_per_volt  float
- *   [12..15] zero_offset  float
- *   [16..19] range_ns     float
- *   [20..21] pwm          uint16
- *   [22..25] centre_v     float
- *   [26]     algo         uint8
+ * Automatic writes keep the existing wear policy: a 20-minute minimum interval
+ * plus material learned-value change. Explicit save requests bypass that time
+ * gate and retry after a failed write.
  * ====================================================================== */
 #ifndef GPSDO_LIVE_STORE_H
 #define GPSDO_LIVE_STORE_H
@@ -50,7 +41,7 @@ bool live_store_begin(void);
 void live_store_tick(uint32_t now_ms);
 
 /* Request an immediate save on the next tick (used after a successful LC
- * calibration). */
+ * runtime state). */
 void live_store_request_save(void);
 
 #endif /* GPSDO_LIVE_STORE_H */

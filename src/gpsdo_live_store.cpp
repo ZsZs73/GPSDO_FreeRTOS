@@ -16,8 +16,7 @@
 #define LS_DAMP_DELTA  0.03f
 #define LS_MIN_MS      (20u * 60u * 1000u)   /* 20 minutes */
 
-#define LS_PAYLOAD     27u
-
+#define LS_PAYLOAD     10u
 /* last-saved values, to measure change since the previous write */
 static float    s_last_drift = 0.0f;
 static float    s_last_damp  = 1.0f;
@@ -34,63 +33,35 @@ static uint16_t ls_get_u16(const uint8_t *p){ return (uint16_t)(p[0] | (p[1] << 
 
 static void ls_pack(uint8_t *buf)
 {
-    float drift, damp, nsv, zero, range, centre;
-    uint16_t pwm; uint8_t algo;
+    float drift = g_lrn_drift;
+    float damp  = g_lrn_damp;
+    uint16_t pwm = DEFAULT_PWM_OUTPUT;
 
-    drift = g_lrn_drift; damp = g_lrn_damp;
-    nsv   = g_ltic.ns_per_volt; zero = g_ltic.zero_offset;
-    range = g_ltic.range_ns;    centre = g_ltic.centre_v;
-
-    pwm = DEFAULT_PWM_OUTPUT; algo = 0;
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
-        pwm  = gCtrl.pwm_output;          /* boot path: single-threaded */
-        algo = gCtrl.active_algo;
+        pwm = gCtrl.pwm_output;
     } else if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        pwm  = gCtrl.pwm_output;
-        algo = gCtrl.active_algo;
+        pwm = gCtrl.pwm_output;
         xSemaphoreGive(xCtrlMutex);
     }
 
-    ls_put_f  (buf +  0, drift);
-    ls_put_f  (buf +  4, damp);
-    ls_put_f  (buf +  8, nsv);
-    ls_put_f  (buf + 12, zero);
-    ls_put_f  (buf + 16, range);
-    ls_put_u16(buf + 20, pwm);
-    ls_put_f  (buf + 22, centre);
-    buf[26] = algo;
+    ls_put_f  (buf + 0, drift);
+    ls_put_f  (buf + 4, damp);
+    ls_put_u16(buf + 8, pwm);
 }
 
 static void ls_apply(const uint8_t *buf)
 {
-    /* learned values */
-    g_lrn_drift = ls_get_f(buf +  0);
-    g_lrn_damp  = ls_get_f(buf +  4);
-    /* The damping floor can change between firmware versions (it was raised
-     * 0.30 → 0.45 when a too-hard floor was found to starve the loop and drop
-     * lock). Flash written by an older build can therefore hold a damp below
-     * the current floor, and since damp only adapts on limit-cycle crossings
-     * it would otherwise stay stuck there for a long time. Clamp the restored
-     * value into the current legal band so a reflash takes effect immediately. */
+    g_lrn_drift = ls_get_f(buf + 0);
+    g_lrn_damp  = ls_get_f(buf + 4);
+
     if (g_lrn_damp < LRN_DAMP_LO) g_lrn_damp = LRN_DAMP_LO;
     if (g_lrn_damp > LRN_DAMP_HI) g_lrn_damp = LRN_DAMP_HI;
-    /* LC calibration */
-    g_ltic.ns_per_volt = ls_get_f(buf +  8);
-    g_ltic.zero_offset = ls_get_f(buf + 12);
-    g_ltic.range_ns    = ls_get_f(buf + 16);
-    g_ltic.centre_v    = ls_get_f(buf + 22);
-    /* PWM is applied: it is genuinely live (freshest operating point) and
-     * self-correcting even if slightly stale. The algo byte is NOT applied:
-     * the active algorithm is a SETTING — the user's explicit choice, saved
-     * by ES and owned by the EEPROM — and a stale ring slot must never
-     * override it (bug: LA 9 + ES + reset came back as algo 7, restored
-     * from a slot written while 7 was still running). The byte stays in the
-     * payload purely as provenance: which algorithm produced these values. */
-    uint16_t pwm  = ls_get_u16(buf + 20);
+
+    uint16_t pwm = ls_get_u16(buf + 8);
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
-        gCtrl.pwm_output  = pwm;
+        gCtrl.pwm_output = pwm;
     } else if (xSemaphoreTake(xCtrlMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        gCtrl.pwm_output  = pwm;
+        gCtrl.pwm_output = pwm;
         xSemaphoreGive(xCtrlMutex);
     }
 
@@ -153,8 +124,9 @@ void live_store_tick(uint32_t now_ms)
         s_last_damp  = g_lrn_damp;
         s_last_ms    = now_ms;
         s_have_last  = true;
+        s_force_save = false;
     }
-    s_force_save = false;   /* clear regardless; retry next tick if write failed */
+    /* Failed forced writes keep s_force_save set so the next tick retries. */
 }
 
 void live_store_request_save(void)

@@ -14,7 +14,7 @@
 #include "gpsdo_algorithms.h"
 #include "gpsdo_state.h"
 #include "gpsdo_health.h"
-#include "gpsdo_plant_cal.h"
+#include "gpsdo_hw_cal.h"
 
 /* Weights, in CORRECTIONS rather than seconds. A decade apart, so the four
  * windows cover four orders of magnitude without overlapping usefully.
@@ -154,8 +154,8 @@ void health_get(health_stats_t *out)
 {
     /* CT owns the measured OCXO slope directly. Without CT there is no
      * calibrated conversion between control LSB and hertz. */
-    out->have_k       = plant_cal_valid();
-    out->k_hz_per_lsb = plant_cal_k_hz_per_lsb();
+    out->have_k       = hw_cal_k_valid();
+    out->k_hz_per_lsb = hw_cal_k_hz_per_lsb();
 
     out->updates = s_n;
     out->gated   = s_gated;

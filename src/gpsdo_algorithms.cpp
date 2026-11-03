@@ -29,7 +29,7 @@
 #include "gpsdo_dac.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_flash_ring.h"
-#include "gpsdo_plant_cal.h"
+#include "gpsdo_hw_cal.h"
 #include <string.h>
 #include <math.h>
 
@@ -202,7 +202,7 @@ static float lrn_update_ef(double e_freq, double phase_ns, double dt, bool locke
         double mean_ef = ef_win / win_t;          /* Hz, residual after ff  */
         g_lrn_slope_ns_s = (float)(mean_ef * 1.0e9 / (double)BASE_FREQ); /* ns/s */
         if (fabs(mean_ef) > 2.0e-4) {             /* 0.2 mHz deadband       */
-            double lsbhz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
+            double lsbhz = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 3000.0;
             /* u = -(…): positive e_freq (freq high) must LOWER pwm, so the
              * feed-forward carries -e_freq. Move a fraction of the residual. */
             double corr = -mean_ef * lsbhz;
@@ -587,7 +587,7 @@ static void ltic_arm_picdiv(void)
  */
 void ltic_autotune(void)
 {
-    double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
+    double lsb_per_hz = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 3000.0;
 
     /* RECOMPUTE ONLY WHEN THE INPUTS CHANGED.
      *
@@ -1305,8 +1305,8 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
                          * attempt, and knowing the slope is what removes it. */
                         double mean = mb;
                         if (fabs(slope) > LTIC_LOCK_SIGMA_K * sem_slope) {
-                            double lsb_per_ns = (plant_cal_valid())
-                                              ? plant_cal_lsb_per_hz()/ 100.0 : 25.0;
+                            double lsb_per_ns = (hw_cal_k_valid())
+                                              ? hw_cal_lsb_per_hz()/ 100.0 : 25.0;
                             /* Damped 0.5 — Alan's k. One pair is a single
                              * measurement; half strength converges in two
                              * corrections where full strength stakes it all on one.
@@ -1360,7 +1360,7 @@ uint16_t ltic_three_stage(uint16_t pwm, uint32_t ppscount)
             }
             if (state == LTIC_LOCK) {
                 /* hard cap per step: ≈4 mHz regardless of unit (from measured K) */
-                double lsbhz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
+                double lsbhz = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 3000.0;
                 double cap = lsbhz * 0.004;
                 if (cap < 3.0) cap = 3.0;
                 /* ...but never below what the loop has just MEASURED it needs.
@@ -1794,7 +1794,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
 
     /* Effective frequency-branch scale. g_lars.gain == 0 means "auto": derive it
      * from the CT calibration, exactly as algo 10 does. CT measures K in Hz per
-     * PWM LSB, so plant_cal_lsb_per_hz() gives the LSB/Hz scale needed here. */
+     * PWM LSB, so hw_cal_lsb_per_hz() gives the LSB/Hz scale needed here. */
     float freq_scale;      /* LSB per Hz  — used by the acquisition branch */
     float phase_gain;      /* LSB per ns  — used by the phase branch        */
     if (g_lars.gain > 0.0f) {
@@ -1802,8 +1802,8 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
         phase_gain  = g_lars.gain;
         g_lars_gain_auto = false;
     } else {
-        double lsb_per_hz = (plant_cal_valid())
-                          ? plant_cal_lsb_per_hz()  /* from CT          */
+        double lsb_per_hz = (hw_cal_k_valid())
+                          ? hw_cal_lsb_per_hz()  /* from CT          */
                           : 3000.0;                       /* fallback if no CT */
         freq_scale = (float)(0.5 * lsb_per_hz);
 
@@ -2777,7 +2777,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
          * 36% and level 0.3 for the loop as it stands. */
         /* fll_holdoff: hoisted to the top of this function so the restart block can
          * clear it; the storage and the initialiser are unchanged. */
-        double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 0.0;
+        double lsb_per_hz = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 0.0;
         if (fll_holdoff > 0u) {
             fll_holdoff--;
         } else if (lsb_per_hz > 0.0 && ppscount > 60u &&
@@ -3245,7 +3245,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
          * possible. This only makes sure the operator hears about it. */
         {
             static float s_warned_mg = -1.0f;
-            double der = (plant_cal_valid()) ? plant_cal_lsb_per_hz()/ 100.0 : 0.0;
+            double der = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz()/ 100.0 : 0.0;
             if (der > 0.0 && g_mlacc_gain != s_warned_mg &&
                 (lsb_per_ns > 4.0 * der || lsb_per_ns * 4.0 < der)) {
                 s_warned_mg = g_mlacc_gain;
@@ -3258,7 +3258,7 @@ uint16_t multi_level_accum(uint16_t pwm, uint32_t ppscount)
             }
         }
     } else {
-        double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 0.0;
+        double lsb_per_hz = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 0.0;
         if (lsb_per_hz <= 0.0) {
             s_mla_locked = false;
             set_trend("NoCT");
@@ -4001,12 +4001,152 @@ static void kf_reset(const kf_scale_t *k)
  * older firmware simply never asks for this type, and a record written by an
  * older version of this layout is rejected on the version byte rather than
  * misread. */
-#define A13_REC_VER 2u          /* 1 = R,Q,KT (12 B); 2 = adds KC (14 B) */
+#define AL13_REC_VER 2u          /* 1 = R,Q,KT (12 B); 2 = adds KC (14 B) */
+
+
+/* ---- algorithm-private persistence ------------------------------------ */
+
+#define AL11_REC_VER 1u
+#define AL12_REC_VER 1u
+
+typedef struct {
+    uint8_t  ver;
+    float    gain;
+    float    damping;
+    uint16_t time_const_s;
+    uint8_t  filter_div;
+    uint16_t tic_offset;
+    uint16_t lock_ns_lim;
+    uint8_t  lock_factor;
+    int16_t  temp_coeff;
+    uint16_t temp_ref;
+    uint8_t  flags;
+    uint16_t fa_win_dpll;
+    uint16_t fa_win_lock;
+} Algo11Record_t;
+
+typedef struct {
+    uint8_t  ver;
+    float    gain;
+    uint8_t  run_level;
+    uint8_t  thr_src;
+    uint16_t thr_tgt_s;
+    int32_t  lim[11];
+} Algo12Record_t;
+
+static bool algo_fa_window_valid(uint16_t v)
+{
+    return v == 10u || v == 100u || v == 1000u;
+}
+
+bool algo11_store_save(void)
+{
+    Algo11Record_t r = {};
+    r.ver          = AL11_REC_VER;
+    r.gain         = g_lars.gain;
+    r.damping      = g_lars.damping;
+    r.time_const_s = g_lars.time_const_s;
+    r.filter_div   = g_lars.filter_div;
+    r.tic_offset   = g_lars.tic_offset;
+    r.lock_ns_lim  = g_lars.lock_ns_lim;
+    r.lock_factor  = g_lars.lock_factor;
+    r.temp_coeff   = g_lars.temp_coeff;
+    r.temp_ref     = g_lars.temp_ref;
+    r.flags        = g_lars.flags;
+    r.fa_win_dpll  = g_freq_damp_win_dpll;
+    r.fa_win_lock  = g_freq_damp_win_lock;
+    return flash_ring_write(REC_AL11, (const uint8_t *)&r, sizeof(r));
+}
+
+bool algo11_store_load(void)
+{
+    Algo11Record_t r = {};
+    uint16_t n = 0u;
+    flash_ring_read_status_t rs =
+        flash_ring_read_newest_ex(REC_AL11, (uint8_t *)&r, sizeof(r), &n);
+
+    if (rs != FLASH_RING_READ_OK && rs != FLASH_RING_READ_RECOVERED)
+        return false;
+    if (n != sizeof(r) || r.ver != AL11_REC_VER)
+        return false;
+    if (!isfinite(r.gain) || r.gain < 0.0f || r.gain > 10000.0f)
+        return false;
+    if (!isfinite(r.damping) || r.damping < 0.001f || r.damping > 1000.0f)
+        return false;
+    if (r.time_const_s < 1u || r.time_const_s > 600u)
+        return false;
+    if (r.filter_div < 1u || r.filter_div > 100u)
+        return false;
+    if (r.tic_offset > 4095u || r.lock_ns_lim < 1u || r.lock_ns_lim > 10000u)
+        return false;
+    if (r.lock_factor < 1u || r.lock_factor > 100u || r.temp_ref > 4095u)
+        return false;
+    if (!algo_fa_window_valid(r.fa_win_dpll) ||
+        !algo_fa_window_valid(r.fa_win_lock))
+        return false;
+
+    g_lars.gain         = r.gain;
+    g_lars.damping      = r.damping;
+    g_lars.time_const_s = r.time_const_s;
+    g_lars.filter_div   = r.filter_div;
+    g_lars.tic_offset   = r.tic_offset;
+    g_lars.lock_ns_lim  = r.lock_ns_lim;
+    g_lars.lock_factor  = r.lock_factor;
+    g_lars.temp_coeff   = r.temp_coeff;
+    g_lars.temp_ref     = r.temp_ref;
+    g_lars.flags        = r.flags;
+    g_freq_damp_win_dpll = r.fa_win_dpll;
+    g_freq_damp_win_lock = r.fa_win_lock;
+    return true;
+}
+
+bool algo12_store_save(void)
+{
+    Algo12Record_t r = {};
+    r.ver       = AL12_REC_VER;
+    r.gain      = g_mlacc_gain;
+    r.run_level = g_mlacc_run_level;
+    r.thr_src   = g_mlacc_thr_src;
+    r.thr_tgt_s = g_mlacc_thr_tgt_s;
+    for (int i = 0; i < 11; ++i)
+        r.lim[i] = g_mlacc_lim[i];
+    return flash_ring_write(REC_AL12, (const uint8_t *)&r, sizeof(r));
+}
+
+bool algo12_store_load(void)
+{
+    Algo12Record_t r = {};
+    uint16_t n = 0u;
+    flash_ring_read_status_t rs =
+        flash_ring_read_newest_ex(REC_AL12, (uint8_t *)&r, sizeof(r), &n);
+
+    if (rs != FLASH_RING_READ_OK && rs != FLASH_RING_READ_RECOVERED)
+        return false;
+    if (n != sizeof(r) || r.ver != AL12_REC_VER)
+        return false;
+    if (!isfinite(r.gain) || r.gain < 0.0f || r.gain > 10000.0f)
+        return false;
+    if (r.run_level >= 11u || r.thr_src > 3u)
+        return false;
+    if (!(r.thr_tgt_s == 0u || r.thr_tgt_s >= (1u << MLACC_LEVELS)))
+        return false;
+    for (int i = 0; i < 11; ++i)
+        if (r.lim[i] < 1 || r.lim[i] > 500000)
+            return false;
+
+    g_mlacc_gain      = r.gain;
+    g_mlacc_run_level = r.run_level;
+    g_mlacc_thr_src   = r.thr_src;
+    g_mlacc_thr_tgt_s = r.thr_tgt_s;
+    for (int i = 0; i < 11; ++i)
+        g_mlacc_lim[i] = r.lim[i];
+    return true;
+}
 
 bool kf_store_save(void)
 {
     uint8_t b[14];
-    b[0] = A13_REC_VER; b[1] = 0;
+    b[0] = AL13_REC_VER; b[1] = 0;
     memcpy(&b[4], &g_kf_r_ns, 4);
     memcpy(&b[8], &g_kf_q,    4);
     /* KT rides in the two spare header bytes rather than growing the record. */
@@ -4014,7 +4154,7 @@ bool kf_store_save(void)
     b[3] = (uint8_t)(g_kf_horizon_s >> 8);
     b[12] = (uint8_t)(g_kf_ctl_s & 0xFFu);
     b[13] = (uint8_t)(g_kf_ctl_s >> 8);
-    return flash_ring_write(REC_A13, b, sizeof(b));
+    return flash_ring_write(REC_AL13, b, sizeof(b));
 }
 
 kf_config_status_t kf_store_load_status(uint8_t *stored_version)
@@ -4033,7 +4173,7 @@ kf_config_status_t kf_store_load_status(uint8_t *stored_version)
 
     uint16_t n = 0u;
     flash_ring_read_status_t rs =
-        flash_ring_read_newest_ex(REC_A13, b, sizeof(b), &n);
+        flash_ring_read_newest_ex(REC_AL13, b, sizeof(b), &n);
 
     if (rs == FLASH_RING_READ_MISSING)   return KF_CONFIG_MISSING;
     if (rs == FLASH_RING_READ_CHECKSUM)  return KF_CONFIG_CHECKSUM;
@@ -4047,11 +4187,11 @@ kf_config_status_t kf_store_load_status(uint8_t *stored_version)
     if (n == 0u) return KF_CONFIG_SIZE;
     if (stored_version) *stored_version = b[0];
 
-    if (b[0] != 1u && b[0] != A13_REC_VER)
+    if (b[0] != 1u && b[0] != AL13_REC_VER)
         return KF_CONFIG_VERSION;
 
     if ((b[0] == 1u && n != 12u) ||
-        (b[0] == A13_REC_VER && n != 14u))
+        (b[0] == AL13_REC_VER && n != 14u))
         return KF_CONFIG_SIZE;
 
     float r, q;
@@ -4065,7 +4205,7 @@ kf_config_status_t kf_store_load_status(uint8_t *stored_version)
         return KF_CONFIG_INVALID_KT;
 
     uint16_t c = 0u;
-    if (b[0] == A13_REC_VER) {
+    if (b[0] == AL13_REC_VER) {
         c = (uint16_t)b[12] | ((uint16_t)b[13] << 8);
         if (!(c == 0u || (c >= 10u && c <= (uint16_t)KF_HORIZON_MAX)))
             return KF_CONFIG_INVALID_KC;
@@ -4115,7 +4255,7 @@ uint16_t kalman_ctl(uint16_t pwm, uint32_t ppscount)
     }
     /* Scale, from CT. lsb_per_ns is the counts that null one nanosecond of
      * phase in one second, so its reciprocal is the ns/s one count buys. */
-    double lsb_per_hz = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 0.0;
+    double lsb_per_hz = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 0.0;
     if (lsb_per_hz <= 0.0) { s_kf_locked = false; set_trend("NoCT"); return pwm; }
     double lsb_per_ns = lsb_per_hz / 100.0;
 

@@ -26,7 +26,7 @@
 #include "gpsdo_live_store.h"
 #include "gpsdo_settings_store.h"
 #include "gpsdo_algorithms.h"
-#include "gpsdo_plant_cal.h"
+#include "gpsdo_hw_cal.h"
 #include "gpsdo_adc.h"
 #include <Arduino.h>
 #include <string.h>
@@ -559,7 +559,7 @@ static void do_calibrate_tune(void)
      * second pass gives low-K plants enough measurement swing for a reliable
      * fit. Upper 2e-3 remains a guard against implausibly wide/non-linear
      * plants. */
-    if (K < PLANT_K_MIN_HZ_PER_LSB || K > PLANT_K_MAX_HZ_PER_LSB) {
+    if (K < HW_CAL_K_MIN_HZ_PER_LSB || K > HW_CAL_K_MAX_HZ_PER_LSB) {
         OUT_SERIAL.print("CT: ERROR K out of range (");
         OUT_SERIAL.print(K * 1000.0, 4);
         OUT_SERIAL.println(" mHz/LSB) — check GPS fix / EFC range. Params unchanged.");
@@ -574,7 +574,7 @@ static void do_calibrate_tune(void)
      * Keep the derivation centralized in algo_coeffs_from_k(); the two locals
      * below are only for the unchanged operator report. */
     /* CT owns this hardware fact; legacy coefficients are derived from it below. */
-    if (!plant_cal_set_k(K)) {
+    if (!hw_cal_set_k(K)) {
         OUT_SERIAL.println("CT: ERROR measured plant slope is invalid.");
         ct_fail();
         return;
@@ -623,7 +623,7 @@ static void do_calibrate_tune(void)
      * it to a power cut because nobody typed ES is a poor trade. Only the PID
      * group is written, so live loop tuning the operator may be experimenting
      * with elsewhere is left alone. */
-    const bool plant_saved = plant_cal_save();
+    const bool plant_saved = hw_cal_save();
     live_store_request_save();  /* CT's new operating PWM is live state. */
 
     /* Temporary bridge: remove with algorithms 3-10. */
@@ -724,7 +724,7 @@ static void do_ltic_calibrate(void)
      * saturation arrives before 10 fit points, halve the offset, re-arm and
      * retry once. */
     uint16_t ramp_pwm = saved_pwm;
-    double lsbhz0 = (plant_cal_valid()) ? plant_cal_lsb_per_hz() : 3000.0;
+    double lsbhz0 = (hw_cal_k_valid()) ? hw_cal_lsb_per_hz() : 3000.0;
     /* commanded fallback offset: NEGATIVE, matching the sweep direction
      * (interval grows when the OCXO runs below 10 MHz) */
     int32_t cmd_off = (int32_t)(-0.06 * lsbhz0);
@@ -1281,17 +1281,24 @@ static void do_ltic_calibrate(void)
             OUT_SERIAL.print("LC: polarity ");
             OUT_SERIAL.print((int)g_ltic.polarity);
             OUT_SERIAL.println(" detected.");
-            /* REC_LIVE owns the changing LC/live state, but polarity is
-             * still a REC_SETTINGS field in the current v7 layout. Save both
-             * until v8 moves hardware calibration into REC_HW_CAL. */
-            live_store_request_save();
+            /* REC_HW_CAL owns detector calibration; SET_LTIC keeps LC-autotuned loop gains. */
+            const bool hw_cal_saved =
+                hw_cal_set_ltic(g_ltic.ns_per_volt,
+                                g_ltic.zero_offset,
+                                g_ltic.range_ns,
+                                g_ltic.polarity,
+                                g_ltic.centre_v) &&
+                hw_cal_save();
+
             const bool ltic_settings_saved =
                 settings_save_partial(SET_LTIC);
 
-            if (ltic_settings_saved)
+            if (hw_cal_saved && ltic_settings_saved)
                 OUT_SERIAL.println("LC: PASSED — detector calibration and polarity auto-saved to flash ring.");
+            else if (!hw_cal_saved)
+                OUT_SERIAL.println("LC: PASSED — detector calibrated, but REC_HW_CAL save FAILED.");
             else
-                OUT_SERIAL.println("LC: PASSED — detector calibrated, but polarity save FAILED; run 'ES LTIC'.");
+                OUT_SERIAL.println("LC: PASSED — hardware calibration saved, but LTIC loop-tuning save FAILED.");
         } else {
             OUT_SERIAL.print("LC: WEAK result — ");
             if (!span_sane)     OUT_SERIAL.print("voltage span too small; ");

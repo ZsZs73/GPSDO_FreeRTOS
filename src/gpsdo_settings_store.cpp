@@ -105,9 +105,6 @@ static void snapshot_full(SettingsBlock_t *s)
     s->press_off   = g_pressure_offset;
     s->alt_off     = g_altitude_offset;
     s->svin_en     = g_svin_enabled ? 1u : 0u;
-    s->ltic_nsv    = g_ltic.ns_per_volt;
-    s->ltic_zero   = g_ltic.zero_offset;
-    s->ltic_range  = g_ltic.range_ns;
     s->ltic_dpll_kp = (float)g_ltic.dpll.Kp;
     s->ltic_dpll_ki = (float)g_ltic.dpll.Ki;
     s->ltic_dpll_kd = (float)g_ltic.dpll.Kd;
@@ -125,8 +122,6 @@ static void snapshot_full(SettingsBlock_t *s)
     s->ltic_acq_ki  = (float)g_ltic.acq.Ki;
     s->ltic_acq_kd  = (float)g_ltic.acq.Kd;
     s->ltic_acq_il  = (float)g_ltic.acq.I_LIMIT;
-    s->ltic_polarity = g_ltic.polarity;
-    s->ltic_centre_v = g_ltic.centre_v;
     /* LTIC-Lars (algo 11) */
     s->lars_gain     = g_lars.gain;
     s->lars_damping  = g_lars.damping;
@@ -142,8 +137,6 @@ static void snapshot_full(SettingsBlock_t *s)
     s->fa_win_lock   = g_freq_damp_win_lock;
     s->lt_local      = g_show_local_time ? 1u : 0u;
     s->lrn_en    = g_lrn_enable ? 1u : 0u;
-    s->lrn_drift = g_lrn_drift;
-    s->lrn_damp  = g_lrn_damp;
     s->warmup_en = g_warmup_enable ? 1u : 0u;
     s->splash_en = g_splash_enable ? 1u : 0u;
     s->saw_en    = g_qerr_enable  ? 1u : 0u;
@@ -206,10 +199,7 @@ static void apply_full(const SettingsBlock_t *s)
 
     g_svin_enabled = (s->svin_en != 0u);
 
-    /* LTIC params */
-    if (is_finite_pos(s->ltic_nsv, 0.0f, 1.0e6f))   g_ltic.ns_per_volt = s->ltic_nsv;
-    if (is_finite_pos(s->ltic_zero, 0.0f, 3.3f))    g_ltic.zero_offset = s->ltic_zero;
-    if (is_finite_pos(s->ltic_range, 0.0f, 1.0e9f)) g_ltic.range_ns    = s->ltic_range;
+    /* LTIC loop/tuning params; detector calibration comes from REC_HW_CAL. */
     if (is_finite_pos(s->ltic_dpll_kp, 0.0f, 100000.0f)) g_ltic.dpll.Kp = s->ltic_dpll_kp;
     if (is_finite_pos(s->ltic_dpll_ki, 0.0f, 100000.0f)) g_ltic.dpll.Ki = s->ltic_dpll_ki;
     if (is_finite_pos(s->ltic_dpll_kd, 0.0f, 100000.0f)) g_ltic.dpll.Kd = s->ltic_dpll_kd;
@@ -228,12 +218,6 @@ static void apply_full(const SettingsBlock_t *s)
     if (is_finite_pos(s->ltic_acq_ki, 0.0f, 100000.0f)) g_ltic.acq.Ki = s->ltic_acq_ki;
     if (is_finite_pos(s->ltic_acq_kd, 0.0f, 100000.0f)) g_ltic.acq.Kd = s->ltic_acq_kd;
     if (is_finite_pos(s->ltic_acq_il, 0.0f, 100000.0f)) g_ltic.acq.I_LIMIT = s->ltic_acq_il;
-    {
-        int8_t sp = s->ltic_polarity;
-        g_ltic.polarity = (sp == 1 || sp == -1) ? sp : 0;
-    }
-    if (is_finite_pos(s->ltic_centre_v, 0.0f, 3.3f)) g_ltic.centre_v = s->ltic_centre_v;
-
     /* LTIC-Lars (algo 11). Gain 0 is valid (auto); the remaining fields are
      * range-checked like the LTIC block above. */
     if (isfinite(s->lars_gain) && s->lars_gain >= 0.0f && s->lars_gain <= 10000.0f)
@@ -255,11 +239,8 @@ static void apply_full(const SettingsBlock_t *s)
         g_freq_damp_win_lock = s->fa_win_lock;
     g_show_local_time = (s->lt_local != 0u);
 
-    /* LRN (fallback when ring not yet populated by live_store) */
+    /* LRN enable is user configuration; learned values come from REC_LIVE. */
     g_lrn_enable = (s->lrn_en != 0u);
-    if (is_finite_pos(s->lrn_drift, -400.0f, 400.0f)) g_lrn_drift = s->lrn_drift;
-    if (is_finite_pos(s->lrn_damp, LRN_DAMP_LO, LRN_DAMP_HI)) g_lrn_damp = s->lrn_damp;
-
     /* enable flags */
     g_warmup_enable = (s->warmup_en != 0u);
     g_splash_enable = (s->splash_en != 0u);
@@ -360,17 +341,12 @@ bool settings_save_partial(settings_partial_t which)
         put_pid_group(&s);
         break;
     case SET_LTIC:
-        s.ltic_nsv  = g_ltic.ns_per_volt;
-        s.ltic_zero = g_ltic.zero_offset;
-        s.ltic_range = g_ltic.range_ns;
         put_ltic_gains(&s);
         s.ltic_acq_th  = g_ltic.acq_threshold_ns;
         s.ltic_dpll_th = g_ltic.dpll_lock_thresh;
         s.ltic_lock_iv = g_ltic.lock_interval_s;
         s.ltic_state   = g_ltic.state;
         s.ltic_submode = g_ltic.submode;
-        s.ltic_polarity = g_ltic.polarity;
-        s.ltic_centre_v = g_ltic.centre_v;
         /* LTIC-Lars (algo 11) rides with the LTIC group: one ES LTIC saves both */
         s.lars_gain     = g_lars.gain;
         s.lars_damping  = g_lars.damping;

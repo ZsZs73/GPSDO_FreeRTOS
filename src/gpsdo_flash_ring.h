@@ -48,9 +48,11 @@
  * settings block: that block has no padding left, and growing it would force a
  * SETTINGS_VER bump that throws away everyone's PID, LC and timezone for three
  * numbers. A new type costs nothing and an older build simply never reads it. */
-#define REC_A13       2u
+#define REC_AL13    2u
+#define REC_AL11    4u
+#define REC_AL12    5u
 /* Shared CT/OCXO plant calibration (K = Hz per 16-bit LSB). */
-#define REC_PLANT    3u
+#define REC_HW_CAL  3u
 
 /* Initialise: validate header, scan slots. Call once at boot before the
  * scheduler starts. Returns true if at least one valid slot exists. */
