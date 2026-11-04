@@ -16,6 +16,7 @@
  * backed settings_store API.
  */
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_state.h"
 #include <limits.h>
 #include "gpsdo_tz.h"

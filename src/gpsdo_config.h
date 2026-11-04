@@ -404,16 +404,38 @@ extern "C" {
  * USB Serial (still available for low-level boot diagnostics regardless).
  * CLI_SERIAL and REPORT_SERIAL follow the same pattern in their .cpp files. */
 #if defined(GPSDO_BLUETOOTH_PARALLEL)
-  /* g_tee is a TeeSerial (defined in gpsdo_tee_serial.h). We must NOT include that
-   * header here — this file is inside an extern "C" block and gpsdo_tee_serial.h pulls
+  /* g_serial is a GpsdoSerial (defined in gpsdo_serial_tx.h). We must NOT include that
+   * header here — this file is inside an extern "C" block and gpsdo_serial_tx.h pulls
    * in Arduino.h with C++ templates, which are illegal under C linkage. Each
-   * .cpp that uses OUT_SERIAL includes gpsdo_tee_serial.h itself, outside extern "C". */
-  #define OUT_SERIAL g_tee
+   * .cpp that uses OUT_SERIAL includes gpsdo_serial_tx.h itself, outside extern "C". */
+  #define OUT_SERIAL g_serial
 #elif defined(GPSDO_BLUETOOTH)
   #define OUT_SERIAL Serial2
 #else
   #define OUT_SERIAL Serial
 #endif
+
+
+/* Serial TX transport.
+ * Queue full = producer waits; output is not silently discarded.
+ * Serial2 line pacing protects simple serial/TCP bridges from long bursts.
+ * Set the line gap to 0 for a future peer with robust flow control. */
+#define GPSDO_SERIAL_TX_CHUNK        128u
+#define GPSDO_SERIAL_TX_QUEUE_DEPTH   24u
+#define GPSDO_SERIAL_TX_STACK        512u
+#define GPSDO_SERIAL_TX_PRIORITY     (tskIDLE_PRIORITY + 2u)
+/*
+ * Optional inter-line pacing for Serial2.
+ *
+ * This was introduced while debugging serial-gateway truncation with
+ * ESP Easy, whose bridge could overrun on long bursts. A more robust
+ * gateway (Tasmota) handled the same traffic correctly at 57600 baud
+ * with no pacing, so the normal setting is 0 ms.
+ *
+ * Increase only if a downstream serial bridge cannot reliably absorb
+ * sustained output bursts and has no better flow-control mechanism.
+ */
+#define GPSDO_SERIAL2_LINE_GAP_MS      0u
 
 /* ── Pin definitions ─────────────────────────────────────────────────── */
 #define PIN_BLUE_LED     PC13
@@ -594,12 +616,12 @@ extern "C" {
 }
 #endif
 
-/* g_tee declaration for parallel USB+Bluetooth. This sits AFTER the extern "C"
- * block above, because gpsdo_tee_serial.h pulls in Arduino.h (C++ templates), which is
+/* g_serial declaration for parallel USB+Bluetooth. This sits AFTER the extern "C"
+ * block above, because gpsdo_serial_tx.h pulls in Arduino.h (C++ templates), which is
  * illegal under C linkage. Every .cpp includes this config header, so declaring
- * g_tee here makes the OUT_SERIAL macro resolve everywhere without touching each
+ * g_serial here makes the OUT_SERIAL macro resolve everywhere without touching each
  * file. The single definition lives in the .ino. */
 #if defined(__cplusplus) && defined(GPSDO_BLUETOOTH_PARALLEL)
-  #include "gpsdo_tee_serial.h"
-  extern TeeSerial g_tee;
+  #include "gpsdo_serial_tx.h"
+  extern GpsdoSerial g_serial;
 #endif

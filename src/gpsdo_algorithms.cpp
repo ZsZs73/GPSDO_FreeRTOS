@@ -25,6 +25,7 @@
 
 #include "gpsdo_algorithms.h"
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_state.h"
 #include "gpsdo_dac.h"
 #include "gpsdo_ubx_timtp.h"

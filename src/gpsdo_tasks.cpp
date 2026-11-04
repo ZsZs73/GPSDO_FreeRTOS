@@ -21,6 +21,7 @@
  */
 
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_state.h"
 #include "gpsdo_log.h"
 #include "gpsdo_hw.h"
@@ -437,13 +438,7 @@ void vUptimeTask(void *pvParameters)
  * flushed with a single Serial.write() call.
  * ====================================================================== */
 
-#if defined(GPSDO_BLUETOOTH_PARALLEL)
-  #define REPORT_SERIAL g_tee
-#elif defined(GPSDO_BLUETOOTH)
-  #define REPORT_SERIAL Serial2
-#else
-  #define REPORT_SERIAL Serial
-#endif
+#define REPORT_SERIAL g_serial
 
 #define SBUF_SIZE 640
 
@@ -525,71 +520,13 @@ static int s2(char *buf, int pos, uint8_t v)
  * behaviour, because telemetry is a live stream, not a log, and the next
  * report is a second away. HardwareSerial::write() blocks rather than drops
  * when its buffer fills, but a room-sized chunk never asks it to. */
-#define REPORT_USB_WRITE_BUDGET_MS  25u
-#define REPORT_BT_WRITE_BUDGET_MS  200u
-
-/* Write one telemetry report to one physical stream with a bounded wait.
- *
- * Never ask the stream to accept more bytes than availableForWrite() says
- * will fit immediately. If the port stops draining, abandon the remainder
- * after the per-port write budget rather than letting its write() stall the
- * display task indefinitely.
- */
-static bool report_write_one(Stream &port, const uint8_t *buf, int n,
-                             uint32_t budget_ms)
-{
-    if (n <= 0) return true;
-
-    uint32_t t0 = millis();
-    int off = 0;
-
-    while (off < n) {
-        int room = port.availableForWrite();
-
-        if (room > 0) {
-            int chunk = (room < (n - off)) ? room : (n - off);
-
-            size_t written = port.write(buf + off, (size_t)chunk);
-            off += (int)written;
-
-            if (written == 0)
-                taskYIELD();
-        } else {
-            taskYIELD();
-        }
-
-        if (off < n && (millis() - t0) >= budget_ms)
-            return false;
-    }
-
-    return true;
-}
-
-/* Write the telemetry report.
- *
- * In USB+Bluetooth parallel mode the two physical outputs MUST be handled
- * independently. TeeSerial::availableForWrite() cannot distinguish an absent
- * USB CDC port from a connected CDC port whose TX queue is full: both may
- * report zero. Using g_tee here could therefore call Serial.write() while its
- * queue is full and recreate the indefinite USB block this guard exists to
- * prevent.
- *
- * Send Bluetooth first so a stalled/unopened USB CDC port cannot even delay
- * the UART copy. Each output then gets its own bounded write attempt.
- */
+/* Telemetry uses the same queued serial transport as CLI/LOG.
+ * A full TX queue applies backpressure instead of discarding a report tail. */
 static bool report_write(const uint8_t *buf, int n)
 {
-#ifdef GPSDO_BLUETOOTH_PARALLEL
-    bool bt_ok  = report_write_one(Serial2, buf, n, REPORT_BT_WRITE_BUDGET_MS);
-    bool usb_ok = report_write_one(Serial,  buf, n, REPORT_USB_WRITE_BUDGET_MS);
-    return bt_ok && usb_ok;
-
-#elif defined(GPSDO_BLUETOOTH)
-    return report_write_one(REPORT_SERIAL, buf, n, REPORT_BT_WRITE_BUDGET_MS);
-
-#else
-    return report_write_one(REPORT_SERIAL, buf, n, REPORT_USB_WRITE_BUDGET_MS);
-#endif
+    if (n <= 0)
+        return true;
+    return REPORT_SERIAL.write(buf, (size_t)n) == (size_t)n;
 }
 
 /* ---- Tab-delimited report -------------------------------------------- */
@@ -644,7 +581,7 @@ buf[p++] = '\t';
 #endif
     buf[p++] = '\r';  buf[p++] = '\n';
 
-    if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+    if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         report_write((const uint8_t *)buf, p);
         xSemaphoreGive(xSerialMutex);
     }
@@ -858,7 +795,7 @@ static void print_human_report(const GpsData_t *g, const FreqSnap_t *f,
     buf[p++]='\r'; buf[p++]='\n';
     buf[p++]='\r'; buf[p++]='\n';
 
-    if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+    if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         report_write((const uint8_t *)buf, p);
         xSemaphoreGive(xSerialMutex);
     }

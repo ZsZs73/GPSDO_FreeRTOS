@@ -89,10 +89,9 @@ HardwareSerial Serial2(PA3, PA2);
 #endif
 
 #if defined(GPSDO_BLUETOOTH_PARALLEL)
-#include "gpsdo_tee_serial.h"
-/* g_tee mirrors USB Serial and the Bluetooth UART. The extern in the config
+#include "gpsdo_serial_tx.h"
+/* g_serial mirrors USB Serial and the Bluetooth UART. The extern in the config
  * headers points here; both ports are begin()-run in setup() below. */
-TeeSerial g_tee(Serial, Serial2);
 #endif
 
 /* ====================================================================== */
@@ -378,6 +377,11 @@ void setup()
     xPpsQueue  = xQueueCreate(2, sizeof(PpsEvent_t));
     xCmdQueue  = xQueueCreate(8, 64);
 
+
+    if (!gpsdo_serial_start()) {
+        Serial.println("FATAL: serial TX queue/task creation failed");
+        while (1) { delay(1000); }
+    }
     xSysEvents = xEventGroupCreate();
 
     /* Request calibration only when no stored configuration was found.

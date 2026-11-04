@@ -1,5 +1,6 @@
 #include "gpsdo_log.h"
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_state.h"
 
 #include <Arduino.h>
@@ -197,7 +198,7 @@ static void log_emit(gpsdo_log_level_t level,
     * same mutex used by the CLI/report streams.
     */
     if (xSerialMutex != nullptr) {
-        if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
             OUT_SERIAL.println(line);
             xSemaphoreGive(xSerialMutex);
         }

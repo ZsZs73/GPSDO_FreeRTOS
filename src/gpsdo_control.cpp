@@ -19,6 +19,7 @@
 
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_dac.h"
 #include "gpsdo_health.h"
 #include "gpsdo_state.h"

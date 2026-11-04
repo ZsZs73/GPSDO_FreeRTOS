@@ -18,6 +18,7 @@
  */
 
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_state.h"
 #include "gpsdo_ubx_timtp.h"
 #include "gpsdo_gps.h"
@@ -37,7 +38,7 @@ const gpsdo_gnss_info_t *gpsdo_gps_info(void)
 
 /* Serial port for echo / messages */
 #if defined(GPSDO_BLUETOOTH_PARALLEL)
-  #define CLI_SER g_tee
+  #define CLI_SER g_serial
 #elif defined(GPSDO_BLUETOOTH)
   #define CLI_SER Serial2
 #else
@@ -1500,7 +1501,7 @@ void vGpsTask(void *pvParameters)
         /* ---- Flush NMEA echo buffer (under serial mutex) ---- */
 #ifdef GPSDO_VERBOSE_NMEA
         if (echo_len > 0) {
-            if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
                 CLI_SER.write(echo_buf, echo_len);
                 xSemaphoreGive(xSerialMutex);
             }

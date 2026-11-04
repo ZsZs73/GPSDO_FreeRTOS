@@ -18,6 +18,7 @@
 
 #include "gpsdo_tz.h"
 #include "gpsdo_config.h"
+#include "gpsdo_serial_tx.h"
 #include "gpsdo_build.h"
 #include "gpsdo_dac.h"
 #include "gpsdo_backlight.h"
@@ -39,13 +40,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#if defined(GPSDO_BLUETOOTH_PARALLEL)
-  #define CLI_SERIAL g_tee
-#elif defined(GPSDO_BLUETOOTH)
-  #define CLI_SERIAL Serial2
-#else
-  #define CLI_SERIAL Serial
-#endif
+#define CLI_SERIAL g_serial
 
 /* Case-insensitive string compare for command verbs, so the CLI accepts any
  * letter case ("LA", "la", "La" all match, likewise "up1"/"UP1"). Used in
@@ -68,14 +63,14 @@ static bool cli_ieq(const char *a, const char *b)
  * ----------------------------------------------------------------------- */
 static void cli_puts(const char *s)
 {
-    if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         CLI_SERIAL.print(s);
         xSemaphoreGive(xSerialMutex);
     }
 }
 static void cli_putln(const char *s)
 {
-    if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         CLI_SERIAL.println(s);
         xSemaphoreGive(xSerialMutex);
     }
@@ -133,7 +128,7 @@ static void cli_putint(int v)
 {
     static char tmp[14];
     ltoa((long)v, tmp, 10);
-    if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         CLI_SERIAL.print(tmp);
         CLI_SERIAL.print("\r\n");
         xSemaphoreGive(xSerialMutex);
@@ -217,7 +212,7 @@ static void cli_putfloat(float v, int dec)
 {
     static char tmp[24];
     dtostrf(v, -1, dec, tmp);
-    if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(xSerialMutex, portMAX_DELAY) == pdTRUE) {
         CLI_SERIAL.print(tmp);
         CLI_SERIAL.print("\r\n");
         xSemaphoreGive(xSerialMutex);
