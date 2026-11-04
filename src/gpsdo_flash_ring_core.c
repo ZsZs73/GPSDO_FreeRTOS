@@ -207,12 +207,11 @@ uint16_t fr_read_newest(fr_state_t *st, uint8_t type,
 int fr_write(fr_state_t *st, uint8_t type,
              const uint8_t *data, uint16_t len)
 {
-    if (len > FR_PAYLOAD) len = FR_PAYLOAD;
+    if (len > FR_PAYLOAD) return FR_WRITE_ERROR;
 
-    /* full? erase and wrap, carrying erase_count forward */
-    if (st->next_idx >= st->slot_count) {
-        if (fr_fresh(st, (uint16_t)(st->erase_count + 1u)) != 0) return -1;
-    }
+    /* Do not erase from the append primitive. The HAL wrapper must first cache
+     * every persistence domain, then rebuild the sector deliberately. */
+    if (st->next_idx >= st->slot_count) return FR_WRITE_FULL;
 
     uint16_t seq = st->have_data ? (uint16_t)(st->cur_seq + 1u) : 1u;
 
@@ -230,16 +229,16 @@ int fr_write(fr_state_t *st, uint8_t type,
     slot[FR_SLOT_SIZE - 1] = (uint8_t)(crc >> 8);
 
     uint32_t off = fr_slot_off(st, st->next_idx);
-    if (st->ops->program(off, slot, FR_SLOT_SIZE) != 0) return -1;
+    if (st->ops->program(off, slot, FR_SLOT_SIZE) != 0) return FR_WRITE_ERROR;
 
     /* verify readback */
     uint8_t chk[FR_SLOT_SIZE];
     st->ops->read(off, chk, FR_SLOT_SIZE);
-    if (memcmp(chk, slot, FR_SLOT_SIZE) != 0) return -1;
+    if (memcmp(chk, slot, FR_SLOT_SIZE) != 0) return FR_WRITE_ERROR;
 
     st->have_data = 1; st->cur_seq = seq;
     st->next_idx++; st->used++;
-    return 0;
+    return FR_WRITE_OK;
 }
 
 uint32_t fr_erase_count(const fr_state_t *st) { return st->erase_count; }

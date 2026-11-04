@@ -34,6 +34,7 @@
 #include "gpsdo_settings_store.h"
 #include "gpsdo_config_load.h"
 #include "gpsdo_ubx_timtp.h"
+#include <stdarg.h>
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -417,6 +418,42 @@ static void cli_warn_ltic_cal(void)
     }
 }
 #endif
+
+/* ---- machine-readable CLI response envelope ---------------------------
+ *
+ * LOG1 is reserved for unsolicited firmware events and TLM1 for telemetry.
+ * Command handlers use CLI1 for their terminal response so a future host can
+ * route the shared serial stream by prefix without guessing.
+ *
+ * `fields_fmt` is already-formatted key=value data. Keep it single-line.
+ */
+static void cli_replyf(const char *cmd, const char *result,
+                       const char *fields_fmt, ...)
+{
+    char line[192];
+
+    int n = snprintf(line, sizeof(line),
+                     "CLI1 cmd=%s result=%s", cmd, result);
+    if (n < 0)
+        return;
+
+    size_t used = (size_t)n;
+    if (used >= sizeof(line))
+        used = sizeof(line) - 1u;
+
+    if (fields_fmt != NULL && fields_fmt[0] != '\0' &&
+        used + 1u < sizeof(line)) {
+        line[used++] = ' ';
+
+        va_list ap;
+        va_start(ap, fields_fmt);
+        vsnprintf(line + used, sizeof(line) - used, fields_fmt, ap);
+        va_end(ap);
+    }
+
+    line[sizeof(line) - 1u] = '\0';
+    cli_putln(line);
+}
 
 static void dispatch(char *line)
 {
@@ -1718,10 +1755,15 @@ if (cli_ieq(verb, "AV")) {
      * clobber a hand-tuned PID set the way the old full EEPROM write could. */
     if (cli_ieq(verb, "ES")) {
         if (arg == NULL) {
-            cli_putln("Saving settings (full)...");
-            settings_save();
+            const bool settings_saved = settings_save();
             live_store_request_save();
-            cli_putln("Done.");
+
+            if (settings_saved) {
+                cli_replyf("ES", "OK", "msg=\"settings saved to flash\"");
+            } else {
+                cli_replyf("ES", "ERROR",
+                           "msg=\"settings save failed; current settings will not survive restart\"");
+            }
         } else if (cli_ieq(arg, "TZ")) {
             cli_putln("Saving TZ...");
             settings_save_partial(SET_TZ);
@@ -2250,16 +2292,15 @@ if (cli_ieq(verb, "MF")) {                 /* where the limits come from */
         /* flash-wear diagnostics for the ring buffer */
         uint16_t slots = flash_ring_slot_count();
         if (slots == 0) {
-            cli_putln("Flash ring: not initialised — the sector failed to format.");
+            cli_replyf("EW", "ERROR",
+                       "reason=storage_not_ready msg=\"flash ring is not initialized\"");
         } else {
-            char line[112];
-            snprintf(line, sizeof(line),
-                     "Flash ring: erase cycles=%lu  slots used=%u/%u  (sector %u, 0x%08lX)",
-                     (unsigned long)flash_ring_erase_count(),
-                     (unsigned)flash_ring_slots_used(), (unsigned)slots,
-                     (unsigned)flash_ring_sector_no(),
-                     (unsigned long)flash_ring_base_addr());
-            cli_putln(line);
+            cli_replyf("EW", "OK",
+                       "erase_count=%lu slots_used=%u slots_total=%u sector=%u base=0x%08lX",
+                       (unsigned long)flash_ring_erase_count(),
+                       (unsigned)flash_ring_slots_used(), (unsigned)slots,
+                       (unsigned)flash_ring_sector_no(),
+                       (unsigned long)flash_ring_base_addr());
         }
         return;
     }

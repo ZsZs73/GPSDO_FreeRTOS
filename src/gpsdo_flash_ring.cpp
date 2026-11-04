@@ -24,6 +24,7 @@
 
 #include "gpsdo_flash_ring.h"
 #include "gpsdo_flash_ring_core.h"
+#include "gpsdo_log.h"
 
 #include "stm32f4xx_hal.h"
 #include <string.h>
@@ -36,6 +37,25 @@
 
 static fr_state_t s_state;
 static bool       s_ready = false;
+
+/* A full-ring compaction must survive the sector erase with every persistence
+ * domain already held in RAM. Six maximum-sized records cost ~3 KiB. */
+typedef struct {
+    uint8_t  present;
+    uint16_t len;
+    uint8_t  data[FR_PAYLOAD];
+} ring_cache_t;
+
+static ring_cache_t s_compact[6];
+
+static const uint8_t s_compact_types[6] = {
+    REC_LIVE,
+    REC_SETTINGS,
+    REC_AL13,
+    REC_HW_CAL,
+    REC_AL11,
+    REC_AL12
+};
 
 /* ---- primitives handed to the core ---- */
 
@@ -145,10 +165,89 @@ uint16_t flash_ring_read_newest(uint8_t type, uint8_t *out, uint16_t maxlen)
     return (stored_len > maxlen) ? maxlen : stored_len;
 }
 
+static bool cache_latest_records(void)
+{
+    for (unsigned i = 0; i < 6u; i++) {
+        ring_cache_t *c = &s_compact[i];
+        c->present = 0u;
+        c->len = 0u;
+
+        uint16_t stored_len = 0u;
+        fr_read_status_t rs = fr_read_newest_ex(
+            &s_state,
+            s_compact_types[i],
+            c->data,
+            (uint16_t)sizeof(c->data),
+            &stored_len);
+
+        if (rs == FR_READ_MISSING)
+            continue;
+
+        /* A full-sector erase is the wrong time to discard evidence of a
+         * damaged domain. Abort compaction if that domain cannot be recovered. */
+        if (rs != FR_READ_OK && rs != FR_READ_RECOVERED)
+            return false;
+
+        if (stored_len > sizeof(c->data))
+            return false;
+
+        c->present = 1u;
+        c->len = stored_len;
+    }
+
+    return true;
+}
+
+static bool compact_and_write(uint8_t type, const uint8_t *data, uint16_t len)
+{
+    if (len > FR_PAYLOAD) return false;
+
+    /* BEFORE erasing anything, capture the newest valid record of every known
+     * persistence domain. This is the key protection missing from the old wrap. */
+    if (!cache_latest_records())
+        return false;
+
+    const uint16_t prev_erase_count = s_state.erase_count;
+
+    /* Accepted trade-off: from this erase until the rebuild finishes there is
+     * a small power-loss window. The cached image exists only in RAM. */
+    if (fr_begin_fresh_count(&s_state, prev_erase_count) != 0)
+        return false;
+
+    /* Rebuild a complete baseline first, including the previous value of the
+     * triggering type. If the final new write fails, the old value is still
+     * present in the freshly rebuilt ring. */
+    for (unsigned i = 0; i < 6u; i++) {
+        const ring_cache_t *c = &s_compact[i];
+        if (!c->present) continue;
+
+        if (fr_write(&s_state,
+                     s_compact_types[i],
+                     c->data,
+                     c->len) != FR_WRITE_OK)
+            return false;
+    }
+
+    /* Append the requested new value last so it becomes authoritative. */
+    if (fr_write(&s_state, type, data, len) != FR_WRITE_OK)
+        return false;
+
+    gpsdo_logf(
+        GPSDO_LOG_INFO, "CONFIG",
+        "Flash storage recycled for continued saving (erase count %lu).",
+        (unsigned long)fr_erase_count(&s_state));
+    return true;
+}
+
 bool flash_ring_write(uint8_t type, const uint8_t *data, uint16_t len)
 {
-    if (!s_ready) return false;
-    return (fr_write(&s_state, type, data, len) == 0);
+    if (!s_ready || len > FR_PAYLOAD) return false;
+
+    const int r = fr_write(&s_state, type, data, len);
+    if (r == FR_WRITE_OK) return true;
+    if (r != FR_WRITE_FULL) return false;
+
+    return compact_and_write(type, data, len);
 }
 
 uint32_t flash_ring_erase_count(void) { return s_ready ? fr_erase_count(&s_state) : 0; }

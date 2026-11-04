@@ -70,6 +70,12 @@ extern "C" {
 #define FR_SLOT_HDR   6u     /* per-slot header: seq(2) type(1) rsv(1) len(2) */
 #define FR_PAYLOAD    504u   /* FR_SLOT_SIZE - FR_SLOT_HDR - CRC(2)          */
 
+/* fr_write() result codes. A full generation is not an error: the HAL
+ * wrapper performs controlled compaction and retries the write. */
+#define FR_WRITE_OK     0
+#define FR_WRITE_ERROR -1
+#define FR_WRITE_FULL  -2
+
 /* Caller-supplied flash primitives. All offsets are RELATIVE to the start
  * of the ring sector (0 == first header byte). */
 typedef struct {
@@ -124,8 +130,9 @@ fr_read_status_t fr_read_newest_ex(fr_state_t *st, uint8_t type,
 uint16_t fr_read_newest(fr_state_t *st, uint8_t type,
                         uint8_t *out, uint16_t maxlen);
 
-/* Append payload as the next slot of the given type; wraps (erase) when full.
- * Returns 0 ok. */
+/* Append payload as the next slot of the given type.
+ * Returns FR_WRITE_FULL when no erased slot remains; this function never
+ * erases the sector itself. */
 
 
 int  fr_write(fr_state_t *st, uint8_t type,
