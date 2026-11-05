@@ -1622,6 +1622,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
     static float    s_i_remain      = 0.0f;   /* Lars' I_term_remain            */
     static float    s_phase_filt    = 0.0f;   /* filtered phase [ns]            */
     static uint32_t s_near_run      = 0u;     /* s with the phase inside the window */
+    static uint32_t s_far_run       = 0u;     /* s with it outside, in a row */
     static uint32_t s_lock_cnt      = 0;      /* Lars' lockPPScounter           */
     static bool     s_locked        = false;
     static bool     s_init          = false;
@@ -1637,7 +1638,7 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
      * cleared even on a switch into a loop that cannot yet run. */
     if (algo_take_restart()) {
         s_pol_warned = false;
-        s_integ = 0.0f; s_i_remain = 0.0f; s_phase_filt = 0.0f; s_near_run = 0u;
+        s_integ = 0.0f; s_i_remain = 0.0f; s_phase_filt = 0.0f; s_near_run = 0u; s_far_run = 0u;
         s_lock_cnt = 0; s_locked = false;
         s_init = false;                     /* re-seed from the live PWM */
         s_tc_old = 0;
@@ -1766,10 +1767,20 @@ uint16_t ltic_lars_pi(uint16_t pwm, uint32_t ppscount)
          * describing the same thing. A settled loop waiting out the lock
          * stopwatch has hundreds of such seconds and smooths from the first;
          * a loop whose phase is walking through the window never accumulates
-         * them and stays fast, which is what it needs. */
-        if (near) { if (s_near_run < 0xFFFFFFFFu) s_near_run++; }
-        else        s_near_run = 0;
-        if (s_near_run < filt) filt = 1u;
+         * them and stays fast. Once locked, however, one or two consecutive
+         * far readings are still treated as possible outliers; three in a row
+         * are taken as real motion and force the fast filter again. */
+        if (near) { if (s_near_run < 0xFFFFFFFFu) s_near_run++; s_far_run = 0u; }
+        else      { s_near_run = 0u; if (s_far_run < 0xFFFFFFFFu) s_far_run++; }
+        /*
+         * While locked, tolerate one or two consecutive out-of-window readings
+         * as possible outliers. After three, return to the fast filter so a real
+         * phase excursion is not hidden by smoothing.
+         *
+         * Refined upstream fix from:
+         * https://github.com/jmnlabs/GPSDO_FreeRTOS/pull/2
+         */
+        if (s_near_run < filt && (!s_locked || s_far_run >= 3u)) filt = 1u;
     }
 
     /* If timeConst changed under us, rescale the integrator so the output does
